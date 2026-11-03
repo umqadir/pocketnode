@@ -30,6 +30,9 @@ In Jupyter, `%load_ext pocketnode` adds two cell magics. `%%phone` runs a cell o
 
   It sends it back even if your code catches the error.
 - **An error from the phone is confirmed on the Mac before you see it.** If the Mac runs the task fine, you get the Mac's result and that function stays on the Mac from then on.
+- **The first result from the phone is checked against the Mac.** The first time a function runs on the phone, the Mac also runs it and the results are compared, with tolerance for floating point.
+  - If they differ, you get the Mac's answer and that function stays on the Mac.
+  - A function that gives different answers on every run (unseeded randomness) is recognised as nondeterministic, so it isn't counted as a mismatch.
 - **Forcing placement raises instead of falling back.** `ex.on("phone")`, `pn.placement("phone")`, `@pn.runs_on("phone")` and `pn.connect(placement=...)` all force where code runs. If the forced node can't run it, you get a clear `PlacementError` rather than a silent fallback. `strict=True` does the same for automatic placement.
 - **The phone can go away at any time.** It can get hot, go to the background, be unplugged, or crash. Its work moves to the Mac (speculative re-execution: the first result wins), and it rejoins when it's back.
 
@@ -38,6 +41,7 @@ In Jupyter, `%load_ext pocketnode` adds two cell magics. `%%phone` runs a cell o
 - **Large inputs cross the link once.** Arrays and DataFrames travel as raw buffers (pickle protocol 5) and are cached on the phone by content hash. Data you'll reuse can be kept resident with `ex.pin(X)`.
 - **The scheduler uses measurements.** It measures each function's compute time per node and the link's bandwidth. Memory-bound work stays on the Mac; heavy work spreads out.
 - **Busy nodes get less work.** Thermal state and background state reduce how much work the phone is given.
+- **Pure-Python work uses all the phone's cores.** iOS has no child processes and no free-threaded Python build. So tasks that touch only the stdlib and pure-Python packages run in per-core subinterpreters, each with its own GIL. Work that releases the GIL (NumPy, scikit-learn, PyTorch) runs on threads.
 
 ## Packages
 

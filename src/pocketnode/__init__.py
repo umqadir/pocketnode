@@ -57,7 +57,7 @@ def _setup_logging() -> None:
 
 def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True, udid: str | None = None,
             placement: str = "auto", strict: bool = False, version_policy: str = "minor",
-            speculate: bool = True, notes: bool = True, wait: float | None = None,
+            speculate: bool = True, notes: bool = True, verify: bool = True, wait: float | None = None,
             simulate_phone: bool | str = False) -> PocketExecutor:
     """Start an executor that pools this Mac's cores and the phone.
 
@@ -65,6 +65,7 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
     mac_workers: Mac worker processes (default: one per core; 0 for phone only).
     placement: "auto", "mac", "phone" or a node name. Overridable per call/function/block.
     strict: raise instead of falling back when a task can't run where it was routed.
+    verify: check each function's first phone result against the Mac before trusting it.
     wait: seconds to wait for the phone to connect before returning.
     simulate_phone: run a local stand-in that behaves like the phone (a path to
         a Python interpreter whose environment mimics the phone's, or True).
@@ -74,7 +75,7 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
 
     _setup_logging()
     ex = PocketExecutor(placement=placement, strict=strict, version_policy=version_policy,
-                        speculate=speculate, notes=notes)
+                        speculate=speculate, notes=notes, verify=verify)
     n = os.cpu_count() if mac_workers is None else mac_workers
     if n:
         ex.add_source(LocalWorkers(n))

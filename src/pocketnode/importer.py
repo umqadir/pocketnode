@@ -49,6 +49,11 @@ class RemoteFinder(importlib.abc.MetaPathFinder):
             self.resolved.clear()
             self.local_versions = _local_versions()
 
+    def paths(self) -> list[str]:
+        """Directories of modules fetched so far (a snapshot, safe from any thread)."""
+        with self._lock:
+            return [str(d) for d in self.resolved.values() if d]
+
     def _load_index(self) -> dict[str, str]:
         idx = {}
         for d in self.cache_dir.glob("*-*"):

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import queue
 import ctypes
 import io
 import json
@@ -116,6 +117,8 @@ class Worker:
         self.finder = RemoteFinder(self.cache_dir, self._fetch_module, on_miss=self._on_compiled_miss)
         self.tasks_done = 0
         self.override: dict = {}  # test hook: pretend thermal/lifecycle state
+        self._outq: queue.Queue = queue.Queue()
+        threading.Thread(target=self._writer, daemon=True, name="pn-writer").start()
         install_finder(self.finder)
         _install_streams()
         compat.install()
@@ -136,7 +139,7 @@ class Worker:
                 and getattr(sys, "_is_gil_enabled", lambda: True)():
             self.subpool = subinterp.SubPool(
                 self.slots, roots if self.phone else None, str(self.scratch), self._phone_dirs,
-                extra_paths=lambda: [str(d) for d in list(self.finder.resolved.values()) if d])
+                extra_paths=self.finder.paths)
 
     def _default_budget(self) -> int:
         avail = device.available_memory()
@@ -264,14 +267,28 @@ class Worker:
             conn.close()
 
     def _send(self, header: dict, bufs=()) -> bool:
+        """Queue a message for the Mac. Only the writer thread touches the socket, so
+        the reader thread never blocks on a full send buffer (which can deadlock)."""
         conn = self.conn
         if conn is None:
             return False
-        try:
-            conn.send(header, bufs)
-            return True
-        except ConnectionClosed:
-            return False
+        self._outq.put((conn, header, list(bufs)))
+        return True
+
+    def _writer(self) -> None:
+        while True:
+            conn, header, bufs = self._outq.get()
+            try:
+                conn.send(header, bufs)
+            except ConnectionClosed:
+                if header.get("t") != "result":
+                    continue
+                cur = self.conn
+                if cur is not None and cur is not conn:
+                    self._outq.put((cur, header, bufs))  # a newer session exists: deliver there
+                else:
+                    with self._lock:
+                        self.held[header["id"]] = (header, bufs)
 
     def _flush_held(self) -> None:
         with self._lock:
@@ -563,6 +580,9 @@ def main(argv=None) -> None:
     ap.add_argument("--name")
     ap.add_argument("--kind")
     a = ap.parse_args(argv)
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # `kill -USR1` dumps stacks
     w = Worker(_read_token(a.token_file), slots=a.slots, cache_dir=a.cache_dir,
                phone=a.phone or None, name=a.name, node_kind=a.kind)
     w.serve(listen=a.listen, unix=a.unix, connect=a.connect,

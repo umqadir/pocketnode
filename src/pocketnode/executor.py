@@ -141,11 +141,23 @@ class Node:
         self.outbox: queue.Queue = queue.Queue()
         threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
 
+    def post(self, header: dict, bufs=()) -> None:
+        """Queue a message for this node. Only the sender thread writes to the socket,
+        so a reader thread never blocks on a full send buffer (which can deadlock)."""
+        self.outbox.put((header, list(bufs)))
+
     def _sender(self) -> None:
         while True:
-            att = self.outbox.get()
-            if att is None:
+            item = self.outbox.get()
+            if item is None:
                 return
+            if isinstance(item, tuple):
+                try:
+                    self.conn.send(*item)
+                except (ConnectionClosed, OSError):
+                    pass
+                continue
+            att = item
             if att.task.done or att.id not in self.ex.attempts:
                 continue
             try:
@@ -257,8 +269,13 @@ def _fn_identity(fn) -> tuple[str, str]:
 
 class PocketExecutor(Executor):
     def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str = "minor",
-                 speculate: bool = True, confirm_errors: bool = True, notes: bool = True):
+                 speculate: bool = True, confirm_errors: bool = True, notes: bool = True,
+                 verify: bool = True):
         self.session = uuid.uuid4().hex
+        # First phone result per function is checked against the Mac before it's trusted.
+        self.verify = verify
+        self.verified: dict[str, str] = {}  # fn_key -> "pending" | "ok" | "mac"
+        self._verify_wait: dict[str, list] = defaultdict(list)
         self.default_placement = placement
         self.strict = strict
         self.version_policy = version_policy
@@ -302,6 +319,9 @@ class PocketExecutor(Executor):
                  or _placement_ctx.get() or self.default_placement)
         packed = serialize.dumps((fn, args, kwargs), memo=memo)
         key, label = _fn_identity(fn)
+        return self._enqueue(packed, key, label, where, ro)
+
+    def _enqueue(self, packed, key, label, where, ro=None) -> PocketFuture:
         fut = PocketFuture()
         task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules))
         with self._cv:
@@ -343,15 +363,15 @@ class PocketExecutor(Executor):
         for n in targets:
             new = [(h, b) for h, b in zip(packed.hashes, packed.buffers) if h not in n.known]
             if new:
-                n.conn.send({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new])
+                n.post({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new])
                 n.known.update(h for h, _ in new)
-            n.conn.send({"t": "pin", "hashes": packed.hashes})
+            n.post({"t": "pin", "hashes": packed.hashes})
         return obj
 
     def unpin(self, obj) -> None:
         packed = serialize.dumps(obj, scan=False)
         for n in self.nodes.values():
-            n.conn.send({"t": "unpin", "hashes": packed.hashes})
+            n.post({"t": "unpin", "hashes": packed.hashes})
 
     def wait_for(self, what: str = "phone", timeout: float | None = None) -> bool:
         """Block until a node matching `what` (kind or name) is connected."""
@@ -425,10 +445,7 @@ class PocketExecutor(Executor):
             for a in list(task.attempts.values()):
                 self.attempts.pop(a.id, None)
                 if a.node.running.pop(a.id, None) is not None:
-                    try:
-                        a.node.conn.send({"t": "cancel", "id": a.id})
-                    except ConnectionClosed:
-                        pass
+                    a.node.post({"t": "cancel", "id": a.id})
             self._cv.notify_all()
 
     def _add_node(self, node: Node) -> None:
@@ -640,7 +657,7 @@ class PocketExecutor(Executor):
                 items = [(h, self._buf_by_hash.get(h)) for h in msg["hashes"]]
             if any(b is None for _, b in items):
                 return  # task already finished; nothing to send
-            node.conn.send({"t": "put", "hashes": [h for h, _ in items]}, [b[0] for _, b in items])
+            node.post({"t": "put", "hashes": [h for h, _ in items]}, [b[0] for _, b in items])
         elif t == "import":
             threading.Thread(target=self._serve_import, args=(node, msg), daemon=True).start()
         elif t == "state":
@@ -658,11 +675,8 @@ class PocketExecutor(Executor):
         except Exception as e:
             info, data = {"kind": "error", "detail": repr(e)}, None
         same = data is not None and info.get("hash") == msg.get("have")
-        try:
-            node.conn.send({"t": "module", "req": msg["req"], "info": {k: v for k, v in info.items() if k != "paths"},
-                            "same": same}, [] if same or data is None else [data])
-        except ConnectionClosed:
-            pass
+        node.post({"t": "module", "req": msg["req"], "info": {k: v for k, v in info.items() if k != "paths"},
+                   "same": same}, [] if same or data is None else [data])
 
     def _on_result(self, node: Node, msg: dict, bufs: list[bytearray]) -> None:
         with self._cv:
@@ -699,6 +713,11 @@ class PocketExecutor(Executor):
                 task.reason = (f"{task.confirm_error[0]} raised {task.confirm_error[1]} on the phone; "
                                "the Mac ran it fine, so this function now stays on the Mac")
                 self.mac_only[task.fn_key] = (task.reason, None)
+            # Verify automatically placed work; forced placement means "run it there".
+            if (node.kind != "mac" and self.verify and task.placement in ("auto", None)
+                    and self.verified.get(task.fn_key) != "ok"):
+                self._verify(task, node, att, value)
+                return
             self._finish(task, node, att, value=value)
             return
         if msg.get("unavailable"):
@@ -736,6 +755,72 @@ class PocketExecutor(Executor):
             task.reason = "raised on the phone and on the Mac too"
         self._finish(task, node, att, exc=exc)
 
+    # ----------------------------------------------------- verification
+
+    def _verify(self, task: Task, node: Node, att: Attempt, value) -> None:
+        """Hold a phone result until the Mac has computed the same task and they agree."""
+        key = task.fn_key
+        with self._cv:
+            state = self.verified.get(key)
+            if state == "mac":  # decided meanwhile: this function runs on the Mac
+                self._requeue(task, node, self.mac_only.get(key, ("",))[0], None, quiet=True)
+                return
+            if not any(n.kind == "mac" for n in self.nodes.values()):
+                self.verified[key] = "ok"
+                state = "ok"
+            else:
+                self._verify_wait[key].append((task, node, att, value))
+        if state == "ok":
+            self._finish(task, node, att, value=value)
+            return
+        if state == "pending":
+            return
+        self.verified[key] = "pending"
+        shadow = self._enqueue(task.packed, key, task.fn_label, "mac", task.ro)
+        shadow.add_done_callback(lambda f: self._verify_done(key, f, task.packed, task.fn_label, task.ro))
+
+    def _verify_done(self, key, mac_fut, packed, label, ro, second=None) -> None:
+        from . import verify as V
+        waiting = self._verify_wait.get(key, [])
+        if not waiting:
+            self.verified[key] = "ok"
+            return
+        task0, node0, att0, phone_value = waiting[0]
+        exc = mac_fut.exception()
+        if exc is not None:
+            agree, why = False, f"the Mac raised {type(exc).__name__}"
+        else:
+            agree, why = V.same(phone_value, mac_fut.result())
+        if not agree and exc is None and second is None:
+            # Before blaming the phone: does the Mac agree with itself?
+            again = self._enqueue(packed, key, label, "mac", ro)
+            again.add_done_callback(lambda f: self._verify_done(key, mac_fut, packed, label, ro, second=f))
+            return
+        if second is not None and exc is None:
+            consistent, _ = V.same(mac_fut.result(), second.result() if second.exception() is None else object())
+            if not consistent:
+                agree, why = True, ""
+                self._note(("nondet", key), f"pocketnode: {label} gives different results on every run, "
+                           "so its phone results can't be checked against the Mac; trusting them")
+        with self._cv:
+            pending = self._verify_wait.pop(key, [])
+            self.verified[key] = "ok" if agree else "mac"
+        if agree:
+            for t, n, a, v in pending:
+                self._finish(t, n, a, value=v)
+            return
+        reason = f"its phone result differed from the Mac's ({why}), so it now runs on the Mac"
+        self.mac_only[key] = (reason, None)
+        self._note(("verify", key), f"pocketnode: {label}: {reason}")
+        t, n, a, _ = pending[0]
+        t.reason = reason
+        if exc is not None:
+            self._finish(t, n, a, exc=exc)
+        else:
+            self._finish(t, n, a, value=mac_fut.result())
+        for t, n, a, _ in pending[1:]:
+            self._requeue(t, n, reason, None, quiet=True)
+
     def _requeue(self, task: Task, node: Node, reason: str, suggestion: str | None, quiet=False) -> None:
         with self._cv:
             task.excluded[node.kind] = reason
@@ -770,10 +855,7 @@ class PocketExecutor(Executor):
                 if a.id != att.id and a.id in self.attempts:
                     self.attempts.pop(a.id, None)
                     a.node.running.pop(a.id, None)
-                    try:
-                        a.node.conn.send({"t": "cancel", "id": a.id})
-                    except ConnectionClosed:
-                        pass
+                    a.node.post({"t": "cancel", "id": a.id})
         if task.future.done():
             return
         try:

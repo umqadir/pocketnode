@@ -129,24 +129,30 @@ class SubPool:
 
     def run(self, payload: bytes, buffers: list) -> dict:
         """Run one pickled (fn, args, kwargs) in a free subinterpreter; returns the outcome dict."""
-        interp = self._get()
-        r, w = os.pipe()
-        chunks: list[bytes] = []
-        reader = threading.Thread(target=lambda: chunks.extend(iter(lambda: os.read(r, 1 << 20), b"")),
-                                  daemon=True)
-        reader.start()
-        shared = {"payload": bytes(payload), "fd": w, "nbufs": len(buffers),
+        # Build everything that can fail before holding an interpreter or a pipe.
+        shared = {"payload": bytes(payload), "nbufs": len(buffers),
                   "extra_paths": "\0".join(self.extra_paths())}
         for i, b in enumerate(buffers):
             shared[f"b{i}"] = bytes(b)
+        chunks: list[bytes] = []
+        interp = self._get()
         try:
-            err = _interpreters.exec(interp, _RUNNER, shared=shared)
-        except BaseException:
-            os.close(w)
-            raise
+            r, w = os.pipe()
+            reader = threading.Thread(target=lambda: chunks.extend(iter(lambda: os.read(r, 1 << 20), b"")),
+                                      daemon=True)
+            reader.start()
+            try:
+                shared["fd"] = w
+                err = _interpreters.exec(interp, _RUNNER, shared=shared)
+            except BaseException:
+                # exec raises only before the runner starts, so the runner never
+                # got to close the write end.
+                os.close(w)
+                raise
+            finally:
+                reader.join()
+                os.close(r)
         finally:
-            reader.join()
-            os.close(r)
             self._idle.put(interp)
         data = b"".join(chunks)
         if err is not None or len(data) < 8:

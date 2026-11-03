@@ -38,6 +38,20 @@ def phone(ex):
     return next(n for n in ex.nodes.values() if n.kind == "phone")
 
 
+def _result_or_dump(ex, fut, timeout=20):
+    """fut.result(), but on a hang show the scheduler's view before failing."""
+    import concurrent.futures
+    try:
+        return fut.result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        lines = [ex.describe()]
+        for n in ex.nodes.values():
+            lines.append(f"{n.name}: state={n.state} running={[(a.task.fn_label, round(time.monotonic() - a.started, 1)) for a in n.running.values()]}")
+        lines.append(f"queue={[(t.fn_label, t.queued, t.done, t.placement) for t in ex.queue]}")
+        lines.append(f"tasks={[(t.fn_label, t.queued, t.done, t.placement, list(t.excluded)) for t in ex.tasks.values()]}")
+        raise AssertionError("\n".join(lines))
+
+
 # ------------------------------------------------------------------- basics
 
 def test_submit_lambda_and_closure(ex):
@@ -224,7 +238,7 @@ def test_speculation_rescues_stalled_phone(ex):
         return "done"
 
     f = ex.on("phone").submit(lambda: 0)
-    f.result()
+    _result_or_dump(ex, f)
     g = ex.submit(slow_on_phone)
     deadline = time.time() + 5
     while not any(a.task.future is g for a in node.running.values()) and time.time() < deadline:
@@ -323,3 +337,27 @@ def test_results_held_across_disconnect(tmp_path):
         src.stop()
         e.shutdown(wait=False)
         proc.kill()
+
+
+def test_first_phone_result_verified_against_mac(ex):
+    # Same answer everywhere: the phone's results are trusted after one check.
+    futs = [ex.submit(lambda x: (np.arange(1000.0) * x).sum(), i) for i in range(30)]
+    assert [f.result() for f in futs] == [float((np.arange(1000.0) * i).sum()) for i in range(30)]
+
+
+def test_phone_result_that_differs_is_replaced_by_macs(ex):
+    def answer():
+        import sys
+        return 41.0 if sys.prefix.endswith(".phone-sim") else 42.0
+
+    futs = [ex.submit(answer) for _ in range(12)]
+    assert all(f.result() == 42.0 for f in futs)
+
+
+def test_nondeterministic_function_still_uses_phone(ex):
+    def noisy():
+        import random
+        return random.random()
+
+    futs = [ex.submit(noisy) for _ in range(20)]
+    assert all(0 <= f.result() < 1 for f in futs)
