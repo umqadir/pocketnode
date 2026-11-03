@@ -1,0 +1,40 @@
+name: PocketNode
+options:
+  bundleIdPrefix: dev.pocketnode
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    ARCHS: arm64            # plain arm64: retagged macOS binaries can't load into an arm64e process
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_OBJC_ARC: YES
+    ENABLE_BITCODE: NO
+    CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER: NO
+    DEVELOPMENT_TEAM: ${POCKETNODE_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    PRODUCT_BUNDLE_IDENTIFIER: ${POCKETNODE_BUNDLE_ID}
+targets:
+  PocketNode:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes: ["python/**"]
+    dependencies:
+      - framework: Python.xcframework
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        INFOPLIST_FILE: App/Info.plist
+        CODE_SIGN_ENTITLEMENTS: App/PocketNode.entitlements
+        HEADER_SEARCH_PATHS: "$(BUILT_PRODUCTS_DIR)/Python.framework/Headers"
+        TARGETED_DEVICE_FAMILY: "1"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
+    postBuildScripts:
+      - name: Install Python, packages and token
+        script: |
+          set -e
+          "$PROJECT_DIR/scripts/install_python.sh"
+        basedOnDependencyAnalysis: false

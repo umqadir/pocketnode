@@ -1,0 +1,412 @@
+"""Stage Python packages from this Mac's environment for the iOS app.
+
+Pure-Python files are copied as they are. Every Mach-O binary (extension
+modules and the dylibs they bundle) is retagged from macOS to iOS: thinned to
+arm64, system framework paths shortened to the iOS layout, the build-version
+load command switched to iOS (or the iOS simulator), and wrapped as a
+framework the way CPython's iOS loader expects (a `.fwork` pointer where the
+`.so` was). Xcode signs the frameworks when it builds the app.
+
+The result is the exact versions the Mac runs, so the router's version checks
+always match. Each binary is also checked statically against the iOS SDK, and
+anything that can't load is reported (and left out) instead of failing on the
+phone.
+"""
+
+from __future__ import annotations
+
+import importlib.metadata as md
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from packaging.markers import default_environment
+
+from . import shims
+from packaging.requirements import Requirement
+
+PLATFORM = {"iphoneos": "ios", "iphonesimulator": "iossim"}
+MINOS = "17.0"
+STAGE_ROOT = Path(os.environ.get("POCKETNODE_STAGE", Path.home() / ".pocketnode" / "build"))
+_SKIP_SUFFIXES = (".pyc", ".pyo", ".a", ".pyx", ".pxd", ".pxi", ".c", ".cpp", ".h", ".hpp", ".cc")
+_MH_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
+_DARWIN_SO = re.compile(r"\.cpython-(\d+)-darwin\.so$")
+
+
+@dataclass
+class Report:
+    sdk: str
+    dists: dict[str, str] = field(default_factory=dict)
+    binaries: int = 0
+    excluded: dict[str, str] = field(default_factory=dict)  # module -> reason
+    warnings: list[str] = field(default_factory=list)
+    seconds: float = 0.0
+
+
+def _run(*cmd: str) -> str:
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)} failed: {r.stderr.strip()}")
+    return r.stdout
+
+
+def sdk_version() -> str:
+    return _run("xcrun", "--sdk", "iphoneos", "--show-sdk-version").strip()
+
+
+def _norm(n: str) -> str:
+    return re.sub(r"[-_.]+", "-", n).lower()
+
+
+def closure(names: list[str]) -> list[md.Distribution]:
+    """Installed distributions for `names` plus their runtime dependencies."""
+    env = default_environment()
+    by_name = {_norm(d.metadata["Name"]): d for d in md.distributions() if d.metadata["Name"]}
+    out: dict[str, md.Distribution] = {}
+    stack = [_norm(n) for n in names]
+    while stack:
+        n = stack.pop()
+        if n in out:
+            continue
+        d = by_name.get(n)
+        if d is None:
+            raise LookupError(f"{n} isn't installed in {sys.prefix}")
+        out[n] = d
+        for r in d.requires or ():
+            req = Requirement(r)
+            if req.marker and not req.marker.evaluate({**env, "extra": ""}):
+                continue
+            if _norm(req.name) in by_name:
+                stack.append(_norm(req.name))
+    return list(out.values())
+
+
+def is_macho(p: Path) -> bool:
+    try:
+        with open(p, "rb") as f:
+            return f.read(4) in _MH_MAGIC
+    except OSError:
+        return False
+
+
+def _load_commands(p: Path) -> tuple[list[str], list[str], str | None]:
+    """(dependent libraries, rpaths, own install name)."""
+    deps, rpaths, ident = [], [], None
+    lines = _run("otool", "-l", str(p)).splitlines()
+    for i, l in enumerate(lines):
+        l = l.strip()
+        if l.startswith("cmd LC_LOAD_DYLIB") or l.startswith("cmd LC_LOAD_WEAK_DYLIB") or \
+                l.startswith("cmd LC_REEXPORT_DYLIB") or l.startswith("cmd LC_ID_DYLIB"):
+            for j in range(i + 1, i + 4):
+                m = re.match(r"\s*name (.+) \(offset", lines[j])
+                if m:
+                    if l.startswith("cmd LC_ID_DYLIB"):
+                        ident = m.group(1)
+                    else:
+                        deps.append(m.group(1))
+                    break
+        elif l.startswith("cmd LC_RPATH"):
+            for j in range(i + 1, i + 4):
+                m = re.match(r"\s*path (.+) \(offset", lines[j])
+                if m:
+                    rpaths.append(m.group(1))
+                    break
+    return deps, rpaths, ident
+
+
+def _resolve(ref: str, binary: Path, rpaths: list[str]) -> Path | None:
+    def sub(s: str) -> str:
+        return s.replace("@loader_path", str(binary.parent)).replace("@executable_path", str(binary.parent))
+    if ref.startswith("@rpath/"):
+        for rp in rpaths:
+            cand = Path(sub(rp)) / ref[len("@rpath/"):]
+            if cand.exists():
+                return cand.resolve()
+        return None
+    if ref.startswith("@loader_path"):
+        cand = Path(sub(ref))
+        return cand.resolve() if cand.exists() else None
+    return None
+
+
+def _ios_framework_path(ref: str) -> str:
+    m = re.match(r"(/System/Library/Frameworks/[^/]+\.framework)/Versions/[^/]+/(.+)$", ref)
+    return f"{m.group(1)}/{m.group(2)}" if m else ref
+
+
+class Stager:
+    def __init__(self, sdk: str, out: Path | None = None, bundle_id: str = "dev.pocketnode.app",
+                 template: Path | None = None):
+        if sdk not in PLATFORM:
+            raise ValueError(f"sdk must be one of {list(PLATFORM)}")
+        self.sdk = sdk
+        self.out = Path(out or STAGE_ROOT / sdk)
+        self.pk = self.out / "app_packages"
+        self.fw = self.out / "Frameworks"
+        self.bundle_id = bundle_id
+        self.template = template
+        self.sdkver = sdk_version()
+        self.report = Report(sdk)
+
+    # ---------------------------------------------------------------- copy
+
+    def stage(self, packages: list[str], extra_paths: dict[str, Path] | None = None) -> Report:
+        t0 = time.time()
+        shutil.rmtree(self.out, ignore_errors=True)
+        self.pk.mkdir(parents=True)
+        self.fw.mkdir(parents=True)
+        for d in closure(packages):
+            self._copy_dist(d)
+        for name, src in (extra_paths or {}).items():
+            shutil.copytree(src, self.pk / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        self._convert_binaries()
+        self.report.seconds = time.time() - t0
+        (self.out / "stage-report.json").write_text(json.dumps(self.report.__dict__, indent=1))
+        return self.report
+
+    def _copy_dist(self, d: md.Distribution) -> None:
+        name = d.metadata["Name"]
+        self.report.dists[name] = d.version
+        for f in d.files or ():
+            rel = str(f)
+            if rel.startswith("..") or "__pycache__" in rel or rel.endswith(_SKIP_SUFFIXES):
+                continue
+            parts = f.parts
+            if len(parts) > 2 and parts[1] == "tests":  # pkg/tests/... isn't needed at runtime
+                continue
+            src = Path(d.locate_file(f))
+            if not src.is_file():
+                continue
+            if rel.endswith(".pth") and "__editable__" in rel:
+                continue
+            dst = self.pk / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    # --------------------------------------------------------- binaries
+
+    def _convert_binaries(self) -> None:
+        bins = [p for p in self.pk.rglob("*") if p.is_file() and not p.is_symlink() and is_macho(p)]
+        self.report.binaries = len(bins)
+        names: dict[Path, str] = {}
+        for p in bins:
+            names[p.resolve()] = self._framework_name(p)
+        info = {}
+        with ThreadPoolExecutor(8) as pool:
+            for p, lc in zip(bins, pool.map(lambda p: _load_commands(p), bins)):
+                info[p] = lc
+        problems = self._check(bins)
+        # Resolve bundled-library references before anything moves.
+        links: dict[Path, dict[str, str]] = {}
+        for p in bins:
+            deps, rpaths, _ = info[p]
+            links[p] = {}
+            for ref in deps:
+                target = _resolve(ref, p, rpaths)
+                if target is not None and target in names:
+                    links[p][ref] = names[target]
+        with ThreadPoolExecutor(8) as pool:
+            list(pool.map(lambda p: self._retag(p, info[p], names, problems.get(p), links[p]), bins))
+        for fw in self.fw.glob("pocketnode_shim_*.framework"):
+            self._write_plist(fw, fw.name[: -len(".framework")])
+
+    def _framework_name(self, p: Path) -> str:
+        rel = p.relative_to(self.pk)
+        stem = rel.name.split(".")[0] if p.suffix == ".so" else rel.name.split(".dylib")[0]
+        dotted = ".".join([*(x.lstrip(".") for x in rel.parent.parts), stem])
+        return re.sub(r"[^A-Za-z0-9_.]", "_", dotted)
+
+    def _check(self, bins: list[Path]) -> dict[Path, str]:
+        try:
+            from . import symcheck
+        except ImportError:
+            self.report.warnings.append("PyYAML missing: skipped the static iOS symbol check")
+            return {}
+        out = {}
+
+        def one(p):
+            try:
+                r = symcheck.analyze(str(p))
+            except Exception as e:
+                return p, f"check failed: {e}"
+            bad = list(r["missing_libs"])
+            by_lib: dict[str, list[str]] = {}
+            for sym, lib in r["missing_syms"]:
+                by_lib.setdefault(lib, []).append(sym)
+            if not bad and by_lib and all(shims.can_shim(v) for v in by_lib.values()):
+                return p, by_lib  # fixable with shims
+            syms = [s for s, _ in r["missing_syms"]]
+            if bad or syms:
+                return p, "; ".join(filter(None, [
+                    f"links {', '.join(bad)} (not on iOS)" if bad else "",
+                    f"needs {', '.join(syms[:6])}{'…' if len(syms) > 6 else ''} (not on iOS)" if syms else "",
+                ]))
+            return p, None
+
+        with ThreadPoolExecutor(8) as pool:
+            for p, why in pool.map(one, bins):
+                if why:
+                    out[p] = why
+        return out
+
+    def _retag(self, p: Path, lc, names: dict[Path, str], problem, links: dict[str, str]) -> None:
+        deps, rpaths, ident = lc
+        fw = names[p.resolve()]
+        rel = p.relative_to(self.pk)
+        shimmed: dict[str, str] = {}
+        if isinstance(problem, dict):
+            for lib, syms in problem.items():
+                shimmed[lib] = shims.build(lib, syms, self.sdk, MINOS, self.fw)
+                self.report.warnings.append(f"{fw}: shimmed {', '.join(syms)} from {lib}")
+            problem = None
+        if problem:
+            # Leave the module out: importing it raises ImportError, which the
+            # worker reports so the Mac runs the task instead.
+            self.report.excluded[fw] = problem
+            p.unlink()
+            return
+        _run("codesign", "--remove-signature", str(p)) if _signed(p) else None
+        if "arm64" in _run("lipo", "-archs", str(p)).split() and len(_run("lipo", "-archs", str(p)).split()) > 1:
+            _run("lipo", "-thin", "arm64", str(p), "-output", str(p))
+        args = []
+        for ref in deps:
+            new = _ios_framework_path(ref)
+            if new in shimmed or ref in shimmed:
+                name = shimmed.get(new) or shimmed[ref]
+                new = f"@rpath/{name}.framework/{name}"
+            if ref in links:
+                new = f"@rpath/{links[ref]}.framework/{links[ref]}"
+            if new != ref:
+                args += ["-change", ref, new]
+        if ident is not None:
+            args += ["-id", f"@rpath/{fw}.framework/{fw}"]
+        if "@executable_path/Frameworks" not in rpaths:
+            args += ["-add_rpath", "@executable_path/Frameworks"]
+        if args:
+            _run("install_name_tool", *args, str(p))
+        _run("xcrun", "vtool", "-set-build-version", PLATFORM[self.sdk], MINOS, self.sdkver,
+             "-replace", "-output", str(p), str(p))
+        fix_zerofill_offsets(p)
+        align_string_table(p)
+        # Into Frameworks/<dotted name>.framework/<dotted name>
+        dest = self.fw / f"{fw}.framework"
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(p), dest / fw)
+        self._write_plist(dest, fw)
+        if p.suffix == ".so":
+            fname = _DARWIN_SO.sub(rf".cpython-\1-{self.sdk}.so", p.name)
+            fwork = p.with_name(fname[: -len(".so")] + ".fwork")
+            fwork.write_text(f"Frameworks/{fw}.framework/{fw}")
+            (dest / f"{fw}.origin").write_text(str(Path("app_packages") / rel.parent / fwork.name))
+
+    def _write_plist(self, dest: Path, fw: str) -> None:
+        plist = {
+            "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": fw,
+            "CFBundleIdentifier": f"{self.bundle_id}.{fw}".replace("_", "-"),
+            "CFBundleInfoDictionaryVersion": "6.0", "CFBundlePackageType": "FMWK",
+            "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
+            "CFBundleSupportedPlatforms": ["iPhoneSimulator" if self.sdk == "iphonesimulator" else "iPhoneOS"],
+            "MinimumOSVersion": MINOS,
+        }
+        (dest / "Info.plist").write_bytes(plistlib.dumps(plist))
+
+
+_ZEROFILL_TYPES = {0x1, 0xC, 0x12}  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL
+
+
+def fix_zerofill_offsets(p: Path) -> int:
+    """Zero the file offset of zero-fill sections (they have no file contents).
+
+    Older linkers left a nonzero offset on __thread_bss. dyld tolerates that
+    for macOS binaries but rejects it on iOS ("has a zero-fill section type,
+    but offset field is not zero"). Returns the number of sections fixed.
+    """
+    import struct
+    data = bytearray(p.read_bytes())
+    if data[:4] != b"\xcf\xfa\xed\xfe":
+        return 0
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    off, fixed = 32, 0
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, off)
+        if cmd == 0x19:  # LC_SEGMENT_64
+            nsects = struct.unpack_from("<I", data, off + 64)[0]
+            sec = off + 72
+            for _ in range(nsects):
+                flags = struct.unpack_from("<I", data, sec + 64)[0]
+                if flags & 0xFF in _ZEROFILL_TYPES and struct.unpack_from("<I", data, sec + 48)[0]:
+                    struct.pack_into("<I", data, sec + 48, 0)
+                    fixed += 1
+                sec += 80
+        off += size
+    if fixed:
+        p.write_bytes(data)
+    return fixed
+
+
+# (cmd, [byte offsets of file-offset fields]) for load commands pointing into __LINKEDIT
+_LINKEDIT_FIELDS = {
+    0x2: [8, 16],                         # LC_SYMTAB: symoff, stroff
+    0xB: [32, 40, 48, 56, 64, 72],        # LC_DYSYMTAB
+    0x22: [8, 16, 24, 32, 40],            # LC_DYLD_INFO
+    0x80000022: [8, 16, 24, 32, 40],      # LC_DYLD_INFO_ONLY
+    **{c: [8] for c in (0x1D, 0x1E, 0x26, 0x29, 0x2B, 0x2E, 0x80000033, 0x80000034)},  # linkedit_data
+}
+
+
+def align_string_table(p: Path) -> int:
+    """Pad the symbol string table to an 8-byte boundary.
+
+    Some macOS wheels' bundled dylibs (sklearn's libomp) have a string pool at
+    a 4-byte offset; iOS dyld refuses them ("mis-aligned LINKEDIT string
+    pool"). Inserts padding and shifts every offset at or past it.
+    """
+    import struct
+    data = bytearray(p.read_bytes())
+    if data[:4] != b"\xcf\xfa\xed\xfe":
+        return 0
+    ncmds = struct.unpack_from("<I", data, 16)[0]
+    cmds, off = [], 32
+    stroff = None
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from("<II", data, off)
+        cmds.append((cmd, off))
+        if cmd == 0x2:
+            stroff = struct.unpack_from("<I", data, off + 16)[0]
+        off += size
+    if stroff is None or stroff % 8 == 0:
+        return 0
+    pad = 8 - stroff % 8
+    for cmd, at in cmds:
+        for f in _LINKEDIT_FIELDS.get(cmd, ()):
+            v = struct.unpack_from("<I", data, at + f)[0]
+            if v >= stroff:
+                struct.pack_into("<I", data, at + f, v + pad)
+        if cmd == 0x19 and bytes(data[at + 8: at + 24]).rstrip(b"\0") == b"__LINKEDIT":
+            vmsize, fileoff, filesize = struct.unpack_from("<QQQ", data, at + 32)
+            filesize += pad
+            vmsize = max(vmsize, (filesize + 0x3FFF) & ~0x3FFF)
+            struct.pack_into("<QQQ", data, at + 32, vmsize, fileoff, filesize)
+    data[stroff:stroff] = b"\0" * pad
+    p.write_bytes(data)
+    return pad
+
+
+def _signed(p: Path) -> bool:
+    return subprocess.run(["codesign", "-d", str(p)], capture_output=True).returncode == 0
+
+
+def stage(packages: list[str], sdk: str = "iphonesimulator", out: Path | None = None,
+          bundle_id: str = "dev.pocketnode.app") -> Report:
+    import pocketnode
+    src = Path(pocketnode.__file__).parent
+    s = Stager(sdk, out, bundle_id)
+    return s.stage(sorted(set(packages) | {"cloudpickle"}), extra_paths={"pocketnode": src})
