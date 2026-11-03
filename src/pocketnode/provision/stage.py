@@ -173,6 +173,12 @@ class Stager:
         for name, src in (extra_paths or {}).items():
             shutil.copytree(src, self.pk / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self._convert_binaries()
+        if "mlx" in self.report.dists:
+            from . import mlx_metal
+            try:
+                mlx_metal.install(self.out, self.report.dists["mlx"], self.sdk)
+            except Exception as e:  # MLX still runs on its CPU backend without kernels
+                self.report.warnings.append(f"mlx: no iOS GPU kernels ({e})")
         self.report.seconds = time.time() - t0
         (self.out / "stage-report.json").write_text(json.dumps(self.report.__dict__, indent=1))
         return self.report

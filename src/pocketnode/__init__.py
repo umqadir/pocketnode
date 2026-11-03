@@ -23,8 +23,15 @@ import os
 from .errors import NodeLost, PlacementError, Unavailable
 from .executor import Placement, PocketExecutor, PocketFuture, placement, runs_on
 
-__all__ = ["connect", "current", "parallel", "placement", "runs_on", "PocketExecutor", "PocketFuture",
-           "Placement", "PlacementError", "Unavailable", "NodeLost"]
+__all__ = ["connect", "current", "parallel", "placement", "runs_on", "packages", "PocketExecutor",
+           "PocketFuture", "Placement", "PlacementError", "Unavailable", "NodeLost"]
+
+
+def __getattr__(name):
+    if name == "packages":  # imported lazily: the selector pulls in provisioning code
+        from .provision.packages import packages
+        return packages
+    raise AttributeError(name)
 
 _current: PocketExecutor | None = None
 

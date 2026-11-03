@@ -124,7 +124,7 @@ def estimate(names: list[str]) -> dict:
         hist = [json.loads(l) for l in app_mod.HISTORY.read_text().splitlines() if l.strip()]
     builds = [h for h in hist if h.get("event") == "build"]
     installs = [h for h in hist if h.get("event") == "install"]
-    measured = bool(builds)
+    measured = bool(builds) and bool(installs)
     build_s = sorted(h["build_s"] + h["stage_s"] for h in builds)[len(builds) // 2] if builds else 90.0
     install_s = sorted(h["seconds"] for h in installs)[len(installs) // 2] if installs else 40.0
     sizes = {r.name.lower(): r.size_mb for r in table(check=False)}

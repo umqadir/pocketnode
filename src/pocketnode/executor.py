@@ -483,7 +483,7 @@ class PocketExecutor(Executor):
             else:
                 task.excluded[node.kind] = v.reason
                 if v.missing:
-                    self.missing_packages[v.missing] += 1
+                    self._missing(v.missing, task)
                 task.suggestion = v.suggestion
             return False, v.reason
         return True, ""
@@ -689,12 +689,12 @@ class PocketExecutor(Executor):
             suggestion = _unavailable_suggestion(u)
             if u.get("module"):
                 node.mac_only_modules.setdefault(u["module"], reason)
-                self.missing_packages[u["module"]] += 1
+                self._missing(u["module"], task)
             if task.placement not in ("auto", None) or self.strict:
                 return self._fail(task, PlacementError(f"{task.fn_label}: {reason}"
                                                        + (f". {suggestion}" if suggestion else "")))
             self.mac_only[task.fn_key] = (reason, suggestion)
-            self._requeue(task, node, reason, suggestion)
+            self._requeue(task, node, reason, suggestion, quiet=bool(u.get("module")))
             return
         # The task raised. Raise it as-is on the Mac, unless it came from the
         # phone: then confirm on the Mac first so platform differences never
@@ -774,6 +774,32 @@ class PocketExecutor(Executor):
         moved = att.task.future.placement.transfer_bytes + result_bytes
         if wire > 0 and moved > 4 << 20:
             node.bandwidth = 0.7 * node.bandwidth + 0.3 * (moved / wire)
+
+    def _missing(self, package: str, task: Task) -> None:
+        """A compiled package kept a task off the phone: offer to add it, once, with an estimate."""
+        first = package not in self.missing_packages
+        self.missing_packages[package] += 1
+        if not first or not self.notes:
+            return
+
+        def offer():
+            try:
+                from .provision import app, packages
+                if package in app.config().get("always_mac", []):
+                    return
+                est = packages.estimate([package])
+                how = "measured" if est["measured"] else "first-time estimate"
+                total = est["build_s"] + est["install_s"]
+                when = f"~{total // 60} min" if total >= 90 else f"~{total} s"
+                self._note(("missing", package),
+                           f"pocketnode: {package} isn't on the phone, so {task.fn_label} ran on the Mac.\n"
+                           f"  add it ({when}: build ~{est['build_s']} s, install/restart ~{est['install_s']} s, "
+                           f"{how}): pn.packages.add({package!r})\n"
+                           f"  or keep it on the Mac without asking again: pn.packages.always_mac({package!r})")
+            except Exception:  # noqa: BLE001 - the offer is advisory
+                log.debug("pocketnode: couldn't estimate adding %s", package, exc_info=True)
+
+        threading.Thread(target=offer, daemon=True).start()
 
     def _note(self, key, text: str) -> None:
         if not self.notes:
