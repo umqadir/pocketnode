@@ -136,6 +136,7 @@ class Node:
         self.bandwidth = source.bandwidth_guess  # bytes/s, refined by measurement
         self.latency = source.latency_guess
         self.bytes_sent = 0
+        self.lost_as_crash = False
         self.outbox: queue.Queue = queue.Queue()
         threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
 
@@ -270,6 +271,7 @@ class PocketExecutor(Executor):
         self.mac_only: dict[str, tuple[str, str | None]] = {}  # fn_key -> (reason, suggestion)
         self.missing_packages: dict[str, int] = defaultdict(int)
         self.crashes: dict[str, int] = defaultdict(int)
+        self._gone: dict[str, Node] = {}  # disconnected nodes, in case the same worker comes back
         self._cv = threading.Condition()
         self._shutdown = False
         self._noted: set[tuple] = set()
@@ -428,11 +430,20 @@ class PocketExecutor(Executor):
     def _add_node(self, node: Node) -> None:
         with self._cv:
             old = [n for n in self.nodes.values() if n.id == node.id]
-            for o in old:  # same worker reconnecting: carry over what we know
+            gone = self._gone.pop(node.id, None)
+            for o in old + ([gone] if gone else []):
+                # The same worker process reconnecting: its cache and in-flight
+                # attempts survived, so those tasks are running, not lost.
                 node.known = o.known
-                node.running = o.running
+                node.running = {k: a for k, a in o.running.items() if k in self.attempts}
                 for a in node.running.values():
                     a.node = node
+                    t = a.task
+                    if t.queued and not t.done:
+                        t.queued = False
+                    if o.lost_as_crash and t.excluded.get(node.kind, "").endswith("stopped while running it"):
+                        del t.excluded[node.kind]
+                        self.crashes[t.fn_key] = max(0, self.crashes[t.fn_key] - 1)
             self.nodes[node.id] = node
             self._cv.notify_all()
         if node.kind != "mac":
@@ -451,6 +462,9 @@ class PocketExecutor(Executor):
             # have crashed it: run that task on the Mac, and keep a function that
             # does it twice off the phone for good.
             crashed = node.kind != "mac" and node.state.get("lifecycle", "active") == "active"
+            node.lost_as_crash = crashed
+            if node.kind != "mac":
+                self._gone[node.id] = node
             for a in list(node.running.values()):
                 t = a.task
                 if crashed and t.placement in ("auto", None) and not t.done:

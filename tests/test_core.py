@@ -285,3 +285,41 @@ def test_pandas_accessor_equals_pandas(ex):
     f = lambda d: d.x.abs().sum()  # noqa: E731
     assert df.pn.groupby("g", executor=ex).apply(f).equals(df.groupby("g").apply(f))
     assert df.x.pn.map(lambda v: v * 3, executor=ex).equals(df.x.map(lambda v: v * 3))
+
+
+def test_results_held_across_disconnect(tmp_path):
+    """A result finished while the link is down is delivered on reconnect."""
+    import socket
+    import subprocess
+
+    tok = tmp_path / "token"
+    tok.write_text("t0ken")
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    proc = subprocess.Popen([str(SIM_PY), "-m", "pocketnode.worker", "--listen", f"127.0.0.1:{port}",
+                             "--token-file", str(tok), "--phone", "--kind", "phone", "--name", "held-test",
+                             "--cache-dir", str(tmp_path / "cache")],
+                            env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, stdout=subprocess.DEVNULL)
+    from pocketnode.sources import Address
+    e = pn.PocketExecutor(notes=False)
+    src = Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5)
+    e.add_source(src)
+    try:
+        assert e.wait_for("phone", 20)
+
+        def slow():
+            import time
+            time.sleep(2)
+            return "held"
+
+        f = e.on("phone").submit(slow)
+        time.sleep(0.5)
+        next(iter(e.nodes.values())).conn.close()  # link drops mid-task
+        assert f.result(timeout=30) == "held"
+        assert len(f.placement.attempts) == 1, "delivered the held result, not a re-run"
+    finally:
+        src.stop()
+        e.shutdown(wait=False)
+        proc.kill()

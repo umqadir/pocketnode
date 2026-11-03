@@ -142,3 +142,71 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
 - [C] TVM `ios_rpc`: new modules can't be uploaded without a custom dyld that needs JIT (debugger), so they were bundled at build time.
 - [C] exo: the $1,000 bounty for the Python node on iOS was closed unsolved (Pyto dependency problems; BeeWare judged buggy).
 
+
+## Local session results — Nov 2, 2026 (Mac + iOS 27.1 simulator; device runs pending)
+
+[M] = measured or verified here.
+
+### Retagging works, and replaces most cross-compiling
+- [M] With the pipeline below, the Mac's own installed binaries load and run in the iOS 27.1 simulator. Results match the Mac.
+
+  | Package | What was checked |
+  |---|---|
+  | numpy 2.3.4 | Accelerate BLAS; SVD |
+  | scipy 1.16.3 | Fortran-backed modules: odeint, L-BFGS-B, ARPACK |
+  | scikit-learn 1.8.0 | random forest, logistic regression, GridSearchCV |
+  | pandas 2.3.3 | groupby, timezones |
+  | statsmodels 0.14.6 | OLS |
+  | pyarrow 22 | Parquet round trip |
+  | polars 1.40 | eager and lazy |
+  | torch 2.11.0 | eager autograd, Adam, Conv2d; loss equals the Mac's to ~1e-8 |
+
+  The full eager PyTorch port (HANDOFF §8) is therefore no longer blue sky.
+- [M] Pipeline:
+  1. Thin to arm64.
+  2. `install_name_tool`: shallow framework paths, rewrite bundled-dylib references to `@rpath/<name>.framework`, add rpath `@executable_path/Frameworks`.
+  3. `vtool -set-build-version ios|iossim 17.0 <sdk>`.
+  4. Two binary patches, needed because iOS dyld is stricter than macOS for old binaries:
+     - zero the file offset of zero-fill sections (`__thread_bss`): error "zero-fill section type, but offset field is not zero";
+     - pad the LC_SYMTAB string pool to 8-byte alignment: error "mis-aligned LINKEDIT string pool" (sklearn's libomp).
+  5. Wrap every Mach-O as `Frameworks/<dotted>.framework` with a `.fwork` pointer.
+  6. Xcode signs.
+- [M] Symbols iOS lacks are handled per kind:
+  - scipy `libgcc_s` → `pthread_jit_write_protect_np`: shim (no-op).
+  - `cython_blas` → `dcabs1_`: shim (implemented).
+  - pyarrow/polars Security keychain functions: auto-stubbed to `errSecUnimplemented`, because the macOS headers declare them as returning OSStatus.
+  - Frameworks iOS lacks entirely (polars → AppKit `NSPasteboardTypeString`): a generated stand-in defining exactly the imported symbols. Weak-linking the dylib alone is not enough: dyld still demanded the individual symbol.
+- [M] Python-level gaps on iOS, fixed in `compat.py`:
+  - no `_multiprocessing` or `_posixshmem`: an in-process SemLock built on thread semaphores, so multiprocessing's thread pools, locks and queues work;
+  - joblib's default backend → threading at the real core count;
+  - torch ctypes-loads its relocated dylibs: redirected through a map written at staging;
+  - no USER/LOGNAME env (`getpass`);
+  - threadpoolctl goes down the Linux path on `ios`.
+- [M] Executables (`torch_shm_manager`) are replaced by placeholders. They can't run on iOS anyway.
+- [M] The iOS 27 SDK requires the UIScene lifecycle, otherwise the app is refused at launch. Its CPython 3.13 `PyConfig` has no `use_system_logger`.
+- [M] Static check over the Mac's 280-package environment: most compiled packages are clean or fixable.
+  - Truly blocked, because they link plain dylibs iOS lacks: pysam and pyBigWig (libcurl), cffi's backend (libffi).
+  - Partially blocked: pyproj and rasterio (libcurl modules only), pyobjc's AppKit parts.
+
+### Consequences for the design
+- Provisioning order changes from HANDOFF §5:
+  1. **Retag the Mac's own build.** This guarantees identical versions, so the version check always passes.
+  2. A published iOS wheel.
+  3. Cross-compile.
+  4. Mac-only.
+
+  A published wheel is now second because only numpy, pillow and cryptography have one, at versions different from the Mac's.
+- The router's version policy (`minor` by default) matters only for packages that weren't retagged.
+
+### Plumbing measured in the simulator (not phone numbers)
+- [M] The simulator shares the Mac's network stack and CPU. The link reaches 4.3 GB/s with a 0.23 ms round trip, so throughput and compute figures must come from the device.
+- [M] GridSearchCV (24 fits × 3 folds) through `pn.parallel()` with 4 Mac workers plus the simulator app: identical best params and scores, 33.8 s → 7.5 s.
+
+### Still to settle on the device
+`pocketnode experiments` runs each of these:
+- post-install `dlopen` (adhoc vs team signature);
+- usbmux throughput with the cable;
+- background survival after switching apps;
+- the `os_proc_available_memory` ceiling with increased-memory-limit;
+- sustained thermal behaviour;
+- device dyld accepting retagged binaries (expected, since the simulator applies the same loader checks, but signature enforcement is device-only).
