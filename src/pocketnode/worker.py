@@ -374,7 +374,9 @@ class Worker:
                 raise Unavailable("cache", "input buffers were evicted before the task started")
             # Each task gets its own writable copies unless the caller allowed
             # sharing read-only views (joblib passes read-only memmaps anyway).
-            views = [memoryview(b).toreadonly() if msg.get("ro") else bytearray(b) for b in held]
+            ro = msg.get("ro")
+            views = [memoryview(b).toreadonly() if ro is not None and len(b) >= ro else bytearray(b)
+                     for b in held]
             t1 = time.perf_counter()
             fn, args, kwargs = serialize.loads(payload, views)
             t2 = time.perf_counter()

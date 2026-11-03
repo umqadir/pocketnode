@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import queue
 import itertools
 import logging
 import os
@@ -73,7 +74,7 @@ class Task:
     packed: serialize.Packed
     future: PocketFuture
     placement: str  # auto | mac | phone | <node name>
-    ro: bool = False
+    ro: int | None = None  # buffers this big or bigger are shared read-only
     submitted: float = field(default_factory=time.monotonic)
     attempts: dict[str, "Attempt"] = field(default_factory=dict)
     excluded: dict[str, str] = field(default_factory=dict)  # node kind/name -> reason
@@ -135,6 +136,20 @@ class Node:
         self.bandwidth = source.bandwidth_guess  # bytes/s, refined by measurement
         self.latency = source.latency_guess
         self.bytes_sent = 0
+        self.outbox: queue.Queue = queue.Queue()
+        threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
+
+    def _sender(self) -> None:
+        while True:
+            att = self.outbox.get()
+            if att is None:
+                return
+            if att.task.done or att.id not in self.ex.attempts:
+                continue
+            try:
+                att.task.future.placement.transfer_bytes += self.send_task(att)
+            except (ConnectionClosed, OSError):
+                self.ex._send_failed(att)
 
     def effective_slots(self) -> int:
         if not self.connected:
@@ -171,8 +186,8 @@ class Node:
                 inline.append(b)
                 self.known.add(h)
         header = {"t": "task", "id": att.id, "bufs": specs}
-        if t.ro:
-            header["ro"] = 1
+        if t.ro is not None:
+            header["ro"] = t.ro
         self.conn.send(header, [t.packed.data, *inline])
         n = len(t.packed.data) + sum(b.nbytes for b in inline)
         self.bytes_sent += n
@@ -272,7 +287,7 @@ class PocketExecutor(Executor):
     def submit(self, fn: Callable, /, *args, **kwargs) -> PocketFuture:
         return self._submit(fn, args, kwargs, None, None)
 
-    def _submit(self, fn, args, kwargs, placement, memo, ro=False) -> PocketFuture:
+    def _submit(self, fn, args, kwargs, placement, memo, ro: int | None = None) -> PocketFuture:
         if self._shutdown:
             raise RuntimeError("cannot schedule new futures after shutdown")
         serialize.register_user_modules()
@@ -419,6 +434,7 @@ class PocketExecutor(Executor):
                        f"({node.slots} slots, Python {'.'.join(map(str, node.hello['python']))})")
 
     def _on_disconnect(self, node: Node) -> None:
+        node.outbox.put(None)
         with self._cv:
             node.connected = False
             if self.nodes.get(node.id) is node:
@@ -551,7 +567,7 @@ class PocketExecutor(Executor):
         return launched
 
     def _launch(self, task: Task, node: Node, speculative: bool) -> None:
-        if not task.future.set_running_or_notify_cancel() and not task.future.running():
+        if not _mark_running(task.future):
             task.queued = False
             return
         att = Attempt(uuid.uuid4().hex, task, node, time.monotonic(), speculative)
@@ -559,20 +575,26 @@ class PocketExecutor(Executor):
         task.queued = False
         self.attempts[att.id] = att
         node.running[att.id] = att
-        try:
-            sent = node.send_task(att)
-            task.future.placement.transfer_bytes += sent
-        except ConnectionClosed:
-            node.running.pop(att.id, None)
-            task.attempts.pop(att.id, None)
-            task.queued = True
+        node.outbox.put(att)  # sent by the node's own thread, outside the scheduler lock
+
+    def _send_failed(self, att: Attempt) -> None:
+        with self._cv:
+            att.node.running.pop(att.id, None)
+            att.task.attempts.pop(att.id, None)
+            self.attempts.pop(att.id, None)
+            t = att.task
+            if not t.done and not t.queued and not any(a.id in self.attempts for a in t.attempts.values()):
+                t.queued = True
+                self.queue.appendleft(t)
+            self._cv.notify_all()
 
     def _fail(self, task: Task, exc: BaseException) -> None:
         task.queued = False
-        if not task.future.done():
-            if not task.future.running():
-                task.future.set_running_or_notify_cancel()
-            task.future.set_exception(exc)
+        if _mark_running(task.future):
+            try:
+                task.future.set_exception(exc)
+            except Exception:
+                pass
 
     # ---------------------------------------------------------- messages
 
@@ -746,6 +768,18 @@ class PocketExecutor(Executor):
                 return
             self._noted.add(key)
         log.info(text)
+
+
+def _mark_running(fut: Future) -> bool:
+    """PENDING -> RUNNING; True if the future is (now) running, False if cancelled or done."""
+    if fut.running():
+        return True
+    if fut.done():
+        return False
+    try:
+        return fut.set_running_or_notify_cancel()
+    except RuntimeError:
+        return fut.running()
 
 
 class PlacedExecutor:

@@ -186,7 +186,7 @@ def install(roots: list[str], scratch: str, phone_dirs: tuple[str, ...] = ()) ->
     import subprocess
     subprocess.Popen._execute_child = lambda self, *a, **k: no_process("subprocess.Popen")()
     # joblib inside a task falls back to threads rather than trying processes.
-    os.environ.setdefault("JOBLIB_MULTIPROCESSING", "0")
+    pass
 
 
 def user_frame_import(top: str, phone_dirs: tuple[str, ...]) -> bool:
