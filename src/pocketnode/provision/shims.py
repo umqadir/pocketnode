@@ -25,6 +25,15 @@ IMPLEMENTATIONS = {
     "_pthread_jit_write_protect_np": "void pthread_jit_write_protect_np(int enabled) { (void)enabled; }",
     # BLAS helper macOS Accelerate exports and iOS Accelerate doesn't: |Re z| + |Im z|.
     "_dcabs1_": "#include <math.h>\ndouble dcabs1_(const double *z) { return fabs(z[0]) + fabs(z[1]); }",
+    # macOS GPU hot-plug API (MLX). An iPhone has exactly one GPU and nothing to observe.
+    "_MTLCopyAllDevicesWithObserver": (
+        "#import <Metal/Metal.h>\n"
+        "__attribute__((ns_returns_retained)) NSArray *MTLCopyAllDevicesWithObserver("
+        "id __strong *observer, id handler) {\n"
+        "  if (observer) *observer = [NSObject new];\n"
+        "  id<MTLDevice> d = MTLCreateSystemDefaultDevice();\n"
+        "  return d ? @[d] : @[];\n}"),
+    "_MTLRemoveDeviceObserver": "void MTLRemoveDeviceObserver(id observer) { (void)observer; }",
 }
 
 
@@ -72,12 +81,13 @@ def build(lib: str, symbols: list[str], sdk: str, minos: str, out_dir: Path) -> 
     if binary.exists():
         return name
     fw.mkdir(parents=True, exist_ok=True)
-    src = fw / "shim.c"
+    src = fw / "shim.m"
     src.write_text("\n".join(implementation(s, lib) for s in syms) + "\n")
     target = f"arm64-apple-ios{minos}" + ("-simulator" if sdk == "iphonesimulator" else "")
     sdkpath = subprocess.check_output(["xcrun", "--sdk", sdk, "--show-sdk-path"], text=True).strip()
     subprocess.run(["xcrun", "--sdk", sdk, "clang", "-target", target, "-isysroot", sdkpath, "-dynamiclib",
-                    "-O2", "-w", "-install_name", f"@rpath/{name}.framework/{name}", *_reexport_flag(lib),
+                    "-fobjc-arc", "-O2", "-w", "-framework", "Foundation",
+                    "-install_name", f"@rpath/{name}.framework/{name}", *_reexport_flag(lib),
                     str(src), "-o", str(binary)], check=True, capture_output=True)
     src.unlink()
     return name

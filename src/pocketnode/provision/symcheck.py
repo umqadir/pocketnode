@@ -12,9 +12,21 @@ import sys
 
 import yaml
 
+_SDK_NAME = "iphoneos"
+
+
+def use_sdk(name: str) -> None:
+    """Check against this SDK ("iphoneos" or "iphonesimulator"); their system libraries differ."""
+    global _SDK_NAME
+    if name != _SDK_NAME:
+        _SDK_NAME = name
+        for f in (_sdk, load_docs, exports_of, inline_exports):
+            f.cache_clear()
+
+
 @functools.lru_cache(None)
 def _sdk() -> str:
-    return subprocess.check_output(["xcrun", "--show-sdk-path", "--sdk", "iphoneos"], text=True).strip()
+    return subprocess.check_output(["xcrun", "--show-sdk-path", "--sdk", _SDK_NAME], text=True).strip()
 
 def ios_path(install):
     # macOS deep framework path -> iOS shallow path
@@ -41,7 +53,7 @@ def load_docs(path):
         return [("json", json.loads(txt))]
     return [("yaml", d) for d in yaml.load_all(txt, Loader=Loader) if d]
 
-ARM = ("arm64-ios", "arm64e-ios", "arm64e.x1-ios")
+ARM = ("arm64-ios", "arm64e-ios", "arm64e.x1-ios", "arm64-ios-simulator")
 def ok_targets(t): return any(x in ARM for x in t)
 
 @functools.lru_cache(None)
@@ -136,7 +148,7 @@ def analyze(path):
         elif exports_of(l) is None:
             res["missing_libs"].append(l)
     for line in imps.splitlines():
-        m = re.match(r"\s+(\S+)\s+(\[weak-import\]\s+)?\(from (.+)\)", line)
+        m = re.match(r"\s+(?:0x[0-9a-fA-F]+\s+)?(\S+)\s+(\[weak-import\]\s+)?\(from (.+)\)", line)
         if not m: continue
         sym, weak, src = m.group(1), m.group(2), m.group(3)
         if src == "<flat-namespace>":

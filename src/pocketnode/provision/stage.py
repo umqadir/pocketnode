@@ -248,6 +248,9 @@ class Stager:
     def _check(self, bins: list[Path]) -> dict[Path, str]:
         try:
             from . import symcheck
+            # Always the device SDK: it's the real target, and the simulator
+            # SDK's libSystem stubs give false misses.
+            symcheck.use_sdk("iphoneos")
         except ImportError:
             self.report.warnings.append("PyYAML missing: skipped the static iOS symbol check")
             return {}

@@ -87,6 +87,23 @@ def _torch_step():
     return (time.perf_counter() - t0) / 50
 
 
+def _mlx_gpu():
+    import time
+    import mlx.core as mx
+    info = {k: v for k, v in mx.metal.device_info().items()
+            if k in ("architecture", "device_name", "memory_size", "max_recommended_working_set_size")}
+    out = {"metal": mx.metal.is_available(), **info}
+    for n in (1024, 4096):
+        a = mx.random.normal((n, n), dtype=mx.float16)
+        mx.eval(a @ a)
+        t0, reps = time.perf_counter(), 0
+        while time.perf_counter() - t0 < 2:
+            mx.eval(a @ a)
+            reps += 1
+        out[f"fp16_matmul_{n}_tflops"] = round(2 * n**3 * reps / (time.perf_counter() - t0) / 1e12, 2)
+    return out
+
+
 def _heartbeat(seconds: float, period: float = 0.25):
     """Record wall-clock ticks; gaps show when the process was suspended."""
     ticks, t_end = [], time.time() + seconds
@@ -207,6 +224,7 @@ def compute(ex) -> dict:
         "matmul_f32_all_gflops": (_matmul_gflops, (2048, "float32", None)),
         "sklearn_rf_fit_s": (_sklearn_fit, ()),
         "torch_mlp_step_s": (_torch_step, ()),
+        "mlx_gpu": (_mlx_gpu, ()),
     }
     for name, (fn, args) in jobs.items():
         row = {}
