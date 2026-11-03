@@ -29,6 +29,15 @@ __all__ = ["connect", "current", "parallel", "placement", "runs_on", "PocketExec
 _current: PocketExecutor | None = None
 
 
+def _register_pandas(_mod) -> None:
+    from .integrations import pandas as _  # noqa: F401  (registers the .pn accessor)
+
+
+from .compat import when_imported as _when_imported  # noqa: E402
+
+_when_imported("pandas", _register_pandas)
+
+
 def _setup_logging() -> None:
     log = logging.getLogger("pocketnode")
     if not log.handlers:

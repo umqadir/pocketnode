@@ -315,6 +315,11 @@ class PocketExecutor(Executor):
         futs = [self._submit(fn, a, {}, placement, memo) for a in zip(*iterables)]
         return _result_iter(futs, timeout)
 
+    @property
+    def _max_workers(self) -> int:
+        """Concurrent slots right now (dask reads this to size its thread pool)."""
+        return max(1, sum(n.effective_slots() for n in self.nodes.values()))
+
     def on(self, placement: str) -> "PlacedExecutor":
         """A view of this executor that forces placement: `ex.on("phone").submit(f, x)`."""
         return PlacedExecutor(self, placement)

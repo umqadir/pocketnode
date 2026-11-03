@@ -115,6 +115,7 @@ class Worker:
         self._conn_ready = threading.Condition(self._lock)
         self.finder = RemoteFinder(self.cache_dir, self._fetch_module, on_miss=self._on_compiled_miss)
         self.tasks_done = 0
+        self.override: dict = {}  # test hook: pretend thermal/lifecycle state
         install_finder(self.finder)
         _install_streams()
         compat.install()
@@ -169,6 +170,7 @@ class Worker:
         s = device.snapshot()
         s["lifecycle"] = self.lifecycle
         s["running"] = len(self.running)
+        s.update(self.override)
         return s
 
     def notify(self, lifecycle: str | None = None) -> None:
@@ -299,6 +301,11 @@ class Worker:
                 self.store.unpin(h)
         elif t == "ping":
             self._send({"t": "pong", "ts": msg.get("ts"), "state": self.state(), "store": self.store.stats()})
+        elif t == "override_state":
+            self.override = msg.get("state", {})
+            if "lifecycle" in self.override:
+                self.lifecycle = self.override["lifecycle"]
+            self._send({"t": "state", **self.state()})
         elif t == "drop_cache":
             self.store.clear()
         elif t == "echo":  # throughput probe
