@@ -25,7 +25,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import compat, device, guards, serialize
+from . import compat, device, guards, serialize, subinterp
 from .errors import TaskCancelled, Unavailable
 from .importer import RemoteFinder, install as install_finder
 from .store import BufferStore
@@ -130,6 +130,13 @@ class Worker:
                      os.path.expanduser("~"), *[p for p in sys.path if p and os.path.isabs(p)]]
             guards.install(roots, str(self.scratch), self._phone_dirs)
             os.chdir(self.scratch)
+        self.subpool = None
+        self.no_sub: set[str] = set()
+        if self.phone and subinterp.AVAILABLE and os.environ.get("POCKETNODE_SUBINTERPRETERS", "1") != "0" \
+                and getattr(sys, "_is_gil_enabled", lambda: True)():
+            self.subpool = subinterp.SubPool(
+                self.slots, roots if self.phone else None, str(self.scratch), self._phone_dirs,
+                extra_paths=lambda: [str(d) for d in list(self.finder.resolved.values()) if d])
 
     def _default_budget(self) -> int:
         avail = device.available_memory()
@@ -385,6 +392,11 @@ class Worker:
             views = [memoryview(b).toreadonly() if ro is not None and len(b) >= ro else bytearray(b)
                      for b in held]
             t1 = time.perf_counter()
+            if self.subpool is not None and msg.get("pure") and msg.get("fk") not in self.no_sub:
+                done = self._run_sub(msg, payload, views, header, t0, t1)
+                if done is not None:
+                    out_bufs = done
+                    raise _Sent
             fn, args, kwargs = serialize.loads(payload, views)
             t2 = time.perf_counter()
             guards.begin_task()
@@ -421,6 +433,8 @@ class Worker:
                 timing={"prep": t1 - t0, "load": t2 - t1, "run": t3 - t2, "dump": t4 - t3},
                 fetched=dict(self.finder.fetched), missing=list(self.finder.missing_compiled),
             )
+        except _Sent:
+            pass
         except TaskCancelled:
             return
         except Unavailable as u:
@@ -444,6 +458,32 @@ class Worker:
         if not self._send(header, out_bufs):
             with self._lock:
                 self.held[tid] = (header, out_bufs)
+
+    def _run_sub(self, msg, payload, views, header, t0, t1) -> list | None:
+        """Run a pure task in a subinterpreter. None means: run it in the main interpreter."""
+        try:
+            out = self.subpool.run(payload, views)
+        except Exception as e:  # noqa: BLE001 - infrastructure trouble: fall back
+            out = {"status": "needs-main", "detail": repr(e)}
+        t3 = time.perf_counter()
+        status = out["status"]
+        if status == "needs-main":
+            self.no_sub.add(msg.get("fk"))
+            return None
+        bufs: list = []
+        if status == "ok":
+            header["ok"] = True
+            bufs = [out["value"]]
+        elif status == "unavailable":
+            kind, detail, module = out["u"]
+            header.update(ok=False, unavailable={"kind": kind, "detail": detail, "module": module})
+        else:
+            header.update(ok=False, error=out.get("tb", ""), exc_type=out.get("etype", "Error"))
+            bufs = [out["exc"]] if "exc" in out else []
+        header.update(stdout=out.get("stdout", ""), stderr=out.get("stderr", ""), sub=1,
+                      timing={"prep": t1 - t0, "load": 0.0, "run": t3 - t1, "dump": 0.0},
+                      fetched=dict(self.finder.fetched), missing=list(self.finder.missing_compiled))
+        return bufs
 
     def _missing_from(self, exc) -> Unavailable | None:
         """An ImportError for a compiled module the Mac has but this node lacks."""
@@ -480,6 +520,10 @@ class Worker:
             return info, bytes(data) if data is not None else None
         finally:
             self._pending_imports.pop(req, None)
+
+
+class _Sent(Exception):
+    """Internal: the task already ran in a subinterpreter."""
 
 
 def _format_exc(exc: BaseException) -> str:

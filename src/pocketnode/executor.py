@@ -75,6 +75,7 @@ class Task:
     future: PocketFuture
     placement: str  # auto | mac | phone | <node name>
     ro: int | None = None  # buffers this big or bigger are shared read-only
+    pure: bool = False  # only stdlib/pure-Python modules: may run in a phone subinterpreter
     submitted: float = field(default_factory=time.monotonic)
     attempts: dict[str, "Attempt"] = field(default_factory=dict)
     excluded: dict[str, str] = field(default_factory=dict)  # node kind/name -> reason
@@ -186,7 +187,9 @@ class Node:
                 specs.append({"h": h, "i": 1})
                 inline.append(b)
                 self.known.add(h)
-        header = {"t": "task", "id": att.id, "bufs": specs}
+        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key}
+        if t.pure:
+            header["pure"] = 1
         if t.ro is not None:
             header["ro"] = t.ro
         self.conn.send(header, [t.packed.data, *inline])
@@ -280,6 +283,7 @@ class PocketExecutor(Executor):
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
         serialize.register_user_modules()
+        threading.Thread(target=envinfo.manifest, daemon=True).start()  # warm the env scan
 
     # --------------------------------------------------------------- API
 
@@ -299,7 +303,7 @@ class PocketExecutor(Executor):
         packed = serialize.dumps((fn, args, kwargs), memo=memo)
         key, label = _fn_identity(fn)
         fut = PocketFuture()
-        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro)
+        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules))
         with self._cv:
             for b, h in zip(packed.buffers, packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)

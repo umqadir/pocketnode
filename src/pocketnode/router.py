@@ -64,3 +64,16 @@ def check(modules: set[str], node, version_policy: str = "minor") -> Verdict:
                                "or allow it with version_policy='any'",
                 )
     return Verdict(True)
+
+
+def is_pure(modules: set[str]) -> bool:
+    """Only the stdlib and pure-Python packages (so it can run in a subinterpreter)."""
+    import sys
+    man = envinfo.manifest()
+    for m in modules - IGNORE:
+        if m in sys.stdlib_module_names:
+            continue
+        info = man.get(m)
+        if info is not None and info["kind"] == "compiled":
+            return False
+    return True
