@@ -89,6 +89,11 @@ def closure(names: list[str]) -> list[md.Distribution]:
     return list(out.values())
 
 
+def _is_executable(p: Path) -> bool:
+    out = _run("otool", "-hv", "-arch", "arm64", str(p)) if "arm64" in _run("lipo", "-archs", str(p)) else ""
+    return " EXECUTE " in out
+
+
 def is_macho(p: Path) -> bool:
     try:
         with open(p, "rb") as f:
@@ -195,6 +200,11 @@ class Stager:
 
     def _convert_binaries(self) -> None:
         bins = [p for p in self.pk.rglob("*") if p.is_file() and not p.is_symlink() and is_macho(p)]
+        # Executables (helper tools like torch_shm_manager) can never run on iOS:
+        # no child processes. Keep a placeholder so existence checks still pass.
+        for p in [b for b in bins if _is_executable(b)]:
+            p.write_text("pocketnode: executables can't run on iOS (no child processes)\n")
+            bins.remove(p)
         self.report.binaries = len(bins)
         names: dict[Path, str] = {}
         for p in bins:
@@ -217,6 +227,11 @@ class Stager:
             list(pool.map(lambda p: self._retag(p, info[p], names, problems.get(p), links[p]), bins))
         for fw in self.fw.glob("pocketnode_shim_*.framework"):
             self._write_plist(fw, fw.name[: -len(".framework")])
+        # Libraries some packages load by path with ctypes (torch, lightgbm, ...)
+        # now live in Frameworks; the worker redirects those loads through this map.
+        moved = {str(p.relative_to(self.pk)): f"Frameworks/{names[p.resolve()]}.framework/{names[p.resolve()]}"
+                 for p in bins if p.suffix != ".so" and names[p.resolve()] not in self.report.excluded}
+        (self.pk / "pocketnode_dylib_map.json").write_text(json.dumps(moved, indent=0))
 
     def _framework_name(self, p: Path) -> str:
         rel = p.relative_to(self.pk)
@@ -410,3 +425,11 @@ def stage(packages: list[str], sdk: str = "iphonesimulator", out: Path | None = 
     src = Path(pocketnode.__file__).parent
     s = Stager(sdk, out, bundle_id)
     return s.stage(sorted(set(packages) | {"cloudpickle"}), extra_paths={"pocketnode": src})
+
+
+def refresh_pocketnode(sdk: str = "iphonesimulator") -> None:
+    """Update just the staged copy of pocketnode itself (fast inner loop while developing)."""
+    import pocketnode
+    dst = STAGE_ROOT / sdk / "app_packages" / "pocketnode"
+    shutil.copytree(Path(pocketnode.__file__).parent, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))

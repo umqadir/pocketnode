@@ -42,15 +42,21 @@ def packages() -> list[str]:
 
 
 def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str | None = None,
-          bundle_id: str | None = None, restage: bool = True) -> Path:
-    """Stage packages, generate the Xcode project and build. Returns the .app path."""
+          bundle_id: str | None = None, restage: bool | str = True) -> Path:
+    """Stage packages, generate the Xcode project and build. Returns the .app path.
+
+    restage: True restages everything, "pocketnode" refreshes only pocketnode
+    itself (fast while developing), False reuses the existing stage.
+    """
     pairing_token()
     cfg = config()
     pkgs = pkgs or packages()
     team = team if team is not None else cfg.get("team", "")
     bundle_id = bundle_id or cfg.get("bundle_id", BUNDLE_ID)
     t0 = time.time()
-    if restage:
+    if restage == "pocketnode":
+        stage_mod.refresh_pocketnode(sdk)
+    elif restage:
         rep = stage_mod.stage(pkgs, sdk, bundle_id=bundle_id)
         for mod, why in rep.excluded.items():
             print(f"  left out {mod}: {why}")

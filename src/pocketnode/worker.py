@@ -25,7 +25,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import device, guards, serialize
+from . import compat, device, guards, serialize
 from .errors import TaskCancelled, Unavailable
 from .importer import RemoteFinder, install as install_finder
 from .store import BufferStore
@@ -117,6 +117,7 @@ class Worker:
         self.tasks_done = 0
         install_finder(self.finder)
         _install_streams()
+        compat.install()
         self._phone_dirs = tuple(
             os.path.realpath(p) for p in {sys.prefix, sys.base_prefix, os.path.dirname(os.__file__),
                                            str(self.finder.cache_dir), *[p for p in sys.path if p]}

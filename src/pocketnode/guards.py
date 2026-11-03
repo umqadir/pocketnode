@@ -66,6 +66,11 @@ class Roots:
         return False
 
 
+# Where Mac data lives. These don't exist on the phone, so a task touching them
+# means the user meant the Mac's file.
+_MAC_PREFIXES = ("/Users/", "/Volumes/", "/opt/", "/Applications/", "/Library/", "/tmp/", "/private/tmp/",
+                 "/var/folders/", "/private/var/folders/", "/home/", "/usr/local/", "/Network/")
+
 _roots: Roots | None = None
 _scratch: str = ""
 _phone_dirs: tuple[str, ...] = ()
@@ -112,9 +117,12 @@ def _check_path(file, writing: bool, op: str):
         return
     if not os.path.isabs(path):
         trip("mac-file", f"{op}({path!r}) uses a relative path, which means the Mac's working directory")
-    if not _roots.local(path):
+    if _roots.local(path):
+        return
+    if writing or path.startswith(_MAC_PREFIXES):
         what = "writes" if writing else "reads"
         trip("mac-file", f"{op} {what} {path}, which is on the Mac, not the phone")
+    # Anything else (/proc, /sys, ...) gets the OS's own answer, as on the Mac.
 
 
 def install(roots: list[str], scratch: str, phone_dirs: tuple[str, ...] = ()) -> None:
