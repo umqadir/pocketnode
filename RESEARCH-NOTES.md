@@ -210,3 +210,12 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
 - the `os_proc_available_memory` ceiling with increased-memory-limit;
 - sustained thermal behaviour;
 - device dyld accepting retagged binaries (expected, since the simulator applies the same loader checks, but signature enforcement is device-only).
+
+### Later in the same session
+- [M] Parallel pure Python without processes: Python 3.13's isolated subinterpreters (`_interpreters`, each with its own GIL) exist in the iOS build. On the stand-in, six pure-Python tasks take 3.1× the time of one, i.e. they run in parallel, and the same holds in the iOS simulator. numpy can't load in subinterpreters, so tasks that use it stay in the main interpreter on threads (BLAS releases the GIL). In 3.13 the low-level queue module needs the test-only `test.support.interpreters`, and `exec`/`call` can't return values, so results come back over a pipe.
+- [M] MLX:
+  - The macOS metallib can't serve iOS, so the iOS metallib is compiled from the v0.31.1 kernel sources with the Metal toolchain (a separate 839 MB Xcode component), NAX kernels included: 125 MB.
+  - `libmlx` imports `MTLCopyAllDevicesWithObserver` and `MTLRemoveDeviceObserver`, which iOS lacks; they're shimmed with the single-GPU meaning.
+  - In the simulator, MLX segfaults because the virtual GPU has no `architecture.name`. GPU numbers wait for the device.
+- [M] A bug in the static check: with chained-fixup binaries, `dyld_info` prints an index before each import (`0x0014 _sym (from Lib)`), which the original regex skipped. Those binaries passed unchecked until this was fixed.
+- [M] Verification of each function's first phone result against the Mac (tolerance-aware, with a second Mac run to tell nondeterminism from real differences) is on by default for automatically placed work.
