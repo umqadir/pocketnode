@@ -269,6 +269,7 @@ class PocketExecutor(Executor):
         self.stats = FnStats()
         self.mac_only: dict[str, tuple[str, str | None]] = {}  # fn_key -> (reason, suggestion)
         self.missing_packages: dict[str, int] = defaultdict(int)
+        self.crashes: dict[str, int] = defaultdict(int)
         self._cv = threading.Condition()
         self._shutdown = False
         self._noted: set[tuple] = set()
@@ -446,8 +447,17 @@ class PocketExecutor(Executor):
                 del self.nodes[node.id]
             # In-flight work there is now suspect: make it runnable elsewhere.
             # A late result (after reconnect) is still accepted if it comes first.
+            # If the app went away while active (not backgrounded), the task may
+            # have crashed it: run that task on the Mac, and keep a function that
+            # does it twice off the phone for good.
+            crashed = node.kind != "mac" and node.state.get("lifecycle", "active") == "active"
             for a in list(node.running.values()):
                 t = a.task
+                if crashed and t.placement in ("auto", None) and not t.done:
+                    t.excluded[node.kind] = f"the {node.kind} app stopped while running it"
+                    self.crashes[t.fn_key] += 1
+                    if self.crashes[t.fn_key] >= 2:
+                        self.mac_only[t.fn_key] = (f"stopped the {node.kind} app twice", None)
                 if not t.done and not t.queued and not any(
                     x.node.connected and x.id != a.id for x in t.attempts.values()
                 ):

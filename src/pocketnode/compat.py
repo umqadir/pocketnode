@@ -26,6 +26,13 @@ def install() -> None:
     _redirect_ctypes()
     _stub_multiprocessing()
     when_imported("joblib.parallel", _joblib_threads)
+    when_imported("threadpoolctl", _threadpoolctl_dyld)
+
+
+def _threadpoolctl_dyld(mod) -> None:
+    """threadpoolctl picks how to list loaded libraries by sys.platform; iOS uses dyld like macOS."""
+    c = mod.ThreadpoolController
+    c._find_libraries_with_dl_iterate_phdr = c._find_libraries_with_dyld
 
 
 def _joblib_threads(mod) -> None:

@@ -127,7 +127,8 @@ def analyze(path):
         l = l.strip()
         if l: libs.append(l.split(" (compatibility")[0])
     imps = subprocess.run(["dyld_info", "-arch", "arm64", "-imports", path], capture_output=True, text=True).stdout
-    res = {"missing_libs": [], "missing_syms": [], "flat_nonpy": [], "flat_py": 0, "rpath_libs": []}
+    res = {"missing_libs": [], "missing_syms": [], "flat_nonpy": [], "flat_py": 0, "rpath_libs": [],
+           "absent_imports": {}}
     leafmap = {leaf(l): l for l in libs}
     for l in libs:
         if l.startswith("@"):
@@ -145,6 +146,9 @@ def analyze(path):
                 res["flat_nonpy"].append(sym)
             continue
         lib = leafmap.get(src)
+        if lib in res["missing_libs"]:
+            res["absent_imports"].setdefault(lib, []).append(sym)
+            continue
         if lib is None or lib.startswith("@"):
             continue
         ex = exports_of(lib)

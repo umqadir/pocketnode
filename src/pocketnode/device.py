@@ -63,7 +63,7 @@ def available_memory() -> int | None:
         try:
             f = _libc.os_proc_available_memory
             f.restype = ctypes.c_size_t
-            return int(f())
+            return int(f()) or None  # 0 means no limit applies (the simulator)
         except AttributeError:
             return None
     return None

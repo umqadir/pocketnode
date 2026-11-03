@@ -225,7 +225,7 @@ class Stager:
                     links[p][ref] = names[target]
         with ThreadPoolExecutor(8) as pool:
             list(pool.map(lambda p: self._retag(p, info[p], names, problems.get(p), links[p]), bins))
-        for fw in self.fw.glob("pocketnode_shim_*.framework"):
+        for fw in [*self.fw.glob("pocketnode_shim_*.framework"), *self.fw.glob("pocketnode_absent_*.framework")]:
             self._write_plist(fw, fw.name[: -len(".framework")])
         # Libraries some packages load by path with ctypes (torch, lightgbm, ...)
         # now live in Frameworks; the worker redirects those loads through this map.
@@ -252,12 +252,17 @@ class Stager:
                 r = symcheck.analyze(str(p))
             except Exception as e:
                 return p, f"check failed: {e}"
-            bad = list(r["missing_libs"])
+            # System frameworks iOS lacks (AppKit, Carbon, ...) back peripheral
+            # features (GUI, clipboard): stand-ins let the rest load.
+            # Missing plain dylibs (libcurl, libffi) are core to their module.
+            weak = {l for l in r["missing_libs"] if l.startswith("/System/Library/Frameworks/")}
+            bad = [l for l in r["missing_libs"] if l not in weak]
             by_lib: dict[str, list[str]] = {}
             for sym, lib in r["missing_syms"]:
                 by_lib.setdefault(lib, []).append(sym)
-            if not bad and by_lib and all(shims.can_shim(v) for v in by_lib.values()):
-                return p, by_lib  # fixable with shims
+            if not bad and (weak or by_lib) and all(shims.can_shim(v, l) for l, v in by_lib.items()):
+                absent = {l: r["absent_imports"].get(l, []) for l in weak}
+                return p, {"shim": by_lib, "absent": absent}  # fixable
             syms = [s for s, _ in r["missing_syms"]]
             if bad or syms:
                 return p, "; ".join(filter(None, [
@@ -278,9 +283,13 @@ class Stager:
         rel = p.relative_to(self.pk)
         shimmed: dict[str, str] = {}
         if isinstance(problem, dict):
-            for lib, syms in problem.items():
+            for lib, syms in problem["shim"].items():
                 shimmed[lib] = shims.build(lib, syms, self.sdk, MINOS, self.fw)
                 self.report.warnings.append(f"{fw}: shimmed {', '.join(syms)} from {lib}")
+            for lib, syms in problem["absent"].items():
+                shimmed[lib] = shims.build_absent(lib, syms, self.sdk, MINOS, self.fw)
+                self.report.warnings.append(f"{fw}: {Path(lib).name} isn't on iOS; stood in for "
+                                            f"{', '.join(syms) or 'nothing'} (features using it are unavailable)")
             problem = None
         if problem:
             # Leave the module out: importing it raises ImportError, which the
