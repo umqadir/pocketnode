@@ -22,7 +22,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from ..sources import BUNDLE_ID, CONFIG_DIR
+from ..sources import CONFIG_DIR
 from . import app as app_mod
 from . import stage as stage_mod
 
@@ -47,7 +47,7 @@ def node_sdk(node) -> str | None:
 
 def signing_identity() -> str:
     """The certificate that signed the installed app (added code must use the same one)."""
-    built = app_mod.IOS_DIR / "build" / "Build" / "Products" / "Debug-iphoneos" / "PocketNode.app"
+    built = app_mod.product("iphoneos")
     if built.exists():
         r = subprocess.run(["codesign", "-dvv", str(built)], capture_output=True, text=True)
         for line in r.stderr.splitlines():
@@ -80,12 +80,13 @@ def prepare(names: list[str], have: dict[str, str], sdk: str | None, out: Path) 
             if wanted(d):
                 s._copy_dist(d)
         return s.report
-    s = stage_mod.Stager(sdk, out, bundle_id=app_mod.config().get("bundle_id", BUNDLE_ID), inplace=True)
+    # Code added to a running app must carry the app's bundle identifier as its signing identifier.
+    bid = app_mod.bundle_id(sdk)
+    s = stage_mod.Stager(sdk, out, bundle_id=bid, inplace=True)
     rep = s.stage(names, only=wanted)
     bins = [p for p in s.pk.rglob("*") if p.is_file() and not p.is_symlink() and stage_mod.is_macho(p)]
     if sdk == "iphoneos":
-        ident, bid = signing_identity(), app_mod.config().get("bundle_id", BUNDLE_ID)
-        args = ["-s", ident, "--identifier", bid]
+        args = ["-s", signing_identity(), "--identifier", bid]
     else:
         args = ["-s", "-"]  # the simulator doesn't check who signed
 

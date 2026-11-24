@@ -20,8 +20,37 @@ from .wire import Refused
 log = logging.getLogger("pocketnode")
 
 CONFIG_DIR = Path(os.environ.get("POCKETNODE_HOME", Path.home() / ".pocketnode"))
-BUNDLE_ID = "dev.pocketnode.app"
+SIM_BUNDLE_ID = "dev.pocketnode.app"
 PHONE_PORT = 7151
+
+
+def app_config() -> dict:
+    """The app's build settings (~/.pocketnode/app.json)."""
+    import json
+    try:
+        return json.loads((CONFIG_DIR / "app.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def bundle_id(sdk: str = "iphoneos", team: str | None = None, cfg: dict | None = None) -> str:
+    """The app's bundle identifier.
+
+    An explicit `bundle_id` in the config (`--bundle-id`) wins. Otherwise a
+    device build uses one derived from the signing team, because a bundle
+    identifier belongs to the first team that registers it: dev.pocketnode.<team>.
+    The value is saved per team at the first device build, so it stays the same.
+    The simulator needs no registration and uses dev.pocketnode.app.
+    """
+    cfg = app_config() if cfg is None else cfg
+    if cfg.get("bundle_id"):
+        return cfg["bundle_id"]
+    if sdk == "iphonesimulator":
+        return SIM_BUNDLE_ID
+    team = team or cfg.get("team")
+    if not team:
+        return SIM_BUNDLE_ID
+    return cfg.get("bundle_ids", {}).get(team) or f"dev.pocketnode.{team.lower()}"
 
 
 def pairing_token() -> str:
@@ -292,29 +321,37 @@ def launch_app(udid: str, restart: bool = False) -> str | None:
     can't until the user does something on the phone.
     """
     try:
-        import json
-        try:
-            bundle_id = json.loads((CONFIG_DIR / "app.json").read_text()).get("bundle_id", BUNDLE_ID)
-        except (OSError, ValueError):
-            bundle_id = BUNDLE_ID
         r = subprocess.run(["xcrun", "devicectl", "device", "process", "launch",
                             *(["--terminate-existing"] if restart else []), "--device", udid,
-                            bundle_id], capture_output=True, text=True, timeout=60)
+                            bundle_id("iphoneos")], capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log.info("pocketnode: launched the app on the phone")
             return None
-        out = r.stdout + r.stderr
-        if "not been explicitly trusted" in out:
-            return ("the phone won't run the app until you trust the developer once: Settings > General > "
-                    "VPN & Device Management > your Apple ID > Trust, then open pocketnode")
-        if "Locked" in out or "could not be, unlocked" in out:
+        kind, why = launch_failure(r.stdout + r.stderr)
+        if kind == "locked":
             log.info("pocketnode: the phone is locked, so the app can't be relaunched; unlock it")
             return None  # nothing shows on the phone for this one: keep trying
-        if "invalid code signature" in out or "expired" in out.lower():
-            return "the phone app's signing has expired; reinstall it with `pocketnode app install`"
-        if "is not installed" in out or "NotFound" in out:
-            return "the pocketnode app isn't on the phone; install it with `pocketnode app install`"
-        log.debug("devicectl launch failed: %s", out.strip()[-300:])
+        if kind == "other":
+            log.debug("devicectl launch failed: %s", (r.stdout + r.stderr).strip()[-300:])
+        return why
     except (OSError, subprocess.TimeoutExpired) as e:
         log.debug("devicectl unavailable: %s", e)
     return None
+
+
+TRUST_STEPS = ("on the phone open Settings > General > VPN & Device Management, pick your Apple ID under "
+               "Developer App, tap Trust, then open the pocketnode app")
+
+
+def launch_failure(out: str) -> tuple[str, str | None]:
+    """Why `devicectl device process launch` failed, from its output: (kind, what to tell the user).
+    kind is untrusted, locked, expired, missing or other."""
+    if "not been explicitly trusted" in out:
+        return "untrusted", f"the phone won't run the app until you trust the developer once: {TRUST_STEPS}"
+    if "Locked" in out or "could not be, unlocked" in out:
+        return "locked", "the phone is locked; unlock it"
+    if "invalid code signature" in out or "expired" in out.lower():
+        return "expired", "the phone app's signing has expired; reinstall it with `pocketnode app install`"
+    if "is not installed" in out or "NotFound" in out:
+        return "missing", "the pocketnode app isn't on the phone; install it with `pocketnode app install`"
+    return "other", None

@@ -9,8 +9,9 @@ process_dylibs "$XCF" "python/lib/$PYVER/lib-dynload"
 
 rsync -a --delete "$PROJECT_DIR/App/python/" "$CODESIGNING_FOLDER_PATH/app/"
 
-# Packages staged by `pocketnode build-app` for this SDK (pure files + retagged binaries).
-STAGE="${POCKETNODE_STAGE:-$HOME/.pocketnode/build}/$PLATFORM_NAME"
+# Packages staged by `pocketnode app build` for this SDK (pure files + retagged binaries).
+PN_HOME="${POCKETNODE_HOME:-$HOME/.pocketnode}"
+STAGE="${POCKETNODE_STAGE:-$PN_HOME/build}/$PLATFORM_NAME"
 if [ -d "$STAGE/app_packages" ]; then
   rsync -a --delete "$STAGE/app_packages/" "$CODESIGNING_FOLDER_PATH/app_packages/"
 fi
@@ -39,12 +40,14 @@ if [ -d "$STAGE/Frameworks" ]; then
     done < "$STAGED_LIST"
   fi
   (cd "$STAGE/Frameworks" && ls -d *.framework) > "$STAGED_LIST"
-  xargs -P 8 -I{} /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" ${OTHER_CODE_SIGN_FLAGS:-} \
-      -o runtime --timestamp=none --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der \
-      "$DEST/{}" < "$TODO"
+  # Names relative to $DEST, appended by xargs: `xargs -I` caps each substituted
+  # argument at 255 bytes, which a long home folder path exceeds.
+  (cd "$DEST" && xargs -P 8 -n 1 /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
+      ${OTHER_CODE_SIGN_FLAGS:-} -o runtime --timestamp=none \
+      --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der < "$TODO")
   rm -f "$TODO"
 fi
-cp "${POCKETNODE_HOME:-$HOME/.pocketnode}/token" "$CODESIGNING_FOLDER_PATH/pocketnode_token"
-if [ -f "${POCKETNODE_HOME:-$HOME/.pocketnode}/app-settings.json" ]; then
-  cp "${POCKETNODE_HOME:-$HOME/.pocketnode}/app-settings.json" "$CODESIGNING_FOLDER_PATH/pocketnode_settings.json"
+cp "$PN_HOME/token" "$CODESIGNING_FOLDER_PATH/pocketnode_token"
+if [ -f "$PN_HOME/app-settings.json" ]; then
+  cp "$PN_HOME/app-settings.json" "$CODESIGNING_FOLDER_PATH/pocketnode_settings.json"
 fi

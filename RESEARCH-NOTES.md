@@ -112,7 +112,7 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
   2. `xcrun vtool -set-build-version ios 17.0 27.1 -replace`.
   3. Re-sign.
   4. Rename `cpython-313-darwin.so` to `cpython-313-iphoneos.so`.
-- [C] Static check against the iOS 27.1 SDK `.tbd` stubs (`scratchpad/retag/check_ios.py`): 981 of 1,047 Mach-O files and 62 of 88 packages in the Mac's global env are clean.
+- [C] Static check against the iOS 27.1 SDK `.tbd` stubs (a prototype of what became `provision/symcheck.py`): 981 of 1,047 Mach-O files and 62 of 88 packages in the Mac's global env are clean.
   - Clean: **numpy, pandas, scikit-learn, statsmodels, torch, skimage, duckdb, pydantic_core, tokenizers, lxml, cryptography, mlx, numba, llvmlite**.
   - Failures:
     - scipy: its bundled `libgcc_s` imports `pthread_jit_write_protect_np`, and `cython_blas` imports `dcabs1_` from Accelerate.

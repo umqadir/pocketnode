@@ -235,8 +235,9 @@ def source_version() -> str:
     h = hashlib.sha256()
     root = Path(__file__).resolve().parent
     for f in sorted(root.rglob("*.py")):
-        if "provision" in f.relative_to(root).parts or f.name in ("cli.py", "sources.py"):
-            continue  # Mac-only code: changing it doesn't make the phone's copy stale
+        parts = f.relative_to(root).parts
+        if "provision" in parts or parts[0] == "ios" or f.name in ("cli.py", "sources.py"):
+            continue  # Mac-only code (and the app's sources): the phone's copy of pocketnode lacks them
         h.update(f.relative_to(root).as_posix().encode())
         h.update(f.read_bytes())
     return h.hexdigest()[:12]

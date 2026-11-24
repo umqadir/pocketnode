@@ -36,5 +36,5 @@ targets:
       - name: Install Python, packages and token
         script: |
           set -e
-          "$PROJECT_DIR/scripts/install_python.sh"
+          /bin/bash "$PROJECT_DIR/scripts/install_python.sh"
         basedOnDependencyAnalysis: false

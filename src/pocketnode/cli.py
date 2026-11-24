@@ -1,5 +1,6 @@
 """`pocketnode` command line.
 
+    pocketnode setup [--sim]          guided first run: checks, builds, installs, acceptance check
     pocketnode status                 nodes, phone state, link
     pocketnode packages               what's on the phone vs this Mac's environment
     pocketnode packages select        checklist: tick what should be on the phone, see what it costs
@@ -85,6 +86,14 @@ def cmd_app(args):
             raise SystemExit(why)
 
 
+def cmd_setup(args):
+    from .provision import app, setup
+    if args.bundle_id:
+        app.save_config(bundle_id=args.bundle_id)
+    app.save_config(sdk="iphonesimulator" if args.sim else "iphoneos")
+    raise SystemExit(setup.main(sim=args.sim, yes=args.yes, team=args.team))
+
+
 def cmd_bench(args):
     from . import bench
     ex = _connect(args, mac_workers=1)
@@ -139,6 +148,13 @@ def main(argv=None) -> None:
     def conn(p):
         p.add_argument("--address", help="host:port instead of USB (e.g. 127.0.0.1:7151 for the simulator)")
         p.add_argument("--wait", type=float, default=20.0, help="seconds to wait for the phone")
+
+    p = sub.add_parser("setup", help="guided first run, from a fresh install to a passing check")
+    p.add_argument("--sim", action="store_true", help="use the iOS simulator instead of an iPhone")
+    p.add_argument("-y", "--yes", action="store_true", help="download what's needed without asking")
+    p.add_argument("--team", help="Apple development team ID (when Xcode has several)")
+    p.add_argument("--bundle-id", help="the app's bundle identifier (default: derived from the team)")
+    p.set_defaults(fn=cmd_setup)
 
     p = sub.add_parser("status")
     conn(p)
