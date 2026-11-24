@@ -1,5 +1,7 @@
 # pocketnode — handoff brief
 
+> This is the original design brief from before any code existed, kept as design history. It is out of date in places (the app is Objective-C, post-install loading works, PyTorch runs on the phone). README.md describes what was built and RESEARCH-NOTES.md what was measured.
+
 This brief carries over a planning conversation (Nov 2, 2026) so a local Claude Code session on the Mac can build the project. The local session has Xcode, the real Mac Python environments and the physical iPhone, none of which the cloud session had. Read all of it before writing code.
 
 **Status:** design agreed, research partly in. No code written yet. Research threads that were still running get appended to `RESEARCH-NOTES.md` in this folder as they finish.
