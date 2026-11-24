@@ -61,6 +61,7 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         for mod, why in rep.excluded.items():
             print(f"  left out {mod}: {why}")
     t1 = time.time()
+    (CONFIG_DIR / "app-settings.json").write_text(json.dumps({"wifi": bool(cfg.get("wifi"))}))
     env = {**os.environ, "POCKETNODE_TEAM": team, "POCKETNODE_BUNDLE_ID": bundle_id}
     r = _run(["xcodegen", "generate", "-q"], cwd=IOS_DIR, env=env)
     if r.returncode:
@@ -88,7 +89,26 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
     t2 = time.time()
     _record({"event": "build", "sdk": sdk, "packages": pkgs, "stage_s": t1 - t0, "build_s": t2 - t1})
     product = "Debug-iphonesimulator" if sdk == "iphonesimulator" else "Debug-iphoneos"
-    return IOS_DIR / "build" / "Build" / "Products" / product / "PocketNode.app"
+    out = IOS_DIR / "build" / "Build" / "Products" / product / "PocketNode.app"
+    if sdk == "iphoneos":
+        exp = profile_expiry(out)
+        if exp:
+            save_config(profile_expires=exp)
+    return out
+
+
+def profile_expiry(app: Path) -> str | None:
+    """When the app's provisioning profile stops working (ISO date). Free Apple
+    accounts get 7 days; after that the app won't launch until it's reinstalled."""
+    import plistlib
+    prof = app / "embedded.mobileprovision"
+    if not prof.exists():
+        return None
+    r = subprocess.run(["security", "cms", "-D", "-i", str(prof)], capture_output=True)
+    try:
+        return plistlib.loads(r.stdout)["ExpirationDate"].isoformat()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def simulator() -> str:
@@ -124,7 +144,17 @@ def install_device(app: Path, udid: str | None = None, launch: bool = True) -> N
     _record({"event": "install", "seconds": time.time() - t0})
     if launch:
         bid = config().get("bundle_id", BUNDLE_ID)
-        _run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid, bid])
+        r = _run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid, bid])
+        if r.returncode:
+            out = r.stdout + r.stderr
+            if "not been explicitly trusted" in out:
+                raise RuntimeError(
+                    "installed, but iOS won't run it until you trust the developer once: on the phone, "
+                    "Settings > General > VPN & Device Management > your Apple ID > Trust. Then run "
+                    "`pocketnode app launch`.")
+            if "Locked" in out or "locked" in out:
+                raise RuntimeError("installed; unlock the phone and run `pocketnode app launch`")
+            raise RuntimeError("installed, but launching failed: " + (out.strip().splitlines() or ["?"])[-1])
 
 
 def device_udid() -> str:

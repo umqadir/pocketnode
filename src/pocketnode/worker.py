@@ -416,6 +416,12 @@ class Worker:
             self._send({"t": "state", **self.state()})
         elif t == "drop_cache":
             self.store.clear()
+        elif t == "stacks":  # diagnostics: what every thread is doing right now
+            frames = sys._current_frames()
+            names = {th.ident: th.name for th in threading.enumerate()}
+            text = "\n".join(f"--- {names.get(i, i)}\n" + "".join(traceback.format_stack(f)[-12:])
+                             for i, f in frames.items())
+            self._send({"t": "stacks", "req": msg.get("req"), "text": text[-60000:]}, sid=sid)
         elif t == "echo":  # throughput probe
             self._send({"t": "echo", "n": sum(len(b) for b in bufs)}, bufs if msg.get("back") else (), sid=sid)
 

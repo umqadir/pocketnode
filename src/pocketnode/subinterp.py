@@ -31,6 +31,8 @@ import os, sys, io, pickle, struct, traceback
 for p in extra_paths.split("\0"):
     if p and p not in sys.path:
         sys.path.append(p)
+import builtins
+builtins._pn_ext_fail = None
 out = {}
 o, e = io.StringIO(), io.StringIO()
 so, se = sys.stdout, sys.stderr
@@ -65,6 +67,8 @@ try:
     if trip is not None:
         out["status"] = "unavailable"
         out["u"] = (trip.kind, trip.detail, trip.module)
+    if getattr(builtins, "_pn_ext_fail", None):
+        out = {"status": "needs-main", "detail": f"{builtins._pn_ext_fail} can't load in a subinterpreter"}
 except BaseException as exc:
     out = {"status": "needs-main", "detail": repr(exc)}
 finally:
@@ -86,6 +90,23 @@ sys.setrecursionlimit(recursion)
 from pocketnode import guards
 if roots:
     guards.install(roots.split("\0"), scratch, tuple(p for p in phone_dirs.split("\0") if p))
+# An extension module that can't load here must send the task to the main
+# interpreter even when the importing package swallows the ImportError and
+# carries on with a fallback.
+import builtins, importlib.machinery as _mach
+builtins._pn_ext_fail = None
+def _watch(cls):
+    real = cls.create_module
+    def create_module(self, spec):
+        try:
+            return real(self, spec)
+        except ImportError:
+            builtins._pn_ext_fail = spec.name
+            raise
+    cls.create_module = create_module
+for _n in ("ExtensionFileLoader", "AppleFrameworkLoader"):
+    if hasattr(_mach, _n):
+        _watch(getattr(_mach, _n))
 """
 
 

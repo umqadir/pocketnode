@@ -124,16 +124,21 @@ static void *python_main(void *ctx) {
 - (UIWindow *)buildUIInScene:(UIWindowScene *)scene {
     self.window = [[UIWindow alloc] initWithWindowScene:scene];
     UIViewController *vc = [UIViewController new];
-    vc.view.backgroundColor = [UIColor systemBackgroundColor];
+    // The screen stays on while the app is in front (locking would suspend it),
+    // so keep it black: on an OLED panel black pixels are off.
+    self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    vc.view.backgroundColor = [UIColor blackColor];
 
     UILabel *title = [UILabel new];
     title.text = @"pocketnode";
     title.font = [UIFont systemFontOfSize:28 weight:UIFontWeightSemibold];
+    title.textColor = [UIColor colorWithWhite:0.55 alpha:1];
 
     self.statusLabel = [UILabel new];
     self.statusLabel.numberOfLines = 0;
     self.statusLabel.font = [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
     self.statusLabel.text = @"starting Python…";
+    self.statusLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1];
 
     self.keepButton = [UIButton buttonWithType:UIButtonTypeSystem];
     [self.keepButton setTitle:@"Keep computing in the background" forState:UIControlStateNormal];

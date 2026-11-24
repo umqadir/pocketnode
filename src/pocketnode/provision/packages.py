@@ -23,6 +23,28 @@ from . import app as app_mod
 
 DEFAULT_STACK = ["numpy", "pandas", "scipy", "scikit-learn", "statsmodels", "joblib", "threadpoolctl", "torch"]
 CHECK_CACHE = CONFIG_DIR / "check-cache.json"
+MISSES = CONFIG_DIR / "misses.json"
+
+
+def record_miss(package: str) -> None:
+    """Remember that a task wanted a compiled package the phone lacks (shown in the selector)."""
+    try:
+        d = json.loads(MISSES.read_text()) if MISSES.exists() else {}
+        e = d.setdefault(package, {"n": 0})
+        e["n"] += 1
+        e["last"] = time.time()
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MISSES.write_text(json.dumps(d))
+    except (OSError, ValueError):
+        pass
+
+
+def recent_misses(days: float = 14) -> dict[str, int]:
+    try:
+        d = json.loads(MISSES.read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k.lower(): v["n"] for k, v in d.items() if time.time() - v.get("last", 0) < days * 86400}
 
 
 @dataclass
@@ -159,10 +181,34 @@ class Packages:
         app_mod.save_config(always_mac=sorted(set(cfg.get("always_mac", [])) | set(names)))
         print(f"won't offer {', '.join(names)} again; tasks needing them run on the Mac")
 
-    def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None):
-        cur = app_mod.packages()
-        new = sorted((set(cur) | set(add)) - set(remove))
-        added, dropped = sorted(set(new) - set(cur)), sorted(set(cur) - set(new))
+    def select(self, sdk: str | None = None):
+        """Interactive checklist: what's on the phone, what could be, what changing it costs."""
+        rows = [r for r in table(check=True) if r.kind == "compiled"]
+        on_phone = phone_packages()
+        if on_phone is None:  # first use: a sensible scientific stack is pre-checked
+            have = {r.name.lower() for r in rows}
+            checked = {n for n in map(str.lower, DEFAULT_STACK) if n in have}
+            first = True
+        else:
+            checked = {r.name.lower() for r in rows if r.status == "on phone"}
+            first = False
+        chosen = _checklist(rows, checked, recent_misses(), first)
+        if chosen is None:
+            print("left as is")
+            return
+        names = {r.name.lower(): r.name for r in rows}
+        return self._change(new=sorted(names[n] for n in chosen), sdk=sdk, before=None if first else checked)
+
+    def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None, new=None, before=None):
+        if new is not None:
+            # From the selector: `new` is everything ticked, `before` what the phone
+            # had (which includes dependencies of the packages named in the config).
+            had, want = set(before or ()), {n.lower() for n in new}
+            added, dropped = sorted(n for n in new if n.lower() not in had), sorted(had - want)
+        else:
+            cur = app_mod.packages()
+            new = sorted((set(cur) | set(add)) - set(remove))
+            added, dropped = sorted(set(new) - set(cur)), sorted(set(cur) - set(new))
         if not added and not dropped:
             print("nothing to change")
             return
@@ -189,6 +235,64 @@ class Packages:
         else:
             app_mod.install_device(p)
         print("done; the phone reconnects on its own")
+
+
+def _checklist(rows: list[Row], checked: set[str], misses: dict[str, int], first: bool) -> set[str] | None:
+    """Curses checklist. Returns the chosen package names (lowercase), or None if cancelled."""
+    import curses
+
+    start = set(checked)
+    sizes = {r.name.lower(): r.size_mb for r in rows}
+    rows = sorted(rows, key=lambda r: (r.name.lower() not in checked and r.name.lower() not in misses,
+                                       r.ios == "blocked", r.name.lower()))
+
+    def ui(scr):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        pos = top = 0
+        while True:
+            h, w = scr.getmaxyx()
+            body = h - 5
+            top = min(max(top, pos - body + 1), pos)
+            scr.erase()
+            head = ("First install: a default scientific stack is pre-checked." if first
+                    else "Checked = on the phone now.")
+            scr.addnstr(0, 0, f"{head}  space: toggle   enter: apply   q: cancel", w - 1, curses.A_BOLD)
+            for i, r in enumerate(rows[top:top + body]):
+                n = r.name.lower()
+                box = "[x]" if n in checked else "[ ]"
+                if r.ios == "blocked":
+                    box = " - "
+                flag = f"  needed {misses[n]}x recently" if n in misses and n not in start else ""
+                note = {"ok": "", "shim": "works with stand-ins for a few macOS-only calls",
+                        "partial": r.detail, "blocked": "can't run on iOS: " + r.detail}.get(r.ios, r.detail)
+                line = f"{box} {r.name[:26]:26} {r.version[:12]:12} {r.size_mb:6.0f} MB{flag}  {note}"
+                scr.addnstr(2 + i, 0, line, w - 1, curses.A_REVERSE if top + i == pos else 0)
+            add, drop = sorted(checked - start), sorted(start - checked)
+            mb = sum(sizes.get(n, 0) for n in add)
+            est = estimate(add) if (add or drop or first) else None
+            foot = ("no changes" if est is None else
+                    f"+{', '.join(add) or '-'}  -{', '.join(drop) or '-'}   about {est['build_s'] + est['install_s']} s"
+                    f"{'' if est['measured'] else ' (first-time estimate)'}, {mb:.0f} MB more; the app restarts")
+            scr.addnstr(h - 2, 0, foot, w - 1, curses.A_BOLD)
+            scr.refresh()
+            k = scr.getch()
+            if k in (ord("q"), 27):
+                return None
+            if k in (curses.KEY_DOWN, ord("j")):
+                pos = min(pos + 1, len(rows) - 1)
+            elif k in (curses.KEY_UP, ord("k")):
+                pos = max(pos - 1, 0)
+            elif k == curses.KEY_NPAGE:
+                pos = min(pos + body, len(rows) - 1)
+            elif k == curses.KEY_PPAGE:
+                pos = max(pos - body, 0)
+            elif k == ord(" ") and rows[pos].ios != "blocked":
+                checked.symmetric_difference_update({rows[pos].name.lower()})
+            elif k in (curses.KEY_ENTER, 10, 13):
+                return checked
+
+    return curses.wrapper(ui)
 
 
 packages = Packages()

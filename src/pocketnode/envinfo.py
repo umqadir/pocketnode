@@ -12,6 +12,7 @@ import importlib.metadata as md
 import importlib.util
 import io
 import os
+import re
 import sys
 import threading
 import zipfile
@@ -23,54 +24,111 @@ _SKIP_DIRS = {"__pycache__", ".git", "tests", "test"}  # tests aren't needed at 
 _lock = threading.Lock()
 
 
-def _dist_has_native(dist: md.Distribution) -> bool:
-    for f in dist.files or ():
-        if str(f).endswith(NATIVE_SUFFIXES):
-            return True
-    return False
+_REQ = re.compile(r"^Requires-Dist:\s*([A-Za-z0-9][A-Za-z0-9._-]*)([^\n]*)$", re.M)
+_SKIP_TOP = (".dist-info", ".data", ".egg-info", ".pth")
+
+
+def _scan_dist(d: md.Distribution):
+    """(name, version, {top-level module: has native code}, required dist names) for one distribution.
+
+    Reads METADATA and RECORD as text. importlib.metadata's own accessors build
+    an object per file and take over ten seconds on a full scientific
+    environment; this takes a fraction of one.
+    """
+    meta = d.read_text("METADATA") or d.read_text("PKG-INFO") or ""
+    head = meta.split("\n\n", 1)[0]
+    name = version = None
+    for line in head.splitlines():
+        if name is None and line.startswith("Name:"):
+            name = line[5:].strip()
+        elif version is None and line.startswith("Version:"):
+            version = line[8:].strip()
+    if not name:
+        return None
+    requires = {_norm(m.group(1)) for m in _REQ.finditer(head) if "extra ==" not in m.group(2)}
+    tops: dict[str, bool] = {}
+    record = d.read_text("RECORD")
+    if record is None:  # egg-style install
+        paths = [str(f) for f in d.files or ()]
+    else:
+        paths = [(line[1:line.index('"', 1)] if line.startswith('"') else line.split(",", 1)[0])
+                 for line in record.splitlines() if line]
+    for path in paths:
+        first, sep, _ = path.partition("/")
+        if first in ("..", "__pycache__", "bin", "") or first.endswith(_SKIP_TOP):
+            continue
+        native = path.endswith(NATIVE_SUFFIXES)
+        if not sep:
+            if not (native or first.endswith(".py")):
+                continue
+            first = first.split(".")[0]
+        tops[first] = tops.get(first, False) or native
+    return name, version or "0", tops, requires
 
 
 @lru_cache(maxsize=1)
+def _scan() -> tuple[dict, dict, dict]:
+    """(manifest, {dist: required dists}, {dist: has native code})."""
+    out: dict[str, dict] = {}
+    requires: dict[str, set[str]] = {}
+    native: dict[str, bool] = {}
+    seen = set()
+    for d in md.distributions():
+        try:
+            got = _scan_dist(d)
+        except Exception:  # noqa: BLE001 - a broken dist-info shouldn't hide the rest
+            got = None
+        if got is None:
+            continue
+        name, version, tops, req = got
+        key = _norm(name)
+        if key in seen:  # an older copy later on sys.path
+            continue
+        seen.add(key)
+        requires[key] = req
+        native[key] = any(tops.values())
+        for top, has_native in tops.items():
+            cur = out.get(top)
+            if cur is None:
+                out[top] = {"dist": name, "version": version, "kind": "compiled" if has_native else "pure"}
+            elif has_native:  # a namespace shared by several distributions
+                cur["kind"] = "compiled"
+    return out, requires, native
+
+
 def manifest() -> dict[str, dict]:
     """{top_level_module: {dist, version, kind}} for installed distributions."""
-    out: dict[str, dict] = {}
-    pkgs = md.packages_distributions()
-    dists: dict[str, md.Distribution] = {}
-    for d in md.distributions():
-        name = d.metadata["Name"]
-        if name:
-            dists.setdefault(_norm(name), d)
-    for top, names in pkgs.items():
-        if "." in top or top == "__pycache__":
+    return _scan()[0]
+
+
+@lru_cache(maxsize=None)
+def needs_native(dist: str) -> bool:
+    """Does this distribution, or anything it requires, contain compiled code?
+
+    A pure-Python package built on a compiled one (polars on its runtime, seaborn
+    on numpy) can't run where compiled modules can't load.
+    """
+    _, requires, native = _scan()
+    todo, seen = [_norm(dist)], set()
+    while todo:
+        n = todo.pop()
+        if n in seen:
             continue
-        d = dists.get(_norm(names[0]))
-        if d is None:
-            continue
-        native = _top_has_native(d, top)
-        out[top] = {
-            "dist": d.metadata["Name"],
-            "version": d.version,
-            "kind": "compiled" if native else "pure",
-        }
-    return out
+        seen.add(n)
+        if native.get(n):
+            return True
+        todo.extend(requires.get(n, ()))
+    return False
 
 
 def refresh() -> None:
-    manifest.cache_clear()
+    _scan.cache_clear()
+    needs_native.cache_clear()
     _package_cache.clear()
 
 
 def _norm(name: str) -> str:
     return name.lower().replace("-", "_").replace(".", "_")
-
-
-def _top_has_native(d: md.Distribution, top: str) -> bool:
-    for f in d.files or ():
-        parts = f.parts
-        if parts and (parts[0] == top or len(parts) == 1 and parts[0].split(".")[0] == top):
-            if str(f).endswith(NATIVE_SUFFIXES):
-                return True
-    return False
 
 
 def locate(top: str) -> dict:

@@ -73,12 +73,19 @@ def is_user_module(mod: types.ModuleType) -> bool:
     return not name.startswith("pocketnode")
 
 
+_seen_module_count = 0
+
+
 def register_user_modules() -> None:
     """Pickle the user's own modules by value.
 
     Workers then run exactly the code the Mac has loaded right now, including
     edits picked up by autoreload, instead of whatever is on disk.
     """
+    global _seen_module_count
+    if len(sys.modules) == _seen_module_count:
+        return
+    _seen_module_count = len(sys.modules)
     for name, mod in list(sys.modules.items()):
         if name in _user_modules_registered or mod is None:
             continue
@@ -88,6 +95,32 @@ def register_user_modules() -> None:
         except Exception:
             pass
         _user_modules_registered.add(name)
+
+
+class _ScanPickler(cloudpickle.Pickler):
+    """cloudpickle, noting the module of every non-builtin object as it goes by.
+
+    That is the set of modules loading the pickle will import. Collecting it
+    here costs nothing for plain data (ints, strings, lists never reach
+    reducer_override), where walking the finished pickle opcode by opcode
+    took seconds on large pure-Python payloads.
+    """
+
+    def __init__(self, file, mods: set, **kw):
+        super().__init__(file, **kw)
+        self._mods = mods
+
+    def reducer_override(self, obj):
+        m = type(obj).__module__
+        if m != "builtins":
+            self._mods.add(m.partition(".")[0])
+        if isinstance(obj, types.ModuleType):
+            self._mods.add(obj.__name__.partition(".")[0])
+        else:
+            m = getattr(obj, "__module__", None)
+            if isinstance(m, str):
+                self._mods.add(m.partition(".")[0])
+        return super().reducer_override(obj)
 
 
 def dumps(obj, memo: HashMemo | None = None, scan: bool = True) -> Packed:
@@ -100,9 +133,16 @@ def dumps(obj, memo: HashMemo | None = None, scan: bool = True) -> Packed:
         bufs.append(view)
         return False
 
-    data = cloudpickle.dumps(obj, protocol=5, buffer_callback=cb)
+    mods: set[str] = set()
+    if scan:
+        f = io.BytesIO()
+        _ScanPickler(f, mods, protocol=5, buffer_callback=cb).dump(obj)
+        data = f.getvalue()
+        mods |= code_imports(obj)
+        mods.discard("")
+    else:
+        data = cloudpickle.dumps(obj, protocol=5, buffer_callback=cb)
     hashes = [memo.get(b) if memo else digest(b) for b in bufs]
-    mods = pickle_modules(data) | code_imports(obj) if scan else set()
     return Packed(data, bufs, hashes, mods)
 
 

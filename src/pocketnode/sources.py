@@ -205,7 +205,24 @@ class PhoneLink(Source):
         return f"usb:{self.udid or 'any'}"
 
     def start(self, ex):
+        self._warn_expiry(ex)
         threading.Thread(target=self._loop, args=(ex,), daemon=True, name="pn-usb").start()
+
+    def _warn_expiry(self, ex) -> None:
+        """Free Apple accounts sign for 7 days. Say so before the app stops launching."""
+        import datetime
+        import json
+        try:
+            exp = json.loads((CONFIG_DIR / "app.json").read_text()).get("profile_expires")
+            left = datetime.datetime.fromisoformat(exp) - datetime.datetime.now()
+        except (OSError, ValueError, TypeError):
+            return
+        if left < datetime.timedelta(0):
+            ex._note(("expiry",), "pocketnode: the phone app's signing expired on "
+                     f"{exp[:10]}; reinstall it with `pocketnode app install`")
+        elif left < datetime.timedelta(days=2):
+            ex._note(("expiry",), f"pocketnode: the phone app's signing expires {exp[:16].replace('T', ' ')}; "
+                     "`pocketnode app install` renews it (a good moment for any package changes too)")
 
     def _loop(self, ex):
         failures = 0
@@ -244,7 +261,13 @@ class PhoneLink(Source):
                     self.status = "phone attached, app not answering"
                 if self.relaunch and failures >= 2 and time.monotonic() - self._last_launch > 30:
                     self._last_launch = time.monotonic()
-                    launch_app(usb[0].serial)
+                    why = launch_app(usb[0].serial)
+                    if why:
+                        # Launching again would only put the same alert on the
+                        # phone's screen; this one is waiting for the user.
+                        self.relaunch = False
+                        self.status = why
+                        ex._note(("launch", usb[0].serial), f"pocketnode: {why}")
                 time.sleep(1.0)
                 continue
             failures = 0
@@ -256,8 +279,12 @@ class PhoneLink(Source):
         self._stop = True
 
 
-def launch_app(udid: str) -> bool:
-    """Start (or foreground) the pocketnode app on the phone over USB."""
+def launch_app(udid: str) -> str | None:
+    """Start (or foreground) the pocketnode app on the phone over USB.
+
+    Returns None if it launched or may launch on a later try, or the reason it
+    can't until the user does something on the phone.
+    """
     try:
         import json
         try:
@@ -268,8 +295,16 @@ def launch_app(udid: str) -> bool:
                             bundle_id], capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log.info("pocketnode: launched the app on the phone")
-            return True
-        log.debug("devicectl launch failed: %s", r.stderr.strip())
+            return None
+        out = r.stdout + r.stderr
+        if "not been explicitly trusted" in out:
+            return ("the phone won't run the app until you trust the developer once: Settings > General > "
+                    "VPN & Device Management > your Apple ID > Trust, then open pocketnode")
+        if "invalid code signature" in out or "expired" in out.lower():
+            return "the phone app's signing has expired; reinstall it with `pocketnode app install`"
+        if "is not installed" in out or "NotFound" in out:
+            return "the pocketnode app isn't on the phone; install it with `pocketnode app install`"
+        log.debug("devicectl launch failed: %s", out.strip()[-300:])
     except (OSError, subprocess.TimeoutExpired) as e:
         log.debug("devicectl unavailable: %s", e)
-    return False
+    return None

@@ -146,6 +146,7 @@ class Node:
         self.latency = source.latency_guess
         self.bytes_sent = 0
         self.lost_as_crash = False
+        self.scanned = (-1, 0.0)  # (queue generation, when) of the last scan that found nothing to run
         self.outbox: queue.Queue = queue.Queue()
         threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
 
@@ -330,6 +331,8 @@ class PocketExecutor(Executor):
         self._noted: set[tuple] = set()
         self._buf_by_hash: dict[str, tuple[memoryview, int]] = {}
         self._pins: dict[tuple, tuple] = {}
+        self._replies: dict[str, tuple] = {}
+        self._qgen = 0  # bumped whenever a task becomes available to pick
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
@@ -368,6 +371,7 @@ class PocketExecutor(Executor):
                 self.queue.appendleft(task)
             else:
                 self.queue.append(task)
+            self._qgen += 1
             self._cv.notify_all()
         fut.add_done_callback(lambda f, t=task: self._release(t))
         return fut
@@ -416,6 +420,19 @@ class PocketExecutor(Executor):
         self._pins.pop(tuple(packed.hashes), None)
         for n in self.nodes.values():
             n.post({"t": "unpin", "hashes": packed.hashes})
+
+    def stacks(self, what: str = "phone", timeout: float = 10.0) -> str:
+        """What every thread on a node is doing right now (for a task that seems stuck)."""
+        node = next((n for n in self.nodes.values() if _matches(n, what)), None)
+        if node is None:
+            raise PlacementError(f"no connected node matches {what!r}")
+        req, ev = uuid.uuid4().hex, (threading.Event(), [])
+        self._replies[req] = ev
+        node.post({"t": "stacks", "req": req})
+        if not ev[0].wait(timeout):
+            self._replies.pop(req, None)
+            raise TimeoutError(f"{node.name} didn't answer (its interpreter may be stuck in native code)")
+        return ev[1][0]
 
     def wait_for(self, what: str = "phone", timeout: float | None = None) -> bool:
         """Block until a node matching `what` (kind or name) is connected."""
@@ -554,6 +571,7 @@ class PocketExecutor(Executor):
                 ):
                     t.queued = True
                     self.queue.appendleft(t)
+                    self._qgen += 1
             self._cv.notify_all()
         if node.kind != "mac" and not self._shutdown:
             self._note(None, f"pocketnode: lost {node.label()}; its tasks are being re-run on other nodes")
@@ -620,7 +638,7 @@ class PocketExecutor(Executor):
     def _pick(self, node: Node) -> Task | None:
         """Next queued task this node should run, or None."""
         queued = None
-        for task in list(self.queue):
+        for task in self.queue:  # nothing in this loop adds to or removes from the queue
             if task.done or not task.queued:
                 continue
             ok, _ = self._eligible(task, node)
@@ -656,10 +674,17 @@ class PocketExecutor(Executor):
         launched = False
         # Fastest node kinds first so the Mac fills before the phone gets marginal work.
         nodes = sorted(self.nodes.values(), key=lambda n: (n.kind != "mac", n.name))
+        now = time.monotonic()
         for node in nodes:
+            # A node that just went through the whole queue and found nothing it
+            # should run doesn't look again until something new is queued (or a
+            # moment passes: estimates drift as results come in).
+            if node.scanned[0] == self._qgen and now - node.scanned[1] < 0.5:
+                continue
             while node.free() > 0:
                 task = self._pick(node)
                 if task is None:
+                    node.scanned = (self._qgen, now)
                     break
                 self._launch(task, node, speculative=False)
                 launched = True
@@ -718,6 +743,7 @@ class PocketExecutor(Executor):
             if not t.done and not t.queued and not any(a.id in self.attempts for a in t.attempts.values()):
                 t.queued = True
                 self.queue.appendleft(t)
+                self._qgen += 1
             self._cv.notify_all()
 
     def _fail(self, task: Task, exc: BaseException) -> None:
@@ -748,6 +774,11 @@ class PocketExecutor(Executor):
                 self._cv.notify_all()
         elif t == "pong":
             node.state = msg.get("state", node.state)
+        elif t == "stacks":
+            ev = self._replies.pop(msg.get("req"), None)
+            if ev:
+                ev[1].append(msg.get("text", ""))
+                ev[0].set()
         elif t == "echo":
             node.source.on_echo(node, msg, bufs) if hasattr(node.source, "on_echo") else None
 
@@ -812,6 +843,7 @@ class PocketExecutor(Executor):
                     if not task.done and not any(a.id in self.attempts for a in task.attempts.values()):
                         task.queued = True
                         self.queue.appendleft(task)
+                        self._qgen += 1
                     self._cv.notify_all()
                 return
             reason = _unavailable_reason(u, node)
@@ -943,6 +975,7 @@ class PocketExecutor(Executor):
             if not task.done and not any(a.node.connected and a.id in self.attempts for a in task.attempts.values()):
                 task.queued = True
                 self.queue.appendleft(task)
+                self._qgen += 1
             self._cv.notify_all()
         if not quiet:
             self._note(("requeue", task.fn_key, reason),
@@ -999,6 +1032,7 @@ class PocketExecutor(Executor):
         def offer():
             try:
                 from .provision import app, packages
+                packages.record_miss(package)
                 if package in app.config().get("always_mac", []):
                     return
                 est = packages.estimate([package])

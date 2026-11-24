@@ -2,6 +2,7 @@
 
     pocketnode status                 nodes, phone state, link
     pocketnode packages               what's on the phone vs this Mac's environment
+    pocketnode packages select        checklist: tick what should be on the phone, see what it costs
     pocketnode packages add NAME...   put compiled packages on the phone
     pocketnode app build|install      build/install the iOS app (--sim for the simulator)
     pocketnode bench                  link + compute, phone vs Mac
@@ -42,6 +43,8 @@ def cmd_packages(args):
         packages.add(*args.names, yes=args.yes, when_idle=args.when_idle, sdk=_sdk(args))
     elif args.action == "remove":
         packages.remove(*args.names, yes=args.yes, sdk=_sdk(args))
+    elif args.action == "select":
+        packages.select(sdk=_sdk(args))
     elif args.action == "always-mac":
         packages.always_mac(*args.names)
     else:
@@ -56,16 +59,22 @@ def cmd_app(args):
     from .provision import app
     sdk = "iphonesimulator" if args.sim else "iphoneos"
     app.save_config(sdk=sdk, **({"team": args.team} if args.team else {}),
-                    **({"bundle_id": args.bundle_id} if args.bundle_id else {}))
+                    **({"bundle_id": args.bundle_id} if args.bundle_id else {}),
+                    **({"wifi": args.wifi} if args.wifi is not None else {}))
     if args.action in ("build", "install"):
         p = app.build(sdk, restage=not args.no_stage)
         print(p)
         if args.action == "install":
-            (app.install_sim if args.sim else app.install_device)(p)
+            try:
+                (app.install_sim if args.sim else app.install_device)(p)
+            except RuntimeError as e:
+                raise SystemExit(str(e))
             print("installed and launched")
     elif args.action == "launch":
         from .sources import launch_app
-        launch_app(app.device_udid())
+        why = launch_app(app.device_udid())
+        if why:
+            raise SystemExit(why)
 
 
 def cmd_bench(args):
@@ -119,7 +128,7 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_status)
 
     p = sub.add_parser("packages")
-    p.add_argument("action", nargs="?", choices=["list", "add", "remove", "always-mac"], default="list")
+    p.add_argument("action", nargs="?", choices=["list", "select", "add", "remove", "always-mac"], default="list")
     p.add_argument("names", nargs="*")
     p.add_argument("-y", "--yes", action="store_true")
     p.add_argument("--when-idle", action="store_true")
@@ -133,6 +142,8 @@ def main(argv=None) -> None:
     p.add_argument("--team", help="Apple development team ID")
     p.add_argument("--bundle-id")
     p.add_argument("--no-stage", action="store_true", help="reuse staged packages")
+    p.add_argument("--wifi", action=argparse.BooleanOptionalAction, default=None,
+                   help="also accept the Mac over the local network (default: USB only)")
     p.set_defaults(fn=cmd_app)
 
     p = sub.add_parser("bench")

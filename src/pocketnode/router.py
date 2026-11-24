@@ -69,13 +69,14 @@ def check(modules: set[str], node, version_policy: str = "minor") -> Verdict:
 
 
 def is_pure(modules: set[str]) -> bool:
-    """Only the stdlib and pure-Python packages (so it can run in a subinterpreter)."""
+    """Only the stdlib and pure-Python packages that don't build on compiled ones
+    (so the task can run in a subinterpreter, where extension modules can't load)."""
     import sys
     man = envinfo.manifest()
     for m in modules - IGNORE:
         if m in sys.stdlib_module_names:
             continue
         info = man.get(m)
-        if info is not None and info["kind"] == "compiled":
+        if info is not None and (info["kind"] == "compiled" or envinfo.needs_native(info["dist"])):
             return False
     return True
