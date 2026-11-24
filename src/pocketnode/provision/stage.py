@@ -32,6 +32,7 @@ from packaging.markers import default_environment
 
 from packaging.requirements import Requirement
 
+from .. import progress as progress_mod
 from ..sources import CONFIG_DIR, SIM_BUNDLE_ID
 from . import shims
 
@@ -170,12 +171,16 @@ class Stager:
         self.template = template
         self.sdkver = sdk_version()
         self.report = Report(sdk)
+        self.progress = progress_mod.NULL
 
     # ---------------------------------------------------------------- copy
 
     def stage(self, packages: list[str], extra_paths: dict[str, Path] | None = None,
-              only=None) -> Report:
-        """only(dist) -> bool picks which distributions of the closure to stage (default: all)."""
+              only=None, progress=None) -> Report:
+        """only(dist) -> bool picks which distributions of the closure to stage (default: all).
+        progress: a reporter (progress.Step or anything with its update/detail) told each phase
+        and its count; None reports nothing."""
+        p = self.progress = progress or progress_mod.NULL
         t0 = time.time()
         shutil.rmtree(self.out, ignore_errors=True)
         self.pk.mkdir(parents=True)
@@ -183,15 +188,17 @@ class Stager:
             self.fw = self.pk / SHIM_DIR
         else:
             self.fw.mkdir(parents=True)
-        for d in closure(packages):
-            if only is None or only(d):
-                self._copy_dist(d)
+        dists = [d for d in closure(packages) if only is None or only(d)]
+        for i, d in enumerate(dists):
+            p.update(i, len(dists), detail="copying packages")
+            self._copy_dist(d)
+        p.update(len(dists), len(dists), detail="copying packages")
         for name, src in (extra_paths or {}).items():
             shutil.copytree(src, self.pk / name, ignore=_IGNORE)
         if "torch" in self.report.dists and (self.pk / "torch/lib/libtorch_cpu.dylib").exists():
             from . import torch_metal
             try:  # before retagging, which thins, re-signs and moves the dylib
-                if torch_metal.install(self.pk, self.report.dists["torch"], self.sdk):
+                if torch_metal.install(self.pk, self.report.dists["torch"], self.sdk, progress=p):
                     self.report.notes["torch_metal"] = True
             except Exception as e:
                 self.report.warnings.append(f"torch: no iOS GPU shaders ({e}); torch's Metal backend will be "
@@ -201,10 +208,10 @@ class Stager:
             from . import mlx_metal
             try:
                 if self.inplace:
-                    shutil.copy2(mlx_metal.build(self.report.dists["mlx"], self.sdk),
+                    shutil.copy2(mlx_metal.build(self.report.dists["mlx"], self.sdk, progress=p),
                                  self.pk / "mlx" / "lib" / "mlx.metallib")
                 else:
-                    mlx_metal.install(self.out, self.report.dists["mlx"], self.sdk)
+                    mlx_metal.install(self.out, self.report.dists["mlx"], self.sdk, progress=p)
             except Exception as e:  # MLX still runs on its CPU backend without kernels
                 self.report.warnings.append(f"mlx: no iOS GPU kernels ({e})")
         self.report.seconds = time.time() - t0
@@ -233,24 +240,39 @@ class Stager:
     # --------------------------------------------------------- binaries
 
     def _convert_binaries(self) -> None:
+        prog = self.progress
+        prog.detail("finding binaries")
         bins = [p for p in self.pk.rglob("*") if p.is_file() and not p.is_symlink() and is_macho(p)]
         # Executables (helper tools like torch_shm_manager) can never run on iOS:
         # no child processes. Keep a placeholder so existence checks still pass.
-        for p in [b for b in bins if _is_executable(b)]:
+        tick = progress_mod.counter(prog, len(bins), "reading binaries")
+
+        def read(p):
+            try:
+                return _is_executable(p), _load_commands(p)
+            finally:
+                tick()
+
+        with ThreadPoolExecutor(8) as pool:
+            got = dict(zip(bins, pool.map(read, bins)))
+        for p in [b for b in bins if got[b][0]]:
             p.write_text("pocketnode: executables can't run on iOS (no child processes)\n")
             bins.remove(p)
         self.report.binaries = len(bins)
         names: dict[Path, str] = {}
         for p in bins:
             names[p.resolve()] = self._framework_name(p)
-        info = {}
-        with ThreadPoolExecutor(8) as pool:
-            for p, lc in zip(bins, pool.map(lambda p: _load_commands(p), bins)):
-                info[p] = lc
+        info = {p: got[p][1] for p in bins}
         problems = self._check(bins)
+        tick = progress_mod.counter(prog, len(bins), "retagging")
         if self.inplace:
+            def one(p):
+                try:
+                    self._retag_inplace(p, info[p], problems.get(p))
+                finally:
+                    tick()
             with ThreadPoolExecutor(8) as pool:
-                list(pool.map(lambda p: self._retag_inplace(p, info[p], problems.get(p)), bins))
+                list(pool.map(one, bins))
             return
         # Resolve bundled-library references before anything moves.
         links: dict[Path, dict[str, str]] = {}
@@ -261,8 +283,14 @@ class Stager:
                 target = _resolve(ref, p, rpaths)
                 if target is not None and target in names:
                     links[p][ref] = names[target]
+        def one(p):
+            try:
+                self._retag(p, info[p], names, problems.get(p), links[p])
+            finally:
+                tick()
+
         with ThreadPoolExecutor(8) as pool:
-            list(pool.map(lambda p: self._retag(p, info[p], names, problems.get(p), links[p]), bins))
+            list(pool.map(one, bins))
         for fw in [*self.fw.glob("pocketnode_shim_*.framework"), *self.fw.glob("pocketnode_absent_*.framework")]:
             self._write_plist(fw, fw.name[: -len(".framework")])
         # Libraries some packages load by path with ctypes (torch, lightgbm, ...)
@@ -290,8 +318,15 @@ class Stager:
             self.report.warnings.append("PyYAML missing: skipped the static iOS symbol check")
             return {}
         out = {}
+        tick = progress_mod.counter(self.progress, len(bins), "checking against the iOS SDK")
 
         def one(p):
+            try:
+                return check(p)
+            finally:
+                tick()
+
+        def check(p):
             try:
                 r = symcheck.analyze(str(p))
             except Exception as e:
@@ -514,11 +549,11 @@ def _signed(p: Path) -> bool:
 
 
 def stage(packages: list[str], sdk: str = "iphonesimulator", out: Path | None = None,
-          bundle_id: str = SIM_BUNDLE_ID) -> Report:
+          bundle_id: str = SIM_BUNDLE_ID, progress=None) -> Report:
     import pocketnode
     src = Path(pocketnode.__file__).parent
     s = Stager(sdk, out, bundle_id)
-    return s.stage(sorted(set(packages) | {"cloudpickle"}), extra_paths={"pocketnode": src})
+    return s.stage(sorted(set(packages) | {"cloudpickle"}), extra_paths={"pocketnode": src}, progress=progress)
 
 
 def refresh_pocketnode(sdk: str = "iphonesimulator") -> None:

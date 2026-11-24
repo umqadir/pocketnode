@@ -13,8 +13,10 @@ import hashlib
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
+from .. import progress as progress_mod
 from ..sources import CONFIG_DIR
 
 CACHE = CONFIG_DIR / "cache"
@@ -23,6 +25,7 @@ XCODEGEN = {
     "version": "2.48.0",
     "url": "https://github.com/yonaskolb/XcodeGen/releases/download/2.48.0/xcodegen.zip",
     "sha256": "620c9f0dc10849f94728ab5df52d225ebab8187439dd6fee1925e59e80dff892",
+    "bytes": 5738697,
 }
 # The phone's Python. Its minor version must match the Mac's (bytecode and
 # extension modules are shared), so this moves to a new minor only together
@@ -33,6 +36,7 @@ PYTHON_SUPPORT = {
     "url": "https://github.com/beeware/Python-Apple-support/releases/download/3.13-b18/"
            "Python-3.13-iOS-support.b18.tar.gz",
     "sha256": "d06acf2a9c7964a8689566353a0e707402eff822037de5e29ba0e16040f7047d",
+    "bytes": 34524958,
     "mb": 35,
 }
 METAL_TOOLCHAIN_MB = 840  # measured with Xcode 27.1
@@ -50,18 +54,31 @@ def _sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def download(url: str, dest: Path, sha256: str) -> Path:
-    """Fetch `url` to `dest` unless a file with the right checksum is already there."""
+def download(url: str, dest: Path, sha256: str, size: int | None = None, progress=None) -> Path:
+    """Fetch `url` to `dest` unless a file with the right checksum is already there.
+    size: the expected bytes (for the count); progress: a reporter told the MB done/total."""
     if dest.exists() and _sha256(dest) == sha256:
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     part = dest.with_name(dest.name + ".part")
+    p = progress or progress_mod.NULL
+    total = round(size / 2**20, 1) if size else None
     # curl uses the system's certificates, which a standalone Python build may not find.
-    r = subprocess.run(["curl", "-fL", "--retry", "3", "--silent", "--show-error", "-o", str(part), url],
-                       capture_output=True, text=True)
+    proc = subprocess.Popen(["curl", "-fL", "--retry", "3", "--silent", "--show-error", "-o", str(part), url],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    while proc.poll() is None:
+        try:
+            got = part.stat().st_size
+        except OSError:
+            got = 0
+        p.update(round(got / 2**20, 1), total, detail="downloading", unit="MB")
+        time.sleep(0.2)
+    r = subprocess.CompletedProcess(proc.args, proc.returncode, "", proc.stderr.read())
+    proc.stderr.close()
     if r.returncode:
         part.unlink(missing_ok=True)
         raise ToolError(f"downloading {url} failed: {r.stderr.strip()}")
+    p.detail("checking the download")
     got = _sha256(part)
     if got != sha256:
         part.unlink(missing_ok=True)
@@ -79,12 +96,15 @@ def xcodegen() -> str:
     exe = home / "xcodegen" / "bin" / "xcodegen"
     if exe.exists():
         return str(exe)
-    z = download(XCODEGEN["url"], CACHE / f"xcodegen-{XCODEGEN['version']}.zip", XCODEGEN["sha256"])
-    tmp = Path(tempfile.mkdtemp(prefix="xcodegen-", dir=CACHE))
-    r = subprocess.run(["unzip", "-q", str(z), "-d", str(tmp)], capture_output=True, text=True)
-    if r.returncode or not (tmp / "xcodegen" / "bin" / "xcodegen").exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise ToolError(f"unpacking {z.name} failed: {r.stderr.strip()}")
+    with progress_mod.step(f"Downloading XcodeGen {XCODEGEN['version']}") as p:
+        z = download(XCODEGEN["url"], CACHE / f"xcodegen-{XCODEGEN['version']}.zip", XCODEGEN["sha256"],
+                     XCODEGEN["bytes"], p)
+        p.detail("unpacking")
+        tmp = Path(tempfile.mkdtemp(prefix="xcodegen-", dir=CACHE))
+        r = subprocess.run(["unzip", "-q", str(z), "-d", str(tmp)], capture_output=True, text=True)
+        if r.returncode or not (tmp / "xcodegen" / "bin" / "xcodegen").exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ToolError(f"unpacking {z.name} failed: {r.stderr.strip()}")
     shutil.rmtree(home, ignore_errors=True)
     tmp.rename(home)
     return str(exe)
@@ -99,12 +119,14 @@ def python_xcframework() -> Path:
             f"Build: {PYTHON_SUPPORT['build']}" in versions.read_text():
         return xcf
     name = PYTHON_SUPPORT["url"].rsplit("/", 1)[1]
-    tar = download(PYTHON_SUPPORT["url"], CACHE / name, PYTHON_SUPPORT["sha256"])
-    tmp = Path(tempfile.mkdtemp(prefix="py-ios-", dir=CACHE))
-    r = subprocess.run(["tar", "-xzf", str(tar), "-C", str(tmp)], capture_output=True, text=True)
-    if r.returncode or not (tmp / "Python.xcframework" / "Info.plist").exists():
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise ToolError(f"unpacking {name} failed: {r.stderr.strip() or 'no Python.xcframework in it'}")
+    with progress_mod.step(f"Downloading Python {PYTHON_SUPPORT['python']} for iOS") as p:
+        tar = download(PYTHON_SUPPORT["url"], CACHE / name, PYTHON_SUPPORT["sha256"], PYTHON_SUPPORT["bytes"], p)
+        p.detail("unpacking")
+        tmp = Path(tempfile.mkdtemp(prefix="py-ios-", dir=CACHE))
+        r = subprocess.run(["tar", "-xzf", str(tar), "-C", str(tmp)], capture_output=True, text=True)
+        if r.returncode or not (tmp / "Python.xcframework" / "Info.plist").exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise ToolError(f"unpacking {name} failed: {r.stderr.strip() or 'no Python.xcframework in it'}")
     shutil.rmtree(root, ignore_errors=True)
     tmp.rename(root)
     return xcf

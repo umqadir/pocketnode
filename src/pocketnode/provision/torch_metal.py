@@ -17,6 +17,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .. import progress as progress_mod
 from ..sources import CONFIG_DIR
 
 CACHE = CONFIG_DIR / "cache"
@@ -32,10 +33,11 @@ def _base(version: str) -> str:
     return version.split("+")[0]
 
 
-def source(version: str) -> Path:
+def source(version: str, progress=None) -> Path:
     version = _base(version)
     src = CACHE / "src" / f"pytorch-{version}"
     if not (src / "aten/src/ATen/native/mps/kernels").exists():
+        (progress or progress_mod.NULL).detail(f"downloading PyTorch {version} shader sources")
         shutil.rmtree(src, ignore_errors=True)  # an interrupted clone
         src.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "-c", "advice.detachedHead=false", "clone", "-q", "--filter=blob:none", "--sparse", "--depth", "1",
@@ -44,16 +46,18 @@ def source(version: str) -> Path:
     return src
 
 
-def build(version: str, sdk: str) -> Path:
+def build(version: str, sdk: str, progress=None) -> Path:
     """kernels_basic.metallib for `sdk` ("iphoneos" or "iphonesimulator"), cached per version.
 
     Compiled as torch's own build does (cmake/Metal.cmake, aten/src/ATen/CMakeLists.txt).
+    progress: a reporter told `compiling GPU shaders k/n` (a cached library reports nothing).
     """
     version = _base(version)
     out = CACHE / "torch-metallib" / f"{version}-{sdk}" / "kernels_basic.metallib"
     if out.exists():
         return out
-    src = source(version)
+    p = progress or progress_mod.NULL
+    src = source(version, p)
     native = src / "aten/src/ATen/native"
     shaders = sorted([*(native / "mps").rglob("*.metal"), *(native / "sparse/mps").rglob("*.metal")])
     work = out.parent / "air"
@@ -61,7 +65,15 @@ def build(version: str, sdk: str) -> Path:
     minflag = (f"-mios-simulator-version-min={METAL_MIN}" if sdk == "iphonesimulator"
                else f"-mios-version-min={METAL_MIN}")
 
+    tick = progress_mod.counter(p, len(shaders), "compiling PyTorch GPU shaders")
+
     def compile_one(s: Path) -> Path:
+        try:
+            return _compile(s)
+        finally:
+            tick()
+
+    def _compile(s: Path) -> Path:
         # Named by path, since torch's own build names .air files by stem alone.
         air = work / (str(s.relative_to(native).with_suffix("")).replace("/", "_") + ".air")
         r = subprocess.run(["xcrun", "-sdk", sdk, "metal", "-c", str(s), "-I", str(src), "-I", str(src / "aten/src"),
@@ -73,6 +85,7 @@ def build(version: str, sdk: str) -> Path:
 
     with ThreadPoolExecutor(8) as pool:
         airs = list(pool.map(compile_one, shaders))
+    p.detail("linking PyTorch GPU shaders")
     linked, tmp = work / "linked.metallib", out.with_suffix(".tmp")
     for cmd in (["metallib", "-o", str(linked), *map(str, airs)],
                 ["metal-strip", "--compress-sections=MODULE_LIST", "--reflection_metadata", f"-o={tmp}", str(linked)]):
@@ -123,10 +136,10 @@ def patch(binary: Path, metallib: Path) -> None:
     raise LookupError(f"{binary} has no __TEXT,metal_basic section")
 
 
-def install(pk: Path, version: str, sdk: str) -> bool:
+def install(pk: Path, version: str, sdk: str, progress=None) -> bool:
     """Put iOS shaders into a staged torch's libtorch_cpu.dylib."""
     lib = pk / "torch" / "lib" / "libtorch_cpu.dylib"
     if not lib.exists():
         return False
-    patch(lib, build(version, sdk))
+    patch(lib, build(version, sdk, progress))
     return True

@@ -160,6 +160,16 @@ def test_phone_states():
     assert not c.ok
 
 
+def test_connected_phone_counts_as_paired():
+    # While a CoreDevice tunnel is up, the State column says `connected`, not `available (paired)`.
+    for state in ("connected         ", "connected (no DDI)"):
+        text = DEVICES.replace("available (paired)", state)
+        d = app_mod.parse_devices(text)[0]
+        assert d["available"] and d["paired"], state
+        c, udid = setup.check_phone(text)
+        assert c.ok and udid == UDID, state
+
+
 def test_developer_mode():
     on = f"UDID\t\t\t\tDeveloper Mode Status\n{UDID}\tenabled\n"
     assert setup.check_devmode(on, UDID).ok
@@ -267,8 +277,8 @@ def test_bundle_id_per_team(home):
 
 def test_device_build_uses_and_saves_the_team_bundle_id(home, monkeypatch):
     seen = {}
-    monkeypatch.setattr(stage_mod, "stage", lambda pkgs, sdk, bundle_id: seen.setdefault("stage", bundle_id)
-                        and stage_mod.Report(sdk))
+    monkeypatch.setattr(stage_mod, "stage", lambda pkgs, sdk, bundle_id, progress=None:
+                        seen.setdefault("stage", bundle_id) and stage_mod.Report(sdk))
     monkeypatch.setattr(app_mod, "prepare_project", lambda team, bundle: seen.setdefault("project", bundle)
                         and home)
     monkeypatch.setattr(app_mod, "device_udid", lambda: (_ for _ in ()).throw(RuntimeError("no phone")))
@@ -278,6 +288,7 @@ def test_device_build_uses_and_saves_the_team_bundle_id(home, monkeypatch):
         seen["env"] = kw.get("env", {})
         return cp()
     monkeypatch.setattr(app_mod, "_run", fake_run)
+    monkeypatch.setattr(app_mod, "_run_streaming", lambda cmd, on_line, log=None, **kw: fake_run(cmd, log, **kw))
     app_mod.save_config(team="ZZ99YY88XX", packages=[])
     app_mod.build("iphoneos")
     assert seen["stage"] == seen["project"] == seen["env"]["POCKETNODE_BUNDLE_ID"] == "dev.pocketnode.zz99yy88xx"
@@ -292,6 +303,20 @@ def test_device_build_uses_and_saves_the_team_bundle_id(home, monkeypatch):
     assert seen["env"]["POCKETNODE_BUNDLE_ID"] == "org.example.pn"
 
 
+def test_build_warns_only_when_cold(home, monkeypatch):
+    """The build directory, not the history, says whether a build starts from nothing."""
+    monkeypatch.setattr(app_mod, "build", lambda sdk: app_mod.product(sdk))
+    monkeypatch.setattr(app_mod, "install_sim", lambda p: None)
+    app_mod._record({"event": "build", "sdk": "iphonesimulator", "stage_s": 1, "build_s": 1})
+    out = []
+    setup.Setup(out=out.append).build_install("iphonesimulator", None)
+    assert out == ["building the app: the first build takes several minutes"]
+    app_mod.product("iphonesimulator").mkdir(parents=True)
+    out.clear()
+    setup.Setup(out=out.append).build_install("iphonesimulator", None)
+    assert out == ["building the app"]
+
+
 def test_hot_add_signs_with_the_app_bundle_id(home, monkeypatch):
     from pocketnode.provision import hot
     app_mod.save_config(team="ZZ99YY88XX")
@@ -304,7 +329,7 @@ def test_hot_add_signs_with_the_app_bundle_id(home, monkeypatch):
             self.pk.mkdir(parents=True)
             (self.pk / "lib.so").write_bytes(b"\xcf\xfa\xed\xfe" + b"\0" * 28)
 
-        def stage(self, names, only=None):
+        def stage(self, names, only=None, progress=None):
             return stage_mod.Report("iphoneos")
 
     monkeypatch.setattr(stage_mod, "Stager", FakeStager)
