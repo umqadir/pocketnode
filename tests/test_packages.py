@@ -26,6 +26,19 @@ from pocketnode.provision import stage as stage_mod  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 SIM_PY = ROOT / ".phone-sim" / "bin" / "python"
+# POCKETNODE_STANDIN_EDITION=store runs the stand-in phone as the App Store edition.
+STORE = os.environ.get("POCKETNODE_STANDIN_EDITION") == "store"
+fixed_set = pytest.mark.skipif(STORE, reason="App Store edition stand-in: its package set is fixed "
+                                            "(tests/test_store.py checks that changing it is refused)")
+
+
+def _store_args(tmp_path) -> list[str]:
+    if not STORE:
+        return []
+    from pocketnode import pairing
+    c = pairing.seed_pair_file(tmp_path / "pairs.json", "this Mac")
+    pairing.remember(c["phone_id"], c["pair_id"], c["token"], "stand-in")
+    return ["--edition", "store", "--pair-file", str(tmp_path / "pairs.json")]
 
 
 @pytest.fixture(autouse=True)
@@ -59,7 +72,7 @@ def _start_standin(tmp_path, port=None):
     tok.write_text("t0ken")
     proc = subprocess.Popen([str(SIM_PY), "-m", "pocketnode.worker", "--listen", f"127.0.0.1:{port}",
                              "--token-file", str(tok), "--phone", "--kind", "phone", "--name", "standalone",
-                             "--cache-dir", str(tmp_path / "cache")],
+                             "--cache-dir", str(tmp_path / "cache"), *_store_args(tmp_path)],
                             env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, stdout=subprocess.DEVNULL)
     return proc, port
 
@@ -172,6 +185,7 @@ def test_table_status_from_the_phone(standin):
 # ------------------------------------------------------------- add / remove
 
 
+@fixed_set
 def test_add_and_remove_on_running_phone(standin, capsys):
     ex = standin
     with pytest.raises(PlacementError, match="PyYAML"):
@@ -288,6 +302,7 @@ def test_checklist_blocked_row_cannot_be_ticked(tmp_path):
 # -------------------------------------------------------------------- select
 
 
+@fixed_set
 def test_select_applies_the_difference(standin, monkeypatch, capsys):
     ex = standin
     monkeypatch.setattr(packages, "_check_dist", lambda d: ("ok", ""))  # the static iOS check isn't under test

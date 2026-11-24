@@ -1,0 +1,54 @@
+# The App Store edition (pocketnode app build --store, pocketnode app archive).
+# Same product and scheme as project.yml; its own Info.plist, entitlements,
+# privacy manifest and asset catalog (Store/), and every binary built for iOS.
+name: PocketNode
+options:
+  bundleIdPrefix: dev.pocketnode
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    ARCHS: arm64
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_OBJC_ARC: YES
+    ENABLE_BITCODE: NO
+    CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER: NO
+    DEVELOPMENT_TEAM: ${POCKETNODE_TEAM}
+    CODE_SIGN_STYLE: Automatic
+    PRODUCT_BUNDLE_IDENTIFIER: ${POCKETNODE_BUNDLE_ID}
+    MARKETING_VERSION: ${POCKETNODE_MARKETING_VERSION}
+    CURRENT_PROJECT_VERSION: ${POCKETNODE_BUILD}
+targets:
+  PocketNode:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes: ["python/**", "pn_core.c", "Info.plist", "PocketNode.entitlements"]
+      - path: Store
+        excludes: ["packages.txt"]
+    dependencies:
+      - framework: Python.xcframework
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        INFOPLIST_FILE: Store/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Store/PocketNode.entitlements
+        GCC_PREPROCESSOR_DEFINITIONS: "$(inherited) POCKETNODE_STORE=1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The app's code stays in the executable in Debug builds too (no PocketNode.debug.dylib).
+        ENABLE_DEBUG_DYLIB: NO
+        # Keep the executable's exported functions (Python finds pocketnode_* with
+        # ctypes.CDLL(None)); the default ("all") strips them from archives.
+        STRIP_STYLE: non-global
+        HEADER_SEARCH_PATHS: "$(BUILT_PRODUCTS_DIR)/Python.framework/Headers"
+        TARGETED_DEVICE_FAMILY: "1"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
+    postBuildScripts:
+      - name: Install Python, packages and settings
+        script: |
+          set -e
+          POCKETNODE_FLAVOUR=store /bin/bash "$PROJECT_DIR/scripts/install_python.sh"
+        basedOnDependencyAnalysis: false

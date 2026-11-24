@@ -116,6 +116,8 @@ def _env_key(manifest) -> str | None:
 
 
 class Worker:
+    uses_site = True  # packages added at run time are imported from self.site
+
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
                  node_kind: str | None = None, site_dir: str | None = None):
@@ -133,7 +135,7 @@ class Worker:
         # version wins over one bundled with the app.
         self.site = Path(site_dir or self.cache_dir / "site")
         self.site.mkdir(parents=True, exist_ok=True)
-        if str(self.site) not in sys.path:
+        if self.uses_site and str(self.site) not in sys.path:
             sys.path.insert(0, str(self.site))
         self._installs: dict[str, set[str] | None] = {}  # req -> modules loaded before it (None: failed)
         self.store = BufferStore(store_budget or self._default_budget())
@@ -339,10 +341,16 @@ class Worker:
                         "environment; close that one (or use the same environment) and it will connect")
         return None
 
+    def _handshake(self, conn: Connection) -> dict:
+        return server_handshake(conn, self.token, self.hello(), admit=self._admit)
+
+    def _session_started(self, sess: _Session, conn: Connection, info: dict) -> None:
+        """Hook: a Mac session has authenticated on `conn` (its peer is conn.sock)."""
+
     def _session(self, sock: socket.socket) -> None:
         conn = Connection(sock, "mac")
         try:
-            info = server_handshake(conn, self.token, self.hello(), admit=self._admit)
+            info = self._handshake(conn)
         except Exception:
             conn.close()
             return
@@ -360,6 +368,7 @@ class Worker:
                 self.env = env
         if old is not None:
             old.close()
+        self._session_started(sess, conn, info)
         if new_env:
             self.finder.set_manifest(info["manifest"])
         self._flush_held(sess)
@@ -960,7 +969,7 @@ def _read_token(path: str | None) -> str:
     return os.environ["POCKETNODE_TOKEN"]
 
 
-def main(argv=None) -> None:
+def main(argv=None, standin: bool = False) -> None:
     ap = argparse.ArgumentParser(prog="python -m pocketnode.worker")
     ap.add_argument("--listen", help="host:port to listen on")
     ap.add_argument("--unix", help="unix socket path to listen on")
@@ -973,16 +982,32 @@ def main(argv=None) -> None:
     ap.add_argument("--kind")
     ap.add_argument("--store-budget", type=int, help="bytes of input data to keep cached")
     ap.add_argument("--site-dir", help="where packages added at runtime go (default: under the cache dir)")
+    ap.add_argument("--edition", choices=["dev", "store"], default="dev",
+                    help="store: behave like the App Store edition (pairing at run time, fixed packages)")
+    ap.add_argument("--pair-file", help="with --edition store: the file holding the paired Macs")
     a = ap.parse_args(argv)
     import faulthandler
     import signal
     faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # `kill -USR1` dumps stacks
-    w = Worker(_read_token(a.token_file), slots=a.slots, cache_dir=a.cache_dir,
-               phone=a.phone or None, name=a.name, node_kind=a.kind,
-               store_budget=a.store_budget, site_dir=a.site_dir)
+    kw = dict(slots=a.slots, cache_dir=a.cache_dir, phone=a.phone or None, name=a.name, node_kind=a.kind,
+              store_budget=a.store_budget, site_dir=a.site_dir)
+    if a.edition == "store":
+        if not a.pair_file:
+            ap.error("--edition store needs --pair-file")
+        from .pairing import FileBackend, PairStore
+        from .storeworker import StoreWorker
+        w = StoreWorker(PairStore(FileBackend(a.pair_file)), **kw)
+        code = os.environ.get("POCKETNODE_STANDIN_PAIR_CODE", "")
+        if standin and code and not device.IS_IOS:
+            # A stand-in has no screen: this opens a pairing window that stays
+            # open and answers Allow by itself (for trying `pocketnode pair`).
+            w.window.auto_allow = True
+            w.window.begin(code=code, keep_open=True)
+    else:
+        w = Worker(_read_token(a.token_file), **kw)
     w.serve(listen=a.listen, unix=a.unix, connect=a.connect,
             ready=lambda addr: print(json.dumps({"ready": str(addr)}), file=sys.__stdout__, flush=True))
 
 
 if __name__ == "__main__":
-    main()
+    main(standin=True)

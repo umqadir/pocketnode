@@ -24,6 +24,20 @@ from pocketnode.errors import PlacementError
 
 ROOT = Path(__file__).resolve().parents[1]
 SIM_PY = ROOT / ".phone-sim" / "bin" / "python"
+# POCKETNODE_STANDIN_EDITION=store runs every stand-in phone as the App Store edition.
+STORE = os.environ.get("POCKETNODE_STANDIN_EDITION") == "store"
+fixed_set = pytest.mark.skipif(STORE, reason="App Store edition stand-in: its package set is fixed "
+                                            "(tests/test_store.py checks that adding is refused)")
+
+
+def store_args(tmp_path) -> list[str]:
+    """In store mode: a pair file for the stand-in, with this Mac's side saved where the Mac looks."""
+    if not STORE:
+        return []
+    from pocketnode import pairing
+    c = pairing.seed_pair_file(tmp_path / "pairs.json", "this Mac")
+    pairing.remember(c["phone_id"], c["pair_id"], c["token"], "stand-in")
+    return ["--edition", "store", "--pair-file", str(tmp_path / "pairs.json")]
 
 
 @pytest.fixture(scope="module")
@@ -318,7 +332,7 @@ def test_results_held_across_disconnect(tmp_path):
     s.close()
     proc = subprocess.Popen([str(SIM_PY), "-m", "pocketnode.worker", "--listen", f"127.0.0.1:{port}",
                              "--token-file", str(tok), "--phone", "--kind", "phone", "--name", "held-test",
-                             "--cache-dir", str(tmp_path / "cache")],
+                             "--cache-dir", str(tmp_path / "cache"), *store_args(tmp_path)],
                             env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, stdout=subprocess.DEVNULL)
     from pocketnode.sources import Address
     e = pn.PocketExecutor(notes=False)
@@ -520,7 +534,7 @@ def _standalone_phone(tmp_path, *extra):
     s.close()
     proc = subprocess.Popen([str(SIM_PY), "-m", "pocketnode.worker", "--listen", f"127.0.0.1:{port}",
                              "--token-file", str(tok), "--phone", "--kind", "phone", "--name", "standalone",
-                             "--cache-dir", str(tmp_path / "cache"), *extra],
+                             "--cache-dir", str(tmp_path / "cache"), *extra, *store_args(tmp_path)],
                             env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, stdout=subprocess.DEVNULL)
     return proc, port
 
@@ -578,6 +592,7 @@ def _uses_yaml(pause=0.0):
     return yaml.__version__
 
 
+@fixed_set
 def test_add_compiled_package_to_running_phone(tmp_path):
     # PyYAML is compiled, installed here and absent from the stand-in's environment.
     yaml = pytest.importorskip("yaml")
@@ -601,6 +616,7 @@ def test_add_compiled_package_to_running_phone(tmp_path):
         proc.kill()
 
 
+@fixed_set
 def test_missing_package_is_added_automatically(tmp_path):
     yaml = pytest.importorskip("yaml")
     from pocketnode.sources import Address, LocalWorkers

@@ -2,12 +2,17 @@
 
     pocketnode setup [--sim]          guided first run: checks, builds, installs, acceptance check
     pocketnode status                 nodes, phone state, link
+    pocketnode pair [--code CODE]     pair this Mac with an iPhone running the App Store edition (USB)
+    pocketnode unpair [--all|PHONE]   forget an iPhone's pairing on this Mac
     pocketnode packages               what's on the phone vs this Mac's environment
     pocketnode packages select        checklist: tick what should be on the phone, see what it costs
     pocketnode packages add NAME...   put compiled packages on the running phone app (seconds, no restart)
     pocketnode packages remove NAME...  take them off again
                                       (--bundle: rebuild the app with the change baked in instead)
-    pocketnode app build|install      build/install the iOS app (--sim for the simulator)
+    pocketnode app build|install      build/install the iOS app (--sim for the simulator;
+                                      --store / --dev switch between the App Store edition and the sideloaded one)
+    pocketnode app archive            App Store archive of the store edition (unsigned without --team)
+    pocketnode app validate [PATH]    check a store archive or app against App Store rules, PASS/FAIL per item
     pocketnode bench                  link + compute, phone vs Mac
     pocketnode check [--quick]        release acceptance check: every feature, PASS/FAIL per item
     pocketnode experiments            device experiments that decide design branches
@@ -37,8 +42,50 @@ def cmd_status(args):
     for n in ex.nodes.values():
         h = n.hello
         print(f"  {h['model']} · Python {'.'.join(map(str, h['python']))} · {h['cores']} · "
-              f"{len(h['packages'])} packages · cache {h['store']['bytes'] / 2**20:.0f} MB")
+              f"{len(h['packages'])} packages · cache {h['store']['bytes'] / 2**20:.0f} MB"
+              + (" · App Store edition" if h.get("edition") == "store" else ""))
     ex.shutdown(wait=False)
+
+
+def cmd_pair(args):
+    from .pairing import PairingFailed, pair_phone
+    try:
+        r = pair_phone(address=args.address, code=args.code)
+    except PairingFailed as e:
+        raise SystemExit(f"not paired: {e}")
+    except KeyboardInterrupt:
+        raise SystemExit("not paired")
+    print(f"paired with {r['phone_name']}; it connects whenever the pocketnode app is open "
+          "(`pocketnode status` shows it)")
+
+
+def cmd_unpair(args):
+    from . import pairing
+    creds = pairing.load()
+    if args.all:
+        targets = list(creds)
+    elif args.phone:
+        want = args.phone.strip().lower()
+        targets = [pid for pid, c in creds.items()
+                   if want in (pid.lower(), str(c.get("phone_name", "")).lower())]
+        if not targets:
+            raise SystemExit(f"this Mac isn't paired with {args.phone!r}"
+                             + (f" (paired: {', '.join(_phone_names(creds))})" if creds else ""))
+    elif len(creds) == 1:
+        targets = list(creds)
+    elif not creds:
+        raise SystemExit("this Mac isn't paired with any iPhone")
+    else:
+        raise SystemExit(f"paired with {', '.join(_phone_names(creds))}: name one, or use --all")
+    for pid in targets:
+        name = creds[pid].get("phone_name") or pid
+        pairing.remove(pid)
+        print(f"forgot {name} on this Mac. To remove this Mac from the iPhone too, open pocketnode "
+              "there and forget it under Paired Macs.")
+
+
+def _phone_names(creds: dict) -> list[str]:
+    return [f"{c.get('phone_name') or '?'} ({pid})" for pid, c in creds.items()]
 
 
 def cmd_packages(args):
@@ -65,17 +112,52 @@ def _sdk(args):
 
 def cmd_app(args):
     from .provision import app
+    if args.action == "validate":
+        from .provision import validate
+        raise SystemExit(validate.main(args.path))
+    if args.action == "archive":
+        if args.dev:
+            raise SystemExit("`pocketnode app archive` builds the App Store edition; the sideloaded one isn't archived")
+        try:
+            arc, signed = app.archive(team=args.team, restage=not args.no_stage)
+        except RuntimeError as e:
+            raise SystemExit(str(e))
+        print(arc)
+        if not signed:
+            print("built without code signing (no team configured): `pocketnode app validate` checks its "
+                  "structure, but exporting it for upload needs the owner's distribution signing (--team TEAMID)")
+        return
+    chosen = "store" if args.store else "dev" if args.dev else None
+    store = (chosen or app.current_flavour()) == "store"
     sdk = "iphonesimulator" if args.sim else "iphoneos"
     app.save_config(sdk=sdk, **({"team": args.team} if args.team else {}),
-                    **({"bundle_id": args.bundle_id} if args.bundle_id else {}),
+                    **({"store_bundle_id" if store else "bundle_id": args.bundle_id} if args.bundle_id else {}),
                     **({"wifi": args.wifi} if args.wifi is not None else {}),
-                    **({"torch_mps": args.torch_mps} if args.torch_mps is not None else {}))
-    if args.action in ("build", "install"):
+                    **({"torch_mps": args.torch_mps} if args.torch_mps is not None else {}),
+                    **({"flavour": chosen} if chosen else {}))
+    if args.action in ("build", "install") and store:
+        try:
+            p = app.build(sdk, restage=not args.no_stage, flavour="store")
+            print(p)
+            if args.action == "install":
+                if args.sim:
+                    app.install_sim(p, device=args.device, flavour="store", port=args.port)
+                else:
+                    app.install_device(p, udid=args.device, flavour="store")
+                print("installed and launched")
+        except RuntimeError as e:
+            raise SystemExit(str(e))
+    elif args.action in ("build", "install"):
         p = app.build(sdk, restage=not args.no_stage)
         print(p)
         if args.action == "install":
             try:
-                (app.install_sim if args.sim else app.install_device)(p)
+                if args.sim and (args.device or args.port):
+                    app.install_sim(p, device=args.device, port=args.port)
+                elif args.device and not args.sim:
+                    app.install_device(p, udid=args.device)
+                else:
+                    (app.install_sim if args.sim else app.install_device)(p)
             except RuntimeError as e:
                 raise SystemExit(str(e))
             print("installed and launched")
@@ -160,6 +242,18 @@ def main(argv=None) -> None:
     conn(p)
     p.set_defaults(fn=cmd_status)
 
+    p = sub.add_parser("pair", help="pair this Mac with an iPhone running the App Store edition",
+                       description="In the pocketnode app on the iPhone tap Pair a Mac, then run this "
+                                   "with the iPhone connected by USB and type the code it shows.")
+    p.add_argument("--address", help="host:port instead of USB (the simulator, or a stand-in on this Mac)")
+    p.add_argument("--code", help="the six-digit code shown on the iPhone (asked for when not given)")
+    p.set_defaults(fn=cmd_pair)
+
+    p = sub.add_parser("unpair", help="forget an iPhone's pairing on this Mac")
+    p.add_argument("phone", nargs="?", help="the iPhone's name or id (see `pocketnode unpair` with no argument)")
+    p.add_argument("--all", action="store_true", help="forget every paired iPhone")
+    p.set_defaults(fn=cmd_unpair)
+
     p = sub.add_parser("packages")
     p.add_argument("action", nargs="?", choices=["list", "select", "add", "remove", "always-mac"], default="list")
     p.add_argument("names", nargs="*")
@@ -172,10 +266,18 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_packages)
 
     p = sub.add_parser("app")
-    p.add_argument("action", choices=["build", "install", "launch"])
+    p.add_argument("action", choices=["build", "install", "launch", "archive", "validate"])
+    p.add_argument("path", nargs="?", help="validate: an .xcarchive or .app (default: the last store archive, "
+                                           "else the last store build)")
     p.add_argument("--sim", action="store_true", help="build for the iOS simulator")
+    which = p.add_mutually_exclusive_group()
+    which.add_argument("--store", action="store_true",
+                       help="build the App Store edition from now on (fixed packages from iOS wheels, pairing at run time)")
+    which.add_argument("--dev", action="store_true", help="build the sideloaded edition from now on (the default)")
     p.add_argument("--team", help="Apple development team ID")
     p.add_argument("--bundle-id")
+    p.add_argument("--device", help="install: the simulator (name or UDID) or iPhone (UDID) to install on")
+    p.add_argument("--port", type=int, help="install on a simulator: the port the app listens on")
     p.add_argument("--no-stage", action="store_true", help="reuse staged packages")
     p.add_argument("--wifi", action=argparse.BooleanOptionalAction, default=None,
                    help="also accept the Mac over the local network (default: USB only)")

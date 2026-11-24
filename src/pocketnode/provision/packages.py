@@ -180,6 +180,25 @@ def _live(executor=None):
             temp.shutdown(wait=False)
 
 
+def _fixed_phone(executor=None):
+    """The connected phone if it runs the App Store edition (its package set is fixed), else None."""
+    ex = executor
+    if ex is None:
+        from .. import _current
+        ex = _current
+    for n in list(ex.nodes.values()) if ex is not None else ():
+        if n.kind == "phone" and n.hello.get("fixed_packages"):
+            return n
+    return None
+
+
+def _refuse_fixed(ex) -> None:
+    node = _fixed_phone(ex)
+    if node is not None:
+        from .hot import CantAdd, fixed_message
+        raise CantAdd(fixed_message(node))
+
+
 class Packages:
     """`pn.packages` — call it for the table; methods change what's on the phone."""
 
@@ -202,6 +221,7 @@ class Packages:
             from . import hot
             with _live(executor) as ex:
                 if ex is not None:
+                    _refuse_fixed(ex)
                     have = next(n.hello.get("packages", {}) for n in ex.nodes.values() if n.kind == "phone")
                     est = hot.estimate(list(names), have=have)
                     print(f"adding {', '.join(names)}: about {est['seconds']} s, {est['mb']} MB"
@@ -230,6 +250,7 @@ class Packages:
             from . import hot
             with _live(executor) as ex:
                 if ex is not None:
+                    _refuse_fixed(ex)
                     r = hot.remove(ex, list(names))
                     if r["removed"]:
                         print(f"removed {', '.join(r['removed'])}")
@@ -254,6 +275,11 @@ class Packages:
     def select(self, sdk: str | None = None, bundle: bool = False, executor=None):
         """Interactive checklist: what's on the phone, what could be, what changing it costs.
         Changes go to the running app; bundle=True rebuilds the app with exactly the ticked set."""
+        node = _fixed_phone(executor)
+        if node is not None:
+            from .hot import fixed_message
+            print(fixed_message(node))
+            return
         rows = [r for r in table(check=True, executor=executor) if r.kind == "compiled"]
         on_phone = phone_packages(executor)
         if on_phone is None:  # first use: a sensible scientific stack is pre-checked

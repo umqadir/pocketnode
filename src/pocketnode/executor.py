@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import inspect
 import queue
 import itertools
 import logging
@@ -26,7 +27,7 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from . import envinfo, router, serialize
+from . import envinfo, pairing, router, serialize
 from .errors import NodeLost, PlacementError, RemoteTraceback
 from .wire import Connection, ConnectionClosed, client_handshake
 
@@ -92,6 +93,7 @@ class Task:
     queued: bool = True
     reason: str = ""
     suggestion: str | None = None
+    fn: Any = None  # the function doing the work (for its source text, shown on store phones)
 
     @property
     def done(self) -> bool:
@@ -151,6 +153,7 @@ class Node:
         self.bytes_sent = 0
         self.lost_as_crash = False
         self.scanned = (-1, 0.0)  # (queue generation, when) of the last scan that found nothing to run
+        self.src_sent: set[str] = set()  # function keys whose source this node has been sent
         self.outbox: queue.Queue = queue.Queue()
         threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
 
@@ -212,7 +215,13 @@ class Node:
                 specs.append({"h": h, "i": 1})
                 inline.append(b)
                 self.known.add(h)
-        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key}
+        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key, "label": t.fn_label}
+        if self.hello.get("edition") == "store" and t.fn_key not in self.src_sent:
+            # The App Store edition shows what is running; the source travels once per function.
+            self.src_sent.add(t.fn_key)
+            src = self.ex._source_of(t)
+            if src:
+                header["src"] = src
         if t.pure:
             header["pure"] = 1
             header["mods"] = sorted(t.packed.modules - router.IGNORE)
@@ -260,7 +269,7 @@ def attach(ex: "PocketExecutor", sock, source: Source, token: str) -> Node | Non
     hello = client_handshake(conn, token, {
         "session": ex.session,
         "manifest": None if source.same_env else envinfo.manifest(),
-    })
+    }, credentials=getattr(source, "credentials", None) or pairing.credentials_for)
     node = Node(ex, conn, hello, source)
     ex._add_node(node)
     threading.Thread(target=node.reader, daemon=True, name=f"pn-read-{node.name}").start()
@@ -306,7 +315,7 @@ def _fn_identity(fn, args=()) -> tuple[str, str]:
 
 
 class PocketExecutor(Executor):
-    def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str = "minor",
+    def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str | None = None,
                  speculate: bool = True, confirm_errors: bool = True, notes: bool = True,
                  verify: bool = True, auto_add: bool = True):
         self.session = uuid.uuid4().hex
@@ -341,6 +350,7 @@ class PocketExecutor(Executor):
         self._replies: dict[str, tuple] = {}
         self._qgen = 0  # bumped whenever a task becomes available to pick
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
+        self._src_cache: dict[str, str | None] = {}
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
         serialize.register_user_modules()
@@ -364,12 +374,12 @@ class PocketExecutor(Executor):
         packed = serialize.dumps((fn, args, kwargs), memo=memo)
         inner, weight, inner_args = _unwrap(fn, args)
         key, label = _fn_identity(inner, inner_args)
-        return self._enqueue(packed, key, label, where, ro, weight=weight)
+        return self._enqueue(packed, key, label, where, ro, weight=weight, fn=inner)
 
-    def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False) -> PocketFuture:
+    def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False, fn=None) -> PocketFuture:
         fut = PocketFuture()
         task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules),
-                    weight=weight, shadow=shadow)
+                    weight=weight, shadow=shadow, fn=fn)
         with self._cv:
             for b, h in zip(packed.buffers, packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)
@@ -670,7 +680,7 @@ class PocketExecutor(Executor):
             else:
                 task.excluded[node.kind] = v.reason
                 if v.missing:
-                    self._missing(v.missing, task)
+                    self._missing(v.missing, task, node)
                 task.suggestion = v.suggestion
             return False, v.reason
         task.eligible[node.id] = True
@@ -808,7 +818,7 @@ class PocketExecutor(Executor):
                 if v is None:
                     v = n.verdicts[mods] = router.check(task.packed.modules, n, self.version_policy)
                 if not v.ok and v.missing:
-                    self._missing(v.missing, task)
+                    self._missing(v.missing, task, n)
 
     def _send_failed(self, att: Attempt) -> None:
         with self._cv:
@@ -923,15 +933,17 @@ class PocketExecutor(Executor):
                     self._cv.notify_all()
                 return
             reason = _unavailable_reason(u, node)
-            suggestion = _unavailable_suggestion(u)
+            suggestion = None if node.hello.get("fixed_packages") and u.get("kind") == "module" \
+                else _unavailable_suggestion(u)
             if u.get("module"):
                 node.mac_only_modules.setdefault(u["module"], reason)
                 node.verdicts.clear()
-                self._missing(u["module"], task)
+                self._missing(u["module"], task, node)
             if task.placement not in ("auto", None) or self.strict:
                 return self._fail(task, PlacementError(f"{task.fn_label}: {reason}"
                                                        + (f". {suggestion}" if suggestion else "")))
-            if u.get("kind") not in ("memory", "cache"):  # those depend on the inputs, not the function
+            # Memory and cache depend on the inputs, not the function; "stopped" was the phone's owner.
+            if u.get("kind") not in ("memory", "cache", "stopped"):
                 self.mac_only[task.fn_key] = (reason, suggestion)
                 if u.get("module"):  # undone when the module is added to the node
                     self._mac_only_mod[task.fn_key] = u["module"]
@@ -1100,10 +1112,19 @@ class PocketExecutor(Executor):
         if wire > 0 and moved > 4 << 20:
             node.bandwidth = 0.7 * node.bandwidth + 0.3 * (moved / wire)
 
-    def _missing(self, package: str, task: Task) -> None:
+    def _missing(self, package: str, task: Task, node: Node | None = None) -> None:
         """A compiled package kept a task off the phone: add it in the background (or offer to), once."""
         info = envinfo.manifest().get(package)  # a module name, or already a distribution
         dist = info["dist"] if info else package
+        if node is not None and node.hello.get("fixed_packages"):
+            # The App Store edition's package set is fixed when the app is built: nothing to add.
+            with self._cv:
+                self.missing_packages[dist] += 1
+            if router._norm(dist) not in node.packages:
+                self._note(("fixed", dist),
+                           f"pocketnode: {dist} isn't in {node.name}'s package set (App Store edition: the set "
+                           "is fixed when the app is built), so tasks that need it run on the Mac")
+            return
         with self._cv:
             self.missing_packages[dist] += 1
             if dist in self._adding:
@@ -1149,6 +1170,13 @@ class PocketExecutor(Executor):
         except Exception:  # noqa: BLE001 - advisory: the task already runs on the Mac
             log.debug("pocketnode: couldn't add %s", dist, exc_info=True)
 
+    def _source_of(self, task: Task) -> str | None:
+        """The source text of a task's function, at most 8 KB (None when Python can't find it)."""
+        key = task.fn_key
+        if key not in self._src_cache:
+            self._src_cache[key] = _source_text(task.fn)
+        return self._src_cache[key]
+
     def _note(self, key, text: str) -> None:
         if not self.notes:
             return
@@ -1157,6 +1185,25 @@ class PocketExecutor(Executor):
                 return
             self._noted.add(key)
         log.info(text)
+
+
+def _source_text(fn, limit: int = 8192) -> str | None:
+    f = fn
+    for _ in range(6):  # as in _fn_identity: look through partials, bound methods, decorators
+        inner = (getattr(f, "func", None) or getattr(f, "__func__", None) or getattr(f, "function", None)
+                 or getattr(f, "__wrapped__", None))
+        if inner is None or not callable(inner):
+            break
+        f = inner
+    if f is None:
+        return None
+    try:
+        import textwrap
+        src = textwrap.dedent(inspect.getsource(f))
+    except (OSError, TypeError, IndentationError, SyntaxError):
+        return None
+    data = src.encode()
+    return src if len(data) <= limit else data[:limit].decode("utf-8", "ignore")
 
 
 def _mark_running(fut: Future) -> bool:
@@ -1194,7 +1241,7 @@ def _unavailable_reason(u: dict, node: Node) -> str:
         return f"needs {u.get('module')} (compiled), which isn't installed on {node.name}"
     if kind == "mac-file":
         return u["detail"]
-    if kind in ("process", "memory"):
+    if kind in ("process", "memory", "stopped"):
         return u["detail"]
     return f"{kind}: {u.get('detail')}"
 

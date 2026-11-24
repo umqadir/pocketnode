@@ -37,6 +37,18 @@ def _norm(n: str) -> str:
     return n.lower().replace("-", "_").replace(".", "_")
 
 
+def fixed_message(node) -> str:
+    """Why nothing can be added to or removed from an App Store edition phone."""
+    have = ", ".join(f"{k} {v}" for k, v in sorted(node.hello.get("packages", {}).items(), key=lambda kv: kv[0].lower()))
+    return ("this iPhone runs the App Store edition of pocketnode: its compiled packages are fixed when the "
+            f"app is built (it has: {have or 'nothing'})")
+
+
+def _refuse_fixed(node) -> None:
+    if node.hello.get("fixed_packages"):
+        raise CantAdd(fixed_message(node))
+
+
 def node_sdk(node) -> str | None:
     """Which SDK a node's binaries need: None means it runs this Mac's binaries as they are."""
     h = node.hello
@@ -105,6 +117,7 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
     node = next((n for n in ex.nodes.values() if on in (n.kind, n.name, n.id)), None)
     if node is None:
         raise CantAdd(f"no connected node matches {on!r}")
+    _refuse_fixed(node)
     t0 = time.time()
     out = Path(tempfile.mkdtemp(prefix="pn-hot-"))
     try:
@@ -179,6 +192,7 @@ def remove(ex, names: list[str], on: str = "phone", timeout: float = 120) -> dic
     node = next((n for n in ex.nodes.values() if on in (n.kind, n.name, n.id)), None)
     if node is None:
         raise CantAdd(f"no connected node matches {on!r}")
+    _refuse_fixed(node)
     req = uuid.uuid4().hex
     reply = ex.expect(req)
     node.post({"t": "uninstall", "req": req, "dists": list(names)})

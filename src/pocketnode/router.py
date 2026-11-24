@@ -28,11 +28,46 @@ def _minor(v: str) -> str:
     return ".".join(v.split(".")[:2])
 
 
-def check(modules: set[str], node, version_policy: str = "minor") -> Verdict:
-    """Static check of a task's referenced modules against a node's capabilities."""
+def release(v: str) -> str:
+    """major.minor.patch, without pre/post/dev/local parts: "2.5.2.post1" -> "2.5.2"."""
+    try:
+        from packaging.version import Version
+        parts = list(Version(v).release)
+    except Exception:  # noqa: BLE001 - not a PEP 440 version: take its leading numbers
+        import re
+        m = re.match(r"\d+(?:\.\d+)*", v)
+        parts = [int(x) for x in m.group(0).split(".")] if m else [v]
+    parts = (parts + [0, 0, 0])[:3]
+    return ".".join(map(str, parts))
+
+
+def policy_for(node, version_policy: str | None) -> str:
+    """The version policy for one node: explicit, else "release" for a fixed package set, else "minor"."""
+    if version_policy:
+        return version_policy
+    return "release" if node.hello.get("fixed_packages") else "minor"
+
+
+def same_version(have: str, want: str, policy: str) -> bool:
+    if policy == "any":
+        return True
+    if policy == "exact":
+        return have == want
+    if policy == "release":
+        return release(have) == release(want)
+    return _minor(have) == _minor(want)
+
+
+def check(modules: set[str], node, version_policy: str | None = None) -> Verdict:
+    """Static check of a task's referenced modules against a node's capabilities.
+
+    version_policy: "minor", "release", "exact" or "any"; None picks per node
+    ("release" where the package set is fixed, as in the App Store edition)."""
     if node.kind == "mac" and node.same_env:
         return Verdict(True)
     hello = node.hello
+    fixed = bool(hello.get("fixed_packages"))
+    policy = policy_for(node, version_policy)
     pkgs = getattr(node, "packages", None)
     if pkgs is None:
         pkgs = {_norm(k): v for k, v in hello.get("packages", {}).items()}
@@ -53,18 +88,22 @@ def check(modules: set[str], node, version_policy: str = "minor") -> Verdict:
                 False,
                 f"needs {info['dist']} (compiled), which isn't installed on {node.name}",
                 missing=info["dist"],
-                suggestion=f"add {info['dist']} to the phone with `pocketnode packages add {info['dist']}`",
+                suggestion=None if fixed else
+                f"add {info['dist']} to the phone with `pocketnode packages add {info['dist']}`",
             )
-        if version_policy != "any":
-            same = have == info["version"] if version_policy == "exact" else _minor(have) == _minor(info["version"])
-            if not same:
-                return Verdict(
-                    False,
-                    f"{info['dist']} is {have} on {node.name} but {info['version']} on the Mac",
-                    missing=info["dist"],
-                    suggestion=f"match versions (`pocketnode packages add {info['dist']}=={info['version']}`) "
-                               "or allow it with version_policy='any'",
-                )
+        if not same_version(have, info["version"], policy):
+            if fixed:
+                tip = (f"install {info['dist']}=={release(have)} on the Mac to use {node.name} for this "
+                       "(its package set is fixed)")
+            else:
+                tip = (f"match versions (`pocketnode packages add {info['dist']}=={info['version']}`) "
+                       "or allow it with version_policy='any'")
+            return Verdict(
+                False,
+                f"{info['dist']} is {have} on {node.name} but {info['version']} on the Mac",
+                missing=info["dist"],
+                suggestion=tip,
+            )
     return Verdict(True)
 
 

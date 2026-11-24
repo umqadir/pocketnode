@@ -51,9 +51,18 @@ def _need(ex, *mods, phone=True):
             importlib.import_module(m)
         except ImportError:
             raise Skip(f"{m} isn't installed on this Mac") from None
-        dist = envinfo.manifest().get(m, {}).get("dist", m)
-        if phone and router._norm(dist) not in _phone(ex).packages:
+        info = envinfo.manifest().get(m, {})
+        dist = info.get("dist", m)
+        if not phone:
+            continue
+        node = _phone(ex)
+        have = node.packages.get(router._norm(dist))
+        if have is None:
             raise Skip(f"{dist} isn't on the phone")
+        mac = info.get("version")
+        if mac and info.get("kind") == "compiled" and \
+                not router.same_version(have, mac, router.policy_for(node, ex.version_policy)):
+            raise Skip(f"{dist} is {have} on the phone but {mac} on this Mac")
 
 
 def _expect(cond, msg: str) -> None:
@@ -606,5 +615,6 @@ def main(ex, quick: bool = False) -> int:
     """Say what's connected and run every item. Returns the exit status: 1 if anything failed."""
     h = _phone(ex).hello
     print(f"{h['name']}: {h.get('model', '?')}, Python {'.'.join(map(str, h['python']))}, "
-          f"{h['slots']} slots, {len(h.get('packages', {}))} packages", flush=True)
+          f"{h['slots']} slots, {len(h.get('packages', {}))} packages"
+          + (", App Store edition (fixed package set)" if h.get("edition") == "store" else ""), flush=True)
     return 1 if any(ok is False for _, ok, _ in run(ex, quick)) else 0
