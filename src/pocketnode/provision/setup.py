@@ -353,7 +353,8 @@ class Setup:
                      "install it with `brew install xcodegen`")
 
     def _xcodegen_on_path(self) -> Check:
-        return self._xcodegen() if shutil.which("xcodegen") else Check(False, "not on PATH yet", "")
+        return self._xcodegen() if shutil.which("xcodegen") else \
+            Check(False, "not on PATH yet", "install it with `brew install xcodegen`")
 
     def _python(self) -> Check:
         p = tools.PYTHON_SUPPORT
@@ -404,7 +405,11 @@ class Setup:
         return u
 
     def build_install(self, sdk: str, udid: str | None) -> None:
-        first = not app_mod.product(sdk).exists()
+        try:
+            built = [json.loads(l) for l in app_mod.HISTORY.read_text().splitlines() if l.strip()]
+        except (OSError, ValueError):
+            built = []
+        first = not any(b.get("event") == "build" and b.get("sdk") == sdk for b in built)
         self.say("building the app: " + ("the first build takes several minutes (about 5 on an M4)"
                                          if first else "about a minute"))
         t0 = time.time()
