@@ -7,3 +7,4 @@ ios/Python.xcframework
 ios/PocketNode.xcodeproj/
 scratch_*.py
 .DS_Store
+.claude/
