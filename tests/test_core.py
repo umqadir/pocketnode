@@ -691,3 +691,15 @@ def test_acceptance_check_runs_against_the_stand_in():
     failed = [(name, detail) for name, ok, detail in results if ok is False]
     assert not failed, failed
     assert sum(ok is True for _, ok, _ in results) >= 12
+
+
+def test_cell_task_needs_no_ipython():
+    """The %%phone task's module must not import IPython: the phone would need IPython's
+    dependencies, and some (wcwidth >= 0.9) are compiled."""
+    import subprocess
+    code = ("import sys, pocketnode.integrations.cells as c; "
+            "assert c.run_cell('y = x * 2\\ny + 1', {'x': 3}, ['y'], True) == ({'y': 6}, 7); "
+            "assert 'IPython' not in sys.modules")
+    subprocess.run([sys.executable, "-c", code], check=True)
+    from pocketnode.integrations import ipython
+    assert ipython._run_cell.__module__ == "pocketnode.integrations.cells"
