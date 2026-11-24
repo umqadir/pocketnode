@@ -2,8 +2,6 @@
 .phone-sim/
 __pycache__/
 *.pyc
-ios/build/
-ios/Python.xcframework
-ios/PocketNode.xcodeproj/
+dist/
 scratch_*.py
 .DS_Store

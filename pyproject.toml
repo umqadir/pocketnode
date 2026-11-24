@@ -6,23 +6,39 @@ readme = "README.md"
 authors = [
     { name = "Uzair Qadir", email = "umqadir@users.noreply.github.com" }
 ]
-requires-python = ">=3.13"
+# The phone runs CPython 3.13 (BeeWare's Python-Apple-support), and the Mac's
+# Python must be the same minor version: bytecode and extensions are shared.
+requires-python = ">=3.13,<3.14"
+# LICENSE: not chosen yet. Add `license = "<SPDX expression>"` and
+# `license-files = ["LICENSE"]` here once it is.
 dependencies = [
     "cloudpickle>=3.1.2",
+    # Building the app and adding packages: requirement parsing, and the iOS SDK's .tbd stubs (YAML).
+    "packaging>=24",
+    "pyyaml>=6",
 ]
 
+[project.urls]
+Repository = "https://github.com/umqadir/pocketnode"
+
 [project.optional-dependencies]
-all = [
+# What the integrations plug into: `pn.parallel()` (joblib), the pandas
+# accessor, `dask.compute(..., scheduler=ex)` and the Jupyter magics.
+integrations = [
     "dask[array,dataframe]",
     "ipython",
     "joblib",
+    "pandas",
+]
+# A scientific stack to put on the phone (the phone runs the Mac's own copies).
+science = [
     "numpy",
     "pandas",
     "scikit-learn",
+    "scipy",
 ]
-provision = [
-    "packaging",
-    "pyyaml",
+all = [
+    "pocketnode[integrations,science]",
 ]
 
 [project.scripts]
@@ -34,6 +50,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "pocketnode[all]",  # the tests exercise every integration
     "pexpect>=4.9.0",
     "pytest>=9.2.0",
 ]

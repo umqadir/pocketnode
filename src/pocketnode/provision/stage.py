@@ -30,14 +30,18 @@ from pathlib import Path
 
 from packaging.markers import default_environment
 
-from . import shims
 from packaging.requirements import Requirement
+
+from ..sources import CONFIG_DIR, SIM_BUNDLE_ID
+from . import shims
 
 PLATFORM = {"iphoneos": "ios", "iphonesimulator": "iossim"}
 SHIM_DIR = "_pocketnode_shims"
 MINOS = "17.0"
-STAGE_ROOT = Path(os.environ.get("POCKETNODE_STAGE", Path.home() / ".pocketnode" / "build"))
+STAGE_ROOT = Path(os.environ.get("POCKETNODE_STAGE", CONFIG_DIR / "build"))
 _SKIP_SUFFIXES = (".pyc", ".pyo", ".a", ".pyx", ".pxd", ".pxi", ".c", ".cpp", ".h", ".hpp", ".cc")
+# The app's own sources (pocketnode/ios) are built into the app, not imported by it.
+_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", "ios")
 _MH_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca"}
 _DARWIN_SO = re.compile(r"\.cpython-(\d+)-darwin\.so$")
 
@@ -150,7 +154,7 @@ def _ios_framework_path(ref: str) -> str:
 
 
 class Stager:
-    def __init__(self, sdk: str, out: Path | None = None, bundle_id: str = "dev.pocketnode.app",
+    def __init__(self, sdk: str, out: Path | None = None, bundle_id: str = SIM_BUNDLE_ID,
                  template: Path | None = None, inplace: bool = False):
         if sdk not in PLATFORM:
             raise ValueError(f"sdk must be one of {list(PLATFORM)}")
@@ -183,7 +187,7 @@ class Stager:
             if only is None or only(d):
                 self._copy_dist(d)
         for name, src in (extra_paths or {}).items():
-            shutil.copytree(src, self.pk / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+            shutil.copytree(src, self.pk / name, ignore=_IGNORE)
         if "torch" in self.report.dists and (self.pk / "torch/lib/libtorch_cpu.dylib").exists():
             from . import torch_metal
             try:  # before retagging, which thins, re-signs and moves the dylib
@@ -510,7 +514,7 @@ def _signed(p: Path) -> bool:
 
 
 def stage(packages: list[str], sdk: str = "iphonesimulator", out: Path | None = None,
-          bundle_id: str = "dev.pocketnode.app") -> Report:
+          bundle_id: str = SIM_BUNDLE_ID) -> Report:
     import pocketnode
     src = Path(pocketnode.__file__).parent
     s = Stager(sdk, out, bundle_id)
@@ -521,5 +525,4 @@ def refresh_pocketnode(sdk: str = "iphonesimulator") -> None:
     """Update just the staged copy of pocketnode itself (fast inner loop while developing)."""
     import pocketnode
     dst = STAGE_ROOT / sdk / "app_packages" / "pocketnode"
-    shutil.copytree(Path(pocketnode.__file__).parent, dst, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copytree(Path(pocketnode.__file__).parent, dst, dirs_exist_ok=True, ignore=_IGNORE)

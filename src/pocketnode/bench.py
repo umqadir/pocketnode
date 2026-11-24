@@ -245,8 +245,7 @@ def background(ex, udid: str, seconds: float = 120, other_app: str = "com.apple.
     for `seconds`, then returns: how long the work kept going, how fast, and
     whether it picked up again afterwards.
     """
-    from .provision.app import config
-    from .sources import BUNDLE_ID
+    from .sources import bundle_id
     node = _node(ex, "phone")
     hb = ex.on("phone").submit(_heartbeat, seconds + 40)
     burn = ex.on("phone").submit(_burn, seconds + 30, 512)
@@ -263,7 +262,7 @@ def background(ex, udid: str, seconds: float = 120, other_app: str = "com.apple.
             states.append((round(time.time() - t_bg, 1), st))
         time.sleep(0.5)
     subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid,
-                    config().get("bundle_id", BUNDLE_ID)], capture_output=True)
+                    bundle_id("iphoneos")], capture_output=True)
     ticks = hb.result(timeout=seconds + 600)
     samples = burn.result(timeout=seconds + 600)
     gaps = [(round(a - t_bg, 1), round(b - a, 1)) for a, b in zip(ticks, ticks[1:]) if b - a > 2]

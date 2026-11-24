@@ -23,6 +23,8 @@ static BOOL pn_low_power(id self, SEL _cmd) { return !pn_gpu_enabled; }
 static void pn_add_macos_metal_selectors(void) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     if (!device) return;
+    // The simulator's GPU has no memory budget (0 bytes), so every torch MPS allocation would fail.
+    if (device.recommendedMaxWorkingSetSize == 0) pn_gpu_enabled = NO;
     Class cls = object_getClass(device);
     struct { const char *name; IMP imp; } add[] = {
         {"isLowPower", (IMP)pn_low_power}, {"isHeadless", (IMP)pn_no}, {"isRemovable", (IMP)pn_no},
