@@ -1,16 +1,24 @@
 #!/bin/bash
 # Xcode build phase: stdlib + extension frameworks, staged app packages, token.
-# Lines starting with POCKETNODE_PROGRESS are progress markers that `pocketnode
-# app build` reads from the build output (`phase <name>`, or `<what> <done> <total>`).
+# Lines starting with POCKETNODE_PROGRESS are progress markers (`phase <name>`, or
+# `<what> <done> <total>`). xcodebuild passes a script's output on in large
+# chunks, so `pocketnode app build` also has them appended to the file it names
+# in POCKETNODE_PROGRESS_FILE, which it follows as they're written.
 set -euo pipefail
+progress() {
+  echo "POCKETNODE_PROGRESS $*"
+  if [ -n "${POCKETNODE_PROGRESS_FILE:-}" ]; then
+    echo "POCKETNODE_PROGRESS $*" >> "$POCKETNODE_PROGRESS_FILE"
+  fi
+}
 XCF="Python.xcframework"
 source "$PROJECT_DIR/$XCF/build/utils.sh"
-echo "POCKETNODE_PROGRESS phase copying-python"
+progress phase copying-python
 install_stdlib "$XCF"
 PYVER=$(ls -1 "$CODESIGNING_FOLDER_PATH/python/lib" | grep -E "^python3\.[0-9]+$")
 process_dylibs "$XCF" "python/lib/$PYVER/lib-dynload"
 
-echo "POCKETNODE_PROGRESS phase copying-packages"
+progress phase copying-packages
 rsync -a --delete "$PROJECT_DIR/App/python/" "$CODESIGNING_FOLDER_PATH/app/"
 
 # Packages staged by `pocketnode app build` for this SDK (pure files + retagged binaries).
@@ -39,7 +47,7 @@ if [ -d "$STAGE/Frameworks" ]; then
       echo "$name" >> "$TODO"
     fi
     i=$((i + 1))
-    echo "POCKETNODE_PROGRESS frameworks $i ${#FWS[@]}"
+    progress frameworks "$i" "${#FWS[@]}"
   done
   # Frameworks staged by an earlier build and since removed from the selection.
   if [ -f "$STAGED_LIST" ]; then
@@ -57,7 +65,7 @@ if [ -d "$STAGE/Frameworks" ]; then
         /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
         ${OTHER_CODE_SIGN_FLAGS:-} -o runtime --timestamp=none \
         --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der < "$TODO") |
-      { k=0; while read -r _; do k=$((k + 1)); echo "POCKETNODE_PROGRESS sign $k $N"; done; }
+      { k=0; while read -r _; do k=$((k + 1)); progress sign "$k" "$N"; done; }
   fi
   rm -f "$TODO"
 fi

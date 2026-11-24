@@ -60,13 +60,35 @@ def _run_streaming(cmd: list[str], on_line, log: Path | None = None, **kw) -> su
     return r
 
 
+def _follow(path: Path, on_line, stop: threading.Event, every: float = 0.2) -> None:
+    """Hand each complete line appended to `path` to on_line(line) until `stop` is set
+    (then once more, for the last lines). The file needn't exist yet."""
+    pos, rest = 0, b""
+    while True:
+        last = stop.wait(every)
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError:
+            data = b""
+        pos += len(data)
+        *lines, rest = (rest + data).split(b"\n")
+        for line in lines:
+            try:
+                on_line(line.decode(errors="replace"))
+            except Exception:  # noqa: BLE001 - progress must never break the build
+                pass
+        if last:
+            return
+
+
 # What xcodebuild is doing, from the start of its task lines.
 _XCODE_TASKS = {
-    "PrecompileModule": "precompiling SDK modules", "ScanDependencies": "compiling sources",
-    "CompileC": "compiling sources", "SwiftCompile": "compiling sources", "CompileSwift": "compiling sources",
-    "SwiftDriver": "compiling sources", "Ld": "linking", "ProcessXCFramework": "copying Python",
-    "PhaseScriptExecution": "installing Python and packages", "CodeSign": "signing the app",
-    "Validate": "signing the app",
+    **dict.fromkeys(("PrecompileModule", "ScanDependencies", "CompileC", "SwiftCompile", "CompileSwift",
+                     "SwiftDriver", "Ld"), "compiling sources"),
+    "ProcessXCFramework": "copying Python", "PhaseScriptExecution": "installing Python and packages",
+    "CodeSign": "signing the app", "Validate": "signing the app",
 }
 # Marker lines from scripts/install_python.sh:
 #   POCKETNODE_PROGRESS phase <name>  or  POCKETNODE_PROGRESS <what> <done> <total>
@@ -223,12 +245,36 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         cmd += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
     log = work / "build" / f"{sdk}.log"
     log.parent.mkdir(exist_ok=True)
+    # The build script's markers come from this file as it writes them: xcodebuild
+    # passes a script's output on in chunks of several kilobytes.
+    markers = log.with_suffix(".progress")
+    markers.unlink(missing_ok=True)
+    env["POCKETNODE_PROGRESS_FILE"] = str(markers)
     with progress.step("Building the app") as p:
-        def on_line(line: str) -> None:
+        seen = {"marker": False, "after": False}
+
+        def from_script(line: str) -> None:
             got = build_progress(line)
-            if got:
+            if got and not seen["after"]:
+                seen["marker"] = True
                 p.update(got[1], got[2], detail=got[0])
-        r = _run_streaming(cmd, on_line, log=log, cwd=work, env=env)
+
+        def from_xcodebuild(line: str) -> None:
+            got = build_progress(line) if "POCKETNODE_PROGRESS" not in line else None
+            if got:
+                # A task after the script's own markers: the script is over, and
+                # markers still being read from the file are stale.
+                seen["after"] = seen["marker"]
+                p.update(got[1], got[2], detail=got[0])
+
+        stop = threading.Event()
+        follower = threading.Thread(target=_follow, args=(markers, from_script, stop), daemon=True)
+        follower.start()
+        try:
+            r = _run_streaming(cmd, from_xcodebuild, log=log, cwd=work, env=env)
+        finally:
+            stop.set()
+            follower.join()
         if r.returncode:
             raise RuntimeError(build_failure(r.stdout + r.stderr, bundle_id, log))
     t2 = time.time()

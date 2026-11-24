@@ -240,10 +240,10 @@ CodeSign /tmp/build/Products/Debug-iphonesimulator/PocketNode.app (in target 'Po
 def test_build_output_parser():
     got = [app_mod.build_progress(l) for l in BUILD_LINES.splitlines()]
     assert got == [
-        ("precompiling SDK modules", None, None),
+        ("compiling sources", None, None),
         ("compiling sources", None, None),
         None,
-        ("linking", None, None),
+        ("compiling sources", None, None),
         ("installing Python and packages", None, None),
         ("copying Python", None, None),
         None,
@@ -269,6 +269,25 @@ def test_run_streaming_hands_over_lines_and_keeps_the_log(tmp_path):
     assert lines == ["one\n", "two\n"]
     assert r.returncode == 3 and r.stdout == "one\ntwo\n" and r.stderr == "err\n"
     assert log.read_text() == "one\ntwo\nerr\n"  # as before: standard output, then errors
+
+
+def test_follow_reads_markers_as_they_are_written(tmp_path):
+    f = tmp_path / "iphonesimulator.progress"  # doesn't exist yet: the script creates it
+    got, stop = [], threading.Event()
+    t = threading.Thread(target=app_mod._follow, args=(f, got.append, stop, 0.01))
+    t.start()
+    with open(f, "a") as w:
+        w.write("POCKETNODE_PROGRESS sign 1 2\nPOCKETNODE_PROGRESS si")
+    for _ in range(300):
+        if got:
+            break
+        threading.Event().wait(0.01)
+    assert got == ["POCKETNODE_PROGRESS sign 1 2"]  # the half-written line waits
+    with open(f, "a") as w:
+        w.write("gn 2 2\n")
+    stop.set()
+    t.join()
+    assert got == ["POCKETNODE_PROGRESS sign 1 2", "POCKETNODE_PROGRESS sign 2 2"]
 
 
 # ---------------------------------------------------------------- the stager
