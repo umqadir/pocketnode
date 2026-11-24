@@ -300,6 +300,9 @@ def launch_app(udid: str) -> str | None:
         if "not been explicitly trusted" in out:
             return ("the phone won't run the app until you trust the developer once: Settings > General > "
                     "VPN & Device Management > your Apple ID > Trust, then open pocketnode")
+        if "Locked" in out or "could not be, unlocked" in out:
+            log.info("pocketnode: the phone is locked, so the app can't be relaunched; unlock it")
+            return None  # nothing shows on the phone for this one: keep trying
         if "invalid code signature" in out or "expired" in out.lower():
             return "the phone app's signing has expired; reinstall it with `pocketnode app install`"
         if "is not installed" in out or "NotFound" in out:

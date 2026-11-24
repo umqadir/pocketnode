@@ -52,6 +52,9 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
     cfg = config()
     pkgs = pkgs or packages()
     team = team if team is not None else cfg.get("team", "")
+    if not team and sdk == "iphoneos":
+        team = detect_team()
+        save_config(team=team)
     bundle_id = bundle_id or cfg.get("bundle_id", BUNDLE_ID)
     t0 = time.time()
     if restage == "pocketnode":
@@ -61,7 +64,7 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         for mod, why in rep.excluded.items():
             print(f"  left out {mod}: {why}")
     t1 = time.time()
-    (CONFIG_DIR / "app-settings.json").write_text(json.dumps({"wifi": bool(cfg.get("wifi"))}))
+    (CONFIG_DIR / "app-settings.json").write_text(json.dumps({"wifi": bool(cfg.get("wifi")), "torch_mps": bool(cfg.get("torch_mps"))}))
     env = {**os.environ, "POCKETNODE_TEAM": team, "POCKETNODE_BUNDLE_ID": bundle_id}
     r = _run(["xcodegen", "generate", "-q"], cwd=IOS_DIR, env=env)
     if r.returncode:
@@ -71,9 +74,16 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         # Naming the connected phone lets Xcode register it with the team, which
         # a new (free) team needs before it can issue a provisioning profile.
         try:
-            dest = f"id={device_udid()}"
+            udid = device_udid()
+            dest = f"id={udid}"
         except RuntimeError:
-            pass
+            udid = None
+        if udid:
+            r = _run(["devmodectl", "list"])
+            if any(udid in l and "disabled" in l for l in r.stdout.splitlines()):
+                raise RuntimeError(
+                    "Developer Mode is off on the iPhone. Turn it on once: Settings > Privacy & Security > "
+                    "Developer Mode, restart when asked, then confirm with your passcode. Then run this again.")
     cmd = ["xcodebuild", "-project", "PocketNode.xcodeproj", "-scheme", "PocketNode", "-sdk", sdk,
            "-destination", dest, "-derivedDataPath", "build", "-configuration", "Debug", "build"]
     if sdk == "iphonesimulator":
@@ -109,6 +119,32 @@ def profile_expiry(app: Path) -> str | None:
         return plistlib.loads(r.stdout)["ExpirationDate"].isoformat()
     except Exception:  # noqa: BLE001
         return None
+
+
+def detect_team() -> str:
+    """The development team of the Apple ID signed in to Xcode.
+
+    Xcode caches each account's teams in its preferences once the account has
+    been looked at in Settings > Apple Accounts. With several teams, pass --team.
+    """
+    import plistlib
+    r = subprocess.run(["defaults", "export", "com.apple.dt.Xcode", "-"], capture_output=True)
+    try:
+        prefs = plistlib.loads(r.stdout)
+    except Exception:  # noqa: BLE001
+        prefs = {}
+    teams = {t["teamID"]: t.get("teamName", "") for ts in prefs.get("IDEProvisioningTeamByIdentifier", {}).values()
+             for t in ts if t.get("teamID")}
+    if len(teams) == 1:
+        return next(iter(teams))
+    if teams:
+        raise RuntimeError("several Apple development teams are available; pick one with --team: "
+                           + ", ".join(f"{k} ({v})" for k, v in teams.items()))
+    accounts = prefs.get("DVTDeveloperAccountManagerAppleIDLists", {}).get("IDE.Identifiers.Prod", [])
+    if accounts:
+        raise RuntimeError("Xcode has your Apple ID but hasn't loaded its team yet: open Xcode > Settings > "
+                           "Apple Accounts and click the account once, then run this again")
+    raise RuntimeError("sign in to Xcode first (Xcode > Settings > Apple Accounts > Sign In; a free Apple ID works)")
 
 
 def simulator() -> str:

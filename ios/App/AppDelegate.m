@@ -5,7 +5,33 @@
 #import "AppDelegate.h"
 #import <BackgroundTasks/BackgroundTasks.h>
 #import <Python/Python.h>
+#import <Metal/Metal.h>
+#import <objc/runtime.h>
 #include <pthread.h>
+
+#pragma mark - macOS Metal selectors
+
+// Packages built for macOS ask the GPU questions that only exist there
+// (PyTorch's Metal backend calls -isLowPower while choosing a device, and an
+// unrecognized selector aborts the app). An iPhone has one GPU: it is never
+// headless or removable. Whether it reports "low power" decides whether such
+// code uses it at all, so that follows the app's torch_mps setting.
+static BOOL pn_gpu_enabled = NO;
+static BOOL pn_no(id self, SEL _cmd) { return NO; }
+static BOOL pn_low_power(id self, SEL _cmd) { return !pn_gpu_enabled; }
+
+static void pn_add_macos_metal_selectors(void) {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) return;
+    Class cls = object_getClass(device);
+    struct { const char *name; IMP imp; } add[] = {
+        {"isLowPower", (IMP)pn_low_power}, {"isHeadless", (IMP)pn_no}, {"isRemovable", (IMP)pn_no},
+    };
+    for (size_t i = 0; i < sizeof(add) / sizeof(add[0]); i++) {
+        SEL sel = sel_registerName(add[i].name);
+        if (![device respondsToSelector:sel]) class_addMethod(cls, sel, add[i].imp, "B@:");
+    }
+}
 
 static NSString *const kTaskPrefix = @"compute";
 
@@ -50,6 +76,12 @@ static NSString *py_call(const char *func, const char *arg) {
 
 static void *python_main(void *ctx) {
     NSString *resources = [[NSBundle mainBundle] resourcePath];
+    NSData *settings = [NSData dataWithContentsOfFile:[resources stringByAppendingPathComponent:@"pocketnode_settings.json"]];
+    if (settings) {
+        NSDictionary *s = [NSJSONSerialization JSONObjectWithData:settings options:0 error:nil];
+        if ([s isKindOfClass:[NSDictionary class]]) pn_gpu_enabled = [s[@"torch_mps"] boolValue];
+    }
+    pn_add_macos_metal_selectors();
     PyPreConfig pre;
     PyConfig config;
     PyPreConfig_InitIsolatedConfig(&pre);

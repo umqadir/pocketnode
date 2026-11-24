@@ -80,6 +80,7 @@ class Task:
     shadow: bool = False  # the Mac's copy of a task whose phone result is being verified
     verifying: bool = False  # its phone result is waiting for the Mac's
     cache_retries: int = 0
+    crashes: int = 0  # times the node running it went away mid-task
     eligible: dict = field(default_factory=dict)  # node id -> True, once checked
     submitted: float = field(default_factory=time.monotonic)
     attempts: dict[str, "Attempt"] = field(default_factory=dict)
@@ -561,6 +562,16 @@ class PocketExecutor(Executor):
                 self._gone[node.id] = node
             for a in list(node.running.values()):
                 t = a.task
+                if crashed and t.placement not in ("auto", None) and not t.done:
+                    # Told to run there, and it takes the app down: once more in
+                    # case it was a coincidence, then say so instead of looping.
+                    t.crashes += 1
+                    if t.crashes >= 2:
+                        self._fail(t, PlacementError(
+                            f"{t.fn_label} stopped the app on {node.label()} twice (a crash in native code, "
+                            f"or it ran out of memory). After it relaunches, ex.nodes[...].hello['last_crash'] "
+                            "has the crash report."))
+                        continue
                 if crashed and t.placement in ("auto", None) and not t.done:
                     t.excluded[node.kind] = f"the {node.kind} app stopped while running it"
                     self.crashes[t.fn_key] += 1

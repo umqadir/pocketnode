@@ -101,7 +101,10 @@ def _watch(cls):
         try:
             return real(self, spec)
         except ImportError:
-            builtins._pn_ext_fail = spec.name
+            # The stdlib's own optional accelerators have equivalent pure-Python
+            # fallbacks; a third-party package's fallback may not be equivalent.
+            if spec.name.partition(".")[0] not in sys.stdlib_module_names:
+                builtins._pn_ext_fail = spec.name
             raise
     cls.create_module = create_module
 for _n in ("ExtensionFileLoader", "AppleFrameworkLoader"):

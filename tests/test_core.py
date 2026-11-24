@@ -529,3 +529,31 @@ def test_large_buffers_hash_the_same_in_pieces():
     y = x.copy()
     y[12_345_678] ^= 1
     assert digest(x) != digest(y)
+
+
+def test_pure_means_no_compiled_code_underneath():
+    from pocketnode import envinfo, router
+    assert router.is_pure({"json", "joblib"})
+    assert not router.is_pure({"numpy"})
+    assert envinfo.needs_native("pandas")
+    assert not envinfo.needs_native("joblib")
+    if "dask" in envinfo.manifest():  # pure Python itself, built on compiled packages
+        assert envinfo.manifest()["dask"]["kind"] == "pure" and not router.is_pure({"dask"})
+
+
+def test_task_that_kills_the_phone_app(ex):
+    def dies_on_phone():
+        import os
+        import sys
+        if sys.prefix.endswith(".phone-sim"):
+            os._exit(3)
+        return "fine"
+
+    # Automatic placement: the Mac runs it instead.
+    assert ex.submit(dies_on_phone).result(timeout=60) == "fine"
+    assert ex.wait_for("phone", 30)
+    # Forced onto the phone: an error after the second crash, not an endless loop.
+    with pytest.raises(PlacementError, match="twice"):
+        ex.on("phone").submit(dies_on_phone).result(timeout=90)
+    assert ex.wait_for("phone", 30)
+    assert ex.on("phone").submit(lambda: 7).result(timeout=30) == 7
