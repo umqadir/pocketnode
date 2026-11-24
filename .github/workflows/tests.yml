@@ -1,0 +1,25 @@
+# The test suite against a local stand-in for the phone (.phone-sim), on an
+# Apple-silicon runner. It can't test iOS: no phone, no signing, and the
+# simulator app isn't built here. Builds and the acceptance check against a
+# phone (`pocketnode setup`) are run by hand.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+      - name: Project environment
+        run: uv sync --python 3.13
+      - name: Phone stand-in (numpy at the project's version, and cloudpickle)
+        run: |
+          uv venv --python 3.13 .phone-sim
+          uv pip install --python .phone-sim/bin/python cloudpickle \
+            "numpy==$(uv run python -c 'import numpy; print(numpy.__version__)')"
+      - name: Tests
+        run: uv run pytest -q
