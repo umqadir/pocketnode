@@ -13,41 +13,13 @@ is printed here, and the last expression is displayed as usual.
 
 from __future__ import annotations
 
-import ast
 import builtins
-import types
 
 from IPython.core.magic import Magics, cell_magic, magics_class
 from IPython.core.magic_arguments import argument, magic_arguments, parse_argstring
 
-
-def _names(cell: str) -> tuple[set[str], set[str], bool]:
-    """(names read, names assigned at top level, ends with an expression)."""
-    tree = ast.parse(cell)
-    loads, stores = set(), set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            (loads if isinstance(node.ctx, ast.Load) else stores).add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            stores.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for a in node.names:
-                stores.add((a.asname or a.name).split(".")[0])
-    ends_expr = bool(tree.body) and isinstance(tree.body[-1], ast.Expr)
-    return loads, stores, ends_expr
-
-
-def _run_cell(cell: str, inputs: dict, outputs: list[str], ends_expr: bool):
-    ns = dict(inputs)
-    ns.setdefault("__name__", "__main__")
-    tree = ast.parse(cell)
-    last = None
-    if ends_expr:
-        last = ast.Expression(tree.body.pop().value)
-    exec(compile(tree, "<cell>", "exec"), ns)
-    value = eval(compile(last, "<cell>", "eval"), ns) if last is not None else None
-    out = {k: ns[k] for k in outputs if k in ns and not isinstance(ns[k], types.ModuleType)}
-    return out, value
+from .cells import names as _names
+from .cells import run_cell as _run_cell
 
 
 @magics_class
