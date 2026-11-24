@@ -43,7 +43,7 @@ def _fault_log() -> str | None:
     last = None
     try:
         text = path.read_text(errors="replace").strip()
-        last = text[-6000:] or None
+        last = (text if len(text) <= 8000 else text[:2500] + "\n...\n" + text[-5000:]) or None
     except OSError:
         pass
     _fault_file = open(path, "w")

@@ -170,6 +170,7 @@ class Worker:
             os.chdir(cwd)
         self.subpool = None
         self.no_sub: dict[str, int] = {}
+        self.sub_fallbacks: dict[str, str] = {}  # why a function left the subinterpreters (diagnostics)
         if self.phone and subinterp.AVAILABLE and os.environ.get("POCKETNODE_SUBINTERPRETERS", "1") != "0" \
                 and getattr(sys, "_is_gil_enabled", lambda: True)():
             self.subpool = subinterp.SubPool(
@@ -219,6 +220,8 @@ class Worker:
         s = device.snapshot()
         s["lifecycle"] = self.lifecycle
         s["running"] = len(self.inflight)
+        if self.sub_fallbacks:
+            s["sub_fallbacks"] = dict(list(self.sub_fallbacks.items())[-8:])
         s.update(self.override)
         return s
 
@@ -667,6 +670,7 @@ class Worker:
             # Usually a module the main interpreter fetches on first import; after
             # that the subinterpreter finds it too. Twice means it can't run there.
             self.no_sub[fk] = self.no_sub.get(fk, 0) + 1
+            self.sub_fallbacks[str(fk)[-60:]] = str(out.get("detail"))[:300]
             return None
         bufs: list = []
         if status == "ok":

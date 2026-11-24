@@ -34,6 +34,7 @@ from . import shims
 from packaging.requirements import Requirement
 
 PLATFORM = {"iphoneos": "ios", "iphonesimulator": "iossim"}
+SHIM_DIR = "_pocketnode_shims"
 MINOS = "17.0"
 STAGE_ROOT = Path(os.environ.get("POCKETNODE_STAGE", Path.home() / ".pocketnode" / "build"))
 _SKIP_SUFFIXES = (".pyc", ".pyo", ".a", ".pyx", ".pxd", ".pxi", ".c", ".cpp", ".h", ".hpp", ".cc")
@@ -149,10 +150,14 @@ def _ios_framework_path(ref: str) -> str:
 
 class Stager:
     def __init__(self, sdk: str, out: Path | None = None, bundle_id: str = "dev.pocketnode.app",
-                 template: Path | None = None):
+                 template: Path | None = None, inplace: bool = False):
         if sdk not in PLATFORM:
             raise ValueError(f"sdk must be one of {list(PLATFORM)}")
         self.sdk = sdk
+        # In place: binaries stay where the package put them (plain .so and
+        # .dylib files), for packages added to an installed app. Otherwise each
+        # one is wrapped as a framework for the app bundle.
+        self.inplace = inplace
         self.out = Path(out or STAGE_ROOT / sdk)
         self.pk = self.out / "app_packages"
         self.fw = self.out / "Frameworks"
@@ -163,20 +168,30 @@ class Stager:
 
     # ---------------------------------------------------------------- copy
 
-    def stage(self, packages: list[str], extra_paths: dict[str, Path] | None = None) -> Report:
+    def stage(self, packages: list[str], extra_paths: dict[str, Path] | None = None,
+              only=None) -> Report:
+        """only(dist) -> bool picks which distributions of the closure to stage (default: all)."""
         t0 = time.time()
         shutil.rmtree(self.out, ignore_errors=True)
         self.pk.mkdir(parents=True)
-        self.fw.mkdir(parents=True)
+        if self.inplace:
+            self.fw = self.pk / SHIM_DIR
+        else:
+            self.fw.mkdir(parents=True)
         for d in closure(packages):
-            self._copy_dist(d)
+            if only is None or only(d):
+                self._copy_dist(d)
         for name, src in (extra_paths or {}).items():
             shutil.copytree(src, self.pk / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         self._convert_binaries()
-        if "mlx" in self.report.dists:
+        if "mlx" in self.report.dists and (self.pk / "mlx").exists():
             from . import mlx_metal
             try:
-                mlx_metal.install(self.out, self.report.dists["mlx"], self.sdk)
+                if self.inplace:
+                    shutil.copy2(mlx_metal.build(self.report.dists["mlx"], self.sdk),
+                                 self.pk / "mlx" / "lib" / "mlx.metallib")
+                else:
+                    mlx_metal.install(self.out, self.report.dists["mlx"], self.sdk)
             except Exception as e:  # MLX still runs on its CPU backend without kernels
                 self.report.warnings.append(f"mlx: no iOS GPU kernels ({e})")
         self.report.seconds = time.time() - t0
@@ -220,6 +235,10 @@ class Stager:
             for p, lc in zip(bins, pool.map(lambda p: _load_commands(p), bins)):
                 info[p] = lc
         problems = self._check(bins)
+        if self.inplace:
+            with ThreadPoolExecutor(8) as pool:
+                list(pool.map(lambda p: self._retag_inplace(p, info[p], problems.get(p)), bins))
+            return
         # Resolve bundled-library references before anything moves.
         links: dict[Path, dict[str, str]] = {}
         for p in bins:
@@ -339,6 +358,47 @@ class Stager:
             fwork = p.with_name(fname[: -len(".so")] + ".fwork")
             fwork.write_text(f"Frameworks/{fw}.framework/{fw}")
             (dest / f"{fw}.origin").write_text(str(Path("app_packages") / rel.parent / fwork.name))
+
+    def _retag_inplace(self, p: Path, lc, problem) -> None:
+        """Retag a binary where it is. The package keeps its layout, so the
+        references between its own libraries (@loader_path, @rpath) stay valid."""
+        deps, rpaths, ident = lc
+        rel = str(p.relative_to(self.pk))
+        shimmed: dict[str, str] = {}
+        if isinstance(problem, dict):
+            for lib, syms in problem["shim"].items():
+                shimmed[lib] = shims.build(lib, syms, self.sdk, MINOS, self.fw)
+                self.report.warnings.append(f"{rel}: shimmed {', '.join(syms)} from {lib}")
+            for lib, syms in problem["absent"].items():
+                shimmed[lib] = shims.build_absent(lib, syms, self.sdk, MINOS, self.fw)
+                self.report.warnings.append(f"{rel}: {Path(lib).name} isn't on iOS; stood in for "
+                                            f"{', '.join(syms) or 'nothing'} (features using it are unavailable)")
+            problem = None
+        if problem:
+            self.report.excluded[rel] = problem
+            p.unlink()
+            return
+        _run("codesign", "--remove-signature", str(p)) if _signed(p) else None
+        archs = _run("lipo", "-archs", str(p)).split()
+        if "arm64" in archs and len(archs) > 1:
+            _run("lipo", "-thin", "arm64", str(p), "-output", str(p))
+        args = []
+        for ref in deps:
+            new = _ios_framework_path(ref)
+            name = shimmed.get(new) or shimmed.get(ref)
+            if name:
+                target = self.fw / f"{name}.framework" / name
+                new = "@loader_path/" + os.path.relpath(target, p.parent)
+            if new != ref:
+                args += ["-change", ref, new]
+        if args:
+            _run("install_name_tool", *args, str(p))
+        _run("xcrun", "vtool", "-set-build-version", PLATFORM[self.sdk], MINOS, self.sdkver,
+             "-replace", "-output", str(p), str(p))
+        fix_zerofill_offsets(p)
+        align_string_table(p)
+        if p.suffix == ".so":
+            p.rename(p.with_name(_DARWIN_SO.sub(rf".cpython-\1-{self.sdk}.so", p.name)))
 
     def _write_plist(self, dest: Path, fw: str) -> None:
         plist = {

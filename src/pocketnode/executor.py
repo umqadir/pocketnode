@@ -538,7 +538,11 @@ class PocketExecutor(Executor):
                        f"({node.slots} slots, Python {'.'.join(map(str, node.hello['python']))})")
             crash = node.hello.get("last_crash")
             if crash:
-                top = next((l.strip() for l in crash.splitlines() if l.strip()), "")
+                lines = [l.strip() for l in crash.splitlines() if l.strip()]
+                top = next((l for l in lines if l.startswith("Fatal Python error")), lines[0] if lines else "")
+                where = next((l for l in lines if l.startswith("File ") and "/pocketnode/" not in l
+                              and "/concurrent/" not in l and "/threading.py" not in l), "")
+                top = f"{top}; {where}" if where else top
                 self._note(("crash", node.id), f"pocketnode: the app on {node.name} crashed last time ({top}); "
                            "details in ex.nodes[...].hello['last_crash']")
             for packed, on in self._pins.values():  # data pinned earlier lives on this node again

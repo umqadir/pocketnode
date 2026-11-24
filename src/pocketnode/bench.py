@@ -230,7 +230,8 @@ def compute(ex) -> dict:
         row = {}
         for where in ("phone", "mac"):
             try:
-                row[where] = round(ex.on(where).submit(fn, *args).result(timeout=600), 4)
+                r = ex.on(where).submit(fn, *args).result(timeout=600)
+                row[where] = round(r, 4) if isinstance(r, float) else r
             except Exception as e:
                 row[where] = f"error: {type(e).__name__}: {str(e)[:120]}"
         out[name] = row

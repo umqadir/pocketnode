@@ -20,20 +20,32 @@ from __future__ import annotations
 import logging
 import os
 
-from .errors import NodeLost, PlacementError, Unavailable
-from .executor import Placement, PocketExecutor, PocketFuture, placement, runs_on
-
 __all__ = ["connect", "current", "parallel", "placement", "runs_on", "packages", "PocketExecutor",
            "PocketFuture", "Placement", "PlacementError", "Unavailable", "NodeLost"]
 
+# Loaded on first use, so `import pocketnode` stays cheap: workers and the
+# phone's subinterpreters import the package without needing the Mac side.
+_LAZY = {
+    "PocketExecutor": "executor", "PocketFuture": "executor", "Placement": "executor",
+    "placement": "executor", "runs_on": "executor",
+    "PlacementError": "errors", "Unavailable": "errors", "NodeLost": "errors",
+}
+
 
 def __getattr__(name):
-    if name == "packages":  # imported lazily: the selector pulls in provisioning code
+    if name == "packages":  # the selector pulls in provisioning code
         from .provision.packages import packages
         return packages
-    raise AttributeError(name)
+    mod = _LAZY.get(name)
+    if mod is None:
+        raise AttributeError(f"module 'pocketnode' has no attribute {name!r}")
+    import importlib
+    value = getattr(importlib.import_module(f".{mod}", __name__), name)
+    globals()[name] = value
+    return value
 
-_current: PocketExecutor | None = None
+
+_current = None
 
 
 def _register_pandas(_mod) -> None:
@@ -58,7 +70,7 @@ def _setup_logging() -> None:
 def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True, udid: str | None = None,
             placement: str = "auto", strict: bool = False, version_policy: str = "minor",
             speculate: bool = True, notes: bool = True, verify: bool = True, wait: float | None = None,
-            simulate_phone: bool | str = False) -> PocketExecutor:
+            simulate_phone: bool | str = False) -> "PocketExecutor":
     """Start an executor that pools this Mac's cores and the phone.
 
     addresses: extra workers at "host:port" (e.g. the phone over Wi-Fi).
@@ -71,6 +83,7 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
         a Python interpreter whose environment mimics the phone's, or True).
     """
     global _current
+    from .executor import PocketExecutor
     from .sources import Address, LocalWorkers, PhoneLink
 
     _setup_logging()
@@ -92,7 +105,7 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
     return ex
 
 
-def current() -> PocketExecutor:
+def current() -> "PocketExecutor":
     """The executor from the last connect(), connecting with defaults if there is none."""
     global _current
     if _current is None:
@@ -100,7 +113,7 @@ def current() -> PocketExecutor:
     return _current
 
 
-def parallel(executor: PocketExecutor | None = None, **kwargs):
+def parallel(executor: "PocketExecutor | None" = None, **kwargs):
     """joblib context: `with pn.parallel(): GridSearchCV(..., n_jobs=-1).fit(X, y)`."""
     from .integrations.joblib_backend import parallel as _p
     return _p(executor or current(), **kwargs)

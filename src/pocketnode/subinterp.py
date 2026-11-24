@@ -113,32 +113,70 @@ for _n in ("ExtensionFileLoader", "AppleFrameworkLoader"):
 """
 
 
+def _restore_gilstate_check() -> None:
+    """Creating an interpreter makes PyGILState_Check() answer "held" forever,
+    which breaks extension modules that assert it isn't (PyTorch autograd).
+    The iOS host exports a function that turns the real check back on; that is
+    sound here because subinterpreter work never shares a thread with anything else."""
+    try:
+        import ctypes
+        ctypes.CDLL(None).pocketnode_enable_gilstate_check()
+    except (AttributeError, OSError):
+        pass  # not the iOS host (the Mac stand-in): nothing to restore
+
+
 class SubPool:
+    """One thread per subinterpreter, and those threads never run anything else.
+
+    CPython's PyGILState API (which extension modules such as PyTorch use to
+    check and take the GIL) keeps one thread state per OS thread and doesn't
+    understand subinterpreters. A thread that has run code in a subinterpreter
+    and later runs an extension module in the main interpreter can be told it
+    holds the wrong GIL. So subinterpreter work stays on these threads, and the
+    worker's main-interpreter task threads never enter a subinterpreter.
+    """
+
     def __init__(self, n: int, roots: list[str] | None, scratch: str, phone_dirs: tuple[str, ...],
                  extra_paths=lambda: []):
         self.n = n
         self.roots, self.scratch, self.phone_dirs = roots, scratch, phone_dirs
         self.extra_paths = extra_paths
-        self._idle: queue.Queue = queue.Queue()
-        self._created = 0
+        self._jobs: queue.Queue = queue.Queue()
+        self._threads: list[threading.Thread] = []
+        self._idle = 0
         self._lock = threading.Lock()
         self.broken: str | None = None
+        # Interpreters take a moment to set up; have them ready before the first task.
+        threading.Thread(target=self._prewarm, daemon=True, name="pn-sub-warm").start()
 
-    def _get(self):
-        try:
-            return self._idle.get_nowait()
-        except queue.Empty:
-            pass
+    def _prewarm(self) -> None:
         with self._lock:
-            if self._created < self.n:
-                self._created += 1
-                try:
-                    return self._create()
-                except Exception as e:  # noqa: BLE001
-                    self._created -= 1
-                    self.broken = repr(e)
-                    raise
-        return self._idle.get()
+            while len(self._threads) < self.n:
+                self._spawn()
+
+    def _spawn(self) -> None:
+        t = threading.Thread(target=self._serve, daemon=True, name=f"pn-sub-{len(self._threads)}")
+        self._threads.append(t)
+        t.start()
+
+    def _serve(self) -> None:
+        interp = None
+        while True:
+            with self._lock:
+                self._idle += 1
+            job = self._jobs.get()
+            with self._lock:
+                self._idle -= 1
+            shared, done = job
+            try:
+                if interp is None:
+                    interp = self._create()
+                done.append(self._exec(interp, shared))
+            except BaseException as e:  # noqa: BLE001 - reported to the caller, which falls back
+                self.broken = repr(e)
+                done.append({"status": "needs-main", "detail": f"subinterpreter failed: {e!r}"})
+            finally:
+                shared["_event"].set()
 
     def _create(self) -> int:
         interp = _interpreters.create(_interpreters.new_config("isolated"))
@@ -149,46 +187,44 @@ class SubPool:
         if err is not None:
             _interpreters.destroy(interp)
             raise RuntimeError(f"subinterpreter setup failed: {err}")
+        _restore_gilstate_check()
         return interp
 
-    def run(self, payload: bytes, buffers: list) -> dict:
-        """Run one pickled (fn, args, kwargs) in a free subinterpreter; returns the outcome dict."""
-        # Build everything that can fail before holding an interpreter or a pipe.
-        shared = {"payload": bytes(payload), "nbufs": len(buffers),
-                  "extra_paths": "\0".join(self.extra_paths())}
-        for i, b in enumerate(buffers):
-            shared[f"b{i}"] = bytes(b)
+    def _exec(self, interp: int, shared: dict) -> dict:
         chunks: list[bytes] = []
-        interp = self._get()
+        r, w = os.pipe()
+        reader = threading.Thread(target=lambda: chunks.extend(iter(lambda: os.read(r, 1 << 20), b"")),
+                                  daemon=True)
+        reader.start()
         try:
-            r, w = os.pipe()
-            reader = threading.Thread(target=lambda: chunks.extend(iter(lambda: os.read(r, 1 << 20), b"")),
-                                      daemon=True)
-            reader.start()
+            args = {k: v for k, v in shared.items() if not k.startswith("_")}
+            args["fd"] = w
             try:
-                shared["fd"] = w
-                err = _interpreters.exec(interp, _RUNNER, shared=shared)
+                err = _interpreters.exec(interp, _RUNNER, shared=args)
             except BaseException:
                 # exec raises only before the runner starts, so the runner never
                 # got to close the write end.
                 os.close(w)
                 raise
-            finally:
-                reader.join()
-                os.close(r)
         finally:
-            self._idle.put(interp)
+            reader.join()
+            os.close(r)
         data = b"".join(chunks)
         if err is not None or len(data) < 8:
             return {"status": "needs-main", "detail": f"subinterpreter failed: {err}"}
         (n,) = struct.unpack_from("<Q", data)
         return pickle.loads(data[8:8 + n])
 
-    def close(self) -> None:
-        while True:
-            try:
-                _interpreters.destroy(self._idle.get_nowait())
-            except queue.Empty:
-                return
-            except Exception:  # noqa: BLE001
-                pass
+    def run(self, payload: bytes, buffers: list) -> dict:
+        """Run one pickled (fn, args, kwargs) in a subinterpreter; returns the outcome dict."""
+        shared = {"payload": bytes(payload), "nbufs": len(buffers),
+                  "extra_paths": "\0".join(self.extra_paths()), "_event": threading.Event()}
+        for i, b in enumerate(buffers):
+            shared[f"b{i}"] = bytes(b)
+        done: list = []
+        with self._lock:
+            if self._idle == 0 and len(self._threads) < self.n:
+                self._spawn()
+        self._jobs.put((shared, done))
+        shared["_event"].wait()
+        return done[0]

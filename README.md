@@ -30,15 +30,19 @@ In Jupyter, `%load_ext pocketnode` adds two cell magics. `%%phone` runs a cell o
 
   It sends it back even if your code catches the error.
 - **An error from the phone is confirmed on the Mac before you see it.** If the Mac runs the task fine, you get the Mac's result and that function stays on the Mac from then on.
-- **The first result from the phone is checked against the Mac.** The first time a function runs on the phone, the Mac also runs it and the results are compared, with tolerance for floating point.
+- **The first result from the phone is checked against the Mac.** The first time a function runs on the phone, the Mac also runs it, ahead of the queue, and the results are compared field by field, with tolerance for floating point.
   - If they differ, you get the Mac's answer and that function stays on the Mac.
-  - A function that gives different answers on every run (unseeded randomness) is recognised as nondeterministic, so it isn't counted as a mismatch.
+  - Fields that vary from run to run on the Mac itself (timings, unseeded randomness) are left out of the comparison; everything else still has to match.
+  - A function is identified by its code and the kinds of arguments it gets. A joblib batch or a `map` chunk counts as the function inside it, so one estimator's verdict never applies to another.
 - **Forcing placement raises instead of falling back.** `ex.on("phone")`, `pn.placement("phone")`, `@pn.runs_on("phone")` and `pn.connect(placement=...)` all force where code runs. If the forced node can't run it, you get a clear `PlacementError` rather than a silent fallback. `strict=True` does the same for automatic placement.
 - **The phone can go away at any time.** It can get hot, go to the background, be unplugged, or crash. Its work moves to the Mac (speculative re-execution: the first result wins), and it rejoins when it's back.
+  - A task that crashes the app is re-run on the Mac. The next time the app starts it reports what crashed (`ex.nodes[...].hello["last_crash"]`).
+  - Inputs too big for the phone's free memory are never sent there.
+- **Several sessions can share the phone.** A notebook, a script and `pocketnode status` can be connected at once, as long as they use the same Python environment. Each gets its own results.
 
 ## How it's fast
 
-- **Large inputs cross the link once.** Arrays and DataFrames travel as raw buffers (pickle protocol 5) and are cached on the phone by content hash. Data you'll reuse can be kept resident with `ex.pin(X)`.
+- **Large inputs cross the link once.** Arrays and DataFrames travel as raw buffers (pickle protocol 5) and are cached on the phone by content hash. The phone checks each hash on arrival, so an array you change between two submits is never mistaken for its old self. Data you'll reuse can be kept resident with `ex.pin(X)`.
 - **The scheduler uses measurements.** It measures each function's compute time per node and the link's bandwidth. Memory-bound work stays on the Mac; heavy work spreads out.
 - **Busy nodes get less work.** Thermal state and background state reduce how much work the phone is given.
 - **Pure-Python work uses all the phone's cores.** iOS has no child processes and no free-threaded Python build. So tasks that touch only the stdlib and pure-Python packages run in per-core subinterpreters, each with its own GIL. Work that releases the GIL (NumPy, scikit-learn, PyTorch) runs on threads.
@@ -47,8 +51,11 @@ In Jupyter, `%load_ext pocketnode` adds two cell magics. `%%phone` runs a cell o
 
 ```
 pocketnode packages              # Mac environment vs phone, with an iOS verdict for each compiled package
+pocketnode packages select       # checklist: tick what should be on the phone, see the cost, apply
 pocketnode packages add lightgbm # stage, rebuild, reinstall (shows a measured estimate and asks first)
 ```
+
+The checklist starts from what the phone has now (a default scientific stack on first use), marks packages your tasks recently needed and didn't find, and shows the size and time of the change before anything happens. Rebuilds sign only the frameworks that changed.
 
 - **Pure-Python packages need nothing.** The phone imports them from the Mac on demand, at the Mac's version.
 - **Compiled packages are checked statically before they ship.** Each one is checked against the iOS SDK. Then:
@@ -60,9 +67,18 @@ pocketnode packages add lightgbm # stage, rebuild, reinstall (shows a measured e
 ## Setup
 
 1. `uv pip install -e .` into the Python environment you work in. The phone's Python minor version must match it (3.13 today).
-2. Sign in to Xcode with an Apple ID (Xcode › Settings › Accounts). A free account works.
-3. Enable Developer Mode on the iPhone, plug it in, and run `pocketnode app install --team <TEAMID>`.
-4. Check the connection: `pocketnode status`, then `pocketnode bench`.
+2. Sign in to Xcode with an Apple ID: Xcode › Settings › Apple Accounts › Sign In, then click the account once so Xcode loads its team. A free account works.
+3. On the iPhone, turn on Developer Mode: Settings › Privacy & Security › Developer Mode, restart, confirm with your passcode.
+4. Plug the phone in, unlock it and run `pocketnode app install`. It finds your team, registers the phone, builds, signs and installs.
+5. The first time only, iOS asks you to trust the developer: Settings › General › VPN & Device Management › your Apple ID › Trust. Then open the app, or run `pocketnode app launch`.
+6. Check the connection: `pocketnode status`, then `pocketnode bench`.
+
+Things to know:
+
+- The app keeps the screen awake (and black) while it's in front, because a locked phone suspends it. If the app isn't running, the Mac can start it over USB, but only while the phone is unlocked.
+- A free Apple ID signs the app for 7 days. pocketnode tells you when that's about to run out; `pocketnode app install` renews it.
+- The app listens on USB only. `pocketnode app install --wifi` also accepts the Mac over the local network (`pn.connect("phone-address:7151")`); the pairing token is required either way.
+- If a task seems stuck on the phone, `ex.stacks("phone")` shows what every thread there is doing.
 
 For the simulator, run `pocketnode app install --sim`, then `pn.connect("127.0.0.1:7151")`.
 

@@ -29,7 +29,7 @@ targets:
       base:
         INFOPLIST_FILE: App/Info.plist
         CODE_SIGN_ENTITLEMENTS: App/PocketNode.entitlements
-        HEADER_SEARCH_PATHS: "$(BUILT_PRODUCTS_DIR)/Python.framework/Headers"
+        HEADER_SEARCH_PATHS: "$(BUILT_PRODUCTS_DIR)/Python.framework/Headers $(BUILT_PRODUCTS_DIR)/Python.framework/Headers/internal"
         TARGETED_DEVICE_FAMILY: "1"
         LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks"
     postBuildScripts:
