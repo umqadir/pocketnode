@@ -15,15 +15,17 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .. import progress as progress_mod
 from ..sources import CONFIG_DIR
 
 CACHE = CONFIG_DIR / "cache"
 METAL_MIN = "26.2"  # Metal 4 tensor ops (NAX) need iOS 26.2+
 
 
-def source(version: str) -> Path:
+def source(version: str, progress=None) -> Path:
     src = CACHE / "src" / f"mlx-{version}"
     if not (src / "mlx").exists():
+        (progress or progress_mod.NULL).detail(f"downloading MLX {version} sources")
         src.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["git", "clone", "-q", "--depth", "1", "-b", f"v{version}",
                         "https://github.com/ml-explore/mlx.git", str(src)], check=True)
@@ -35,19 +37,30 @@ def kernels(src: Path) -> list[str]:
     return sorted(set(re.findall(r"build_kernel\(\s*([A-Za-z0-9_/]+)", cm)) - {"KERNEL"})
 
 
-def build(version: str, sdk: str) -> Path:
-    """mlx.metallib for `sdk` ("iphoneos" or "iphonesimulator"), cached per version."""
+def build(version: str, sdk: str, progress=None) -> Path:
+    """mlx.metallib for `sdk` ("iphoneos" or "iphonesimulator"), cached per version.
+    progress: a reporter told `compiling GPU shaders k/n` (a cached library reports nothing)."""
     out = CACHE / "mlx-metallib" / f"{version}-{sdk}" / "mlx.metallib"
     if out.exists():
         return out
-    src = source(version)
+    p = progress or progress_mod.NULL
+    src = source(version, p)
     kdir = src / "mlx/backend/metal/kernels"
     work = out.parent / "air"
     work.mkdir(parents=True, exist_ok=True)
     minflag = (f"-mios-simulator-version-min={METAL_MIN}" if sdk == "iphonesimulator"
                else f"-mios-version-min={METAL_MIN}")
 
+    names = kernels(src)
+    tick = progress_mod.counter(p, len(names), "compiling MLX GPU shaders")
+
     def compile_one(k: str) -> Path:
+        try:
+            return _compile(k)
+        finally:
+            tick()
+
+    def _compile(k: str) -> Path:
         air = work / (k.replace("/", "_") + ".air")
         r = subprocess.run(["xcrun", "-sdk", sdk, "metal", "-x", "metal", "-Wall", "-Wextra", "-fno-fast-math",
                             "-Wno-c++17-extensions", "-Wno-c++20-extensions", minflag, "-c",
@@ -57,19 +70,20 @@ def build(version: str, sdk: str) -> Path:
         return air
 
     with ThreadPoolExecutor(8) as pool:
-        airs = list(pool.map(compile_one, kernels(src)))
+        airs = list(pool.map(compile_one, names))
+    p.detail("linking MLX GPU shaders")
     subprocess.run(["xcrun", "-sdk", sdk, "metallib", *map(str, airs), "-o", str(out)], check=True,
                    capture_output=True)
     shutil.rmtree(work, ignore_errors=True)
     return out
 
 
-def install(stage_root: Path, version: str, sdk: str) -> Path | None:
+def install(stage_root: Path, version: str, sdk: str, progress=None) -> Path | None:
     """Swap the macOS metallib in a staged app for the iOS one."""
     fw = next((stage_root / "Frameworks").glob("mlx.lib.libmlx.framework"), None)
     if fw is None:
         return None
-    lib = build(version, sdk)
+    lib = build(version, sdk, progress)
     shutil.copy2(lib, fw / "mlx.metallib")
     mac = stage_root / "app_packages" / "mlx" / "lib" / "mlx.metallib"
     if mac.exists():

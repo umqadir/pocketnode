@@ -17,11 +17,13 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from .. import progress as progress_mod
 from ..sources import CONFIG_DIR
 from . import app as app_mod
 from . import stage as stage_mod
@@ -60,8 +62,10 @@ def signing_identity() -> str:
     return ident
 
 
-def prepare(names: list[str], have: dict[str, str], sdk: str | None, out: Path) -> stage_mod.Report:
-    """Stage the compiled distributions `names` need that the node doesn't have (at this version)."""
+def prepare(names: list[str], have: dict[str, str], sdk: str | None, out: Path, progress=None) -> stage_mod.Report:
+    """Stage the compiled distributions `names` need that the node doesn't have (at this version).
+    progress: a reporter told each phase and its count; None reports nothing."""
+    p = progress or progress_mod.NULL
     have = {_norm(k): v for k, v in have.items()}
 
     def wanted(d) -> bool:
@@ -71,6 +75,7 @@ def prepare(names: list[str], have: dict[str, str], sdk: str | None, out: Path) 
         return any(str(f).endswith((".so", ".dylib")) for f in d.files or ())
 
     if sdk is None:  # a local stand-in: the Mac's binaries run there unchanged
+        p.detail(f"preparing {', '.join(names)}")
         import shutil
         shutil.rmtree(out, ignore_errors=True)
         s = stage_mod.Stager.__new__(stage_mod.Stager)
@@ -83,32 +88,45 @@ def prepare(names: list[str], have: dict[str, str], sdk: str | None, out: Path) 
     # Code added to a running app must carry the app's bundle identifier as its signing identifier.
     bid = app_mod.bundle_id(sdk)
     s = stage_mod.Stager(sdk, out, bundle_id=bid, inplace=True)
-    rep = s.stage(names, only=wanted)
-    bins = [p for p in s.pk.rglob("*") if p.is_file() and not p.is_symlink() and stage_mod.is_macho(p)]
+    rep = s.stage(names, only=wanted, progress=progress_mod.Prefixed(p, f"preparing {', '.join(names)}"))
+    bins = [b for b in s.pk.rglob("*") if b.is_file() and not b.is_symlink() and stage_mod.is_macho(b)]
     if sdk == "iphoneos":
         args = ["-s", signing_identity(), "--identifier", bid]
     else:
         args = ["-s", "-"]  # the simulator doesn't check who signed
+    tick = progress_mod.counter(p, len(bins), "signing")
 
-    def sign(p: Path) -> None:
-        r = subprocess.run(["codesign", "-f", "--timestamp=none", *args, str(p)], capture_output=True, text=True)
+    def sign(b: Path) -> None:
+        try:
+            r = subprocess.run(["codesign", "-f", "--timestamp=none", *args, str(b)], capture_output=True, text=True)
+        finally:
+            tick()
         if r.returncode:
-            raise CantAdd(f"signing {p.name} failed: {r.stderr.strip()}")
+            raise CantAdd(f"signing {b.name} failed: {r.stderr.strip()}")
 
     with ThreadPoolExecutor(8) as pool:
         list(pool.map(sign, bins))
     return rep
 
 
-def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: bool = False) -> dict:
-    """Put compiled packages on a connected node. Returns {"added": {dist: version}, "seconds", "mb", ...}."""
+def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: bool = False,
+        progress: bool = False) -> dict:
+    """Put compiled packages on a connected node. Returns {"added": {dist: version}, "seconds", "mb", ...}.
+
+    progress=True draws a progress line while it works (for callers in the foreground); otherwise
+    (a background add) it notes when it starts and when it's done. quiet=True says nothing at all."""
     node = next((n for n in ex.nodes.values() if on in (n.kind, n.name, n.id)), None)
     if node is None:
         raise CantAdd(f"no connected node matches {on!r}")
+    with progress_mod.step(f"Adding {', '.join(names)} to {node.name}", quiet=quiet or not progress) as p:
+        return _add(ex, node, names, timeout, notes=not quiet and not progress, prog=p)
+
+
+def _add(ex, node, names: list[str], timeout: float, notes: bool, prog) -> dict:
     t0 = time.time()
     out = Path(tempfile.mkdtemp(prefix="pn-hot-"))
     try:
-        rep = prepare(list(names), node.hello.get("packages", {}), node_sdk(node), out)
+        rep = prepare(list(names), node.hello.get("packages", {}), node_sdk(node), out, progress=prog)
         if not rep.dists:
             return {"added": {}, "seconds": 0.0, "send_s": 0.0, "mb": 0.0, "excluded": rep.excluded,
                     "warnings": rep.warnings, "failed": {}, "restart": False, "note": "already there"}
@@ -118,9 +136,11 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
         avail = node.hello.get("disk_free")
         if avail and total > avail - (1 << 30):
             raise CantAdd(f"{total / 2**20:.0f} MB wouldn't fit in the {avail / 2**20:.0f} MB free on {node.name}")
-        if not quiet:
+        if notes:
             ex._note(None, f"pocketnode: adding {', '.join(rep.dists)} to {node.name} ({total / 2**20:.0f} MB)…")
         t1 = time.time()
+        b0 = node.bytes_sent
+        prog.update(0.0, round(total / 2**20, 1), detail="sending", unit="MB")
         req = uuid.uuid4().hex
         reply = ex.expect(req)
         batch, size, seq = [], 0, 0
@@ -139,7 +159,23 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
             batch.append(p)
             size += n
         flush(True)
-        msg = reply(timeout)
+        # The batches are queued; the node's sender thread counts bytes as they leave.
+        stop = threading.Event()
+
+        def watch() -> None:
+            while not stop.wait(0.2):
+                sent = node.bytes_sent - b0
+                if sent < total:
+                    prog.update(round(sent / 2**20, 1), round(total / 2**20, 1), detail="sending", unit="MB")
+                else:
+                    prog.detail("installing on the phone")
+
+        if not getattr(prog, "silent", False):
+            threading.Thread(target=watch, daemon=True, name="pn-hot-progress").start()
+        try:
+            msg = reply(timeout)
+        finally:
+            stop.set()
         if msg is None:
             raise CantAdd(f"{node.name} didn't confirm the install in time")
         if msg.get("error"):
@@ -159,7 +195,7 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
         ex._note(None, f"pocketnode: restarting the app on {node.name} to switch to the new "
                        f"{', '.join(msg['restart'])}")
         node.post({"t": "restart"})
-    if not quiet:
+    if notes:
         bad = result["failed"]
         ex._note(None, f"pocketnode: {', '.join(rep.dists)} now on {node.name} ({result['seconds']} s)"
                  + (f"; couldn't import {', '.join(bad)} there, so tasks using it stay on the Mac" if bad else ""))

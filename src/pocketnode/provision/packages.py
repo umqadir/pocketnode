@@ -206,7 +206,7 @@ class Packages:
                     est = hot.estimate(list(names), have=have)
                     print(f"adding {', '.join(names)}: about {est['seconds']} s, {est['mb']} MB"
                           f"{' (measured)' if est['measured'] else ' (estimate)'}")
-                    r = hot.add(ex, list(names), quiet=True)
+                    r = hot.add(ex, list(names), progress=True)
                     if not r["added"]:
                         print(f"nothing to add: {', '.join(names)} already on the phone "
                               "(or pure Python, which the phone imports from the Mac on demand)")

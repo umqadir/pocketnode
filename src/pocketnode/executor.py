@@ -167,6 +167,7 @@ class Node:
             if isinstance(item, tuple):
                 try:
                     self.conn.send(*item)
+                    self.bytes_sent += sum(len(b) for b in item[1] if isinstance(b, (bytes, bytearray)))
                 except (ConnectionClosed, OSError):
                     pass
                 continue

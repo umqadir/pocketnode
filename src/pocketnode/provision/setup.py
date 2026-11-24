@@ -26,6 +26,7 @@ import sys
 import time
 from typing import Callable, NamedTuple
 
+from .. import progress
 from ..sources import PHONE_PORT, TRUST_STEPS, launch_failure
 from . import app as app_mod
 from . import tools
@@ -259,10 +260,12 @@ def first_launch(launch: Callable[[], subprocess.CompletedProcess], answers: Cal
     r = launch()
     if r.returncode == 0:
         end = clock() + started_wait
-        while clock() < end:
-            if answers():
-                return Check(True, "started; the app answers")
-            sleep(poll)
+        with progress.step("  waiting for the app to start") as p:
+            while clock() < end:
+                if answers():
+                    return Check(True, "started; the app answers")
+                sleep(poll)
+            p.finish("no answer")
         say("  the app started but isn't answering yet. If it isn't on the phone's screen, open the pocketnode "
             "app on the phone.")
     else:
@@ -279,8 +282,9 @@ def first_launch(launch: Callable[[], subprocess.CompletedProcess], answers: Cal
         else:
             say(f"  the app didn't start ({_last_line(r)}). Open the pocketnode app on the phone.")
     say("  waiting for the app to answer (Ctrl-C to stop; `pocketnode setup` picks up where it left off)")
-    while not answers():
-        sleep(poll)
+    with progress.step("  waiting for the app to answer"):
+        while not answers():
+            sleep(poll)
     return Check(True, "the app answers")
 
 
@@ -296,9 +300,10 @@ class Setup:
         self.out(text)
 
     def step(self, label: str, check: Callable[[], Check], wait: bool = True,
-             poll: Callable[[], Check] | None = None) -> Check:
+             poll: Callable[[], Check] | None = None, waiting: str | None = None) -> Check:
         """Print `label: result`. On a problem print the fix, then wait for `poll` (default: the check)
-        to pass, or stop when waiting can't help."""
+        to pass, or stop when waiting can't help. waiting: what the wait is for, in words
+        ("the phone to be unlocked"; default: the label)."""
         c = check()
         self.say(f"{label}: {c.message}")
         if c.ok:
@@ -309,15 +314,17 @@ class Setup:
         self.say("  waiting for that (Ctrl-C to stop; run `pocketnode setup` again any time)")
         poll = poll or check
         last = c.message
-        while True:
-            time.sleep(self.interval)
-            c = poll()
-            if c.ok:
-                self.say(f"  done: {c.message}")
-                return c
-            if c.message != last:  # something changed, and needs something else now
-                self.say(f"  now: {c.message}. To fix: {c.fix}")
-                last = c.message
+        with progress.step(f"  waiting for {waiting or label}") as p:
+            while True:
+                time.sleep(self.interval)
+                c = poll()
+                if c.ok:
+                    break
+                if c.message != last:  # something changed, and needs something else now
+                    p.echo(f"  now: {c.message}. To fix: {c.fix}", self.say)
+                    last = c.message
+        self.say(f"  done: {c.message}")
+        return c
 
     def confirm(self, question: str) -> bool:
         if self.yes or not sys.stdin.isatty():
@@ -337,7 +344,7 @@ class Setup:
             self.say(f"iOS platform: {sdk.message}")
             if self.confirm("download it now with `xcodebuild -downloadPlatform iOS` (several GB)?"):
                 subprocess.run(["xcodebuild", "-downloadPlatform", "iOS"])
-        self.step("iOS platform", check_ios_sdk)
+        self.step("iOS platform", check_ios_sdk, waiting="the iOS platform")
         self.step("XcodeGen", self._xcodegen, poll=self._xcodegen_on_path)
         self.step("embedded Python", self._python, wait=False)
         self._metal()
@@ -384,7 +391,8 @@ class Setup:
                      "`pocketnode app install`.")
 
     def signing(self) -> str:
-        self.step("Apple ID and team", lambda: check_signing(*app_mod.xcode_teams(), team=self.team))
+        self.step("Apple ID and team", lambda: check_signing(*app_mod.xcode_teams(), team=self.team),
+                  waiting="the Apple ID and team")
         team = self.team or app_mod.detect_team()
         app_mod.save_config(team=team)
         return team
@@ -396,34 +404,28 @@ class Setup:
             c, udid[0] = check_phone(run_cmd(["xcrun", "devicectl", "list", "devices"]).stdout)
             return c
 
-        self.step("iPhone", connected)
+        self.step("iPhone", connected, waiting="the iPhone")
         u = udid[0]
         self.step("Developer Mode", lambda: check_devmode(run_cmd(["devmodectl", "list"]).stdout, u))
         self.step("phone unlocked", lambda: check_unlocked(run_cmd(
             ["xcrun", "devicectl", "device", "info", "lockState", "--device", u, "--quiet",
-             "--json-output", "-"], timeout=60).stdout))
+             "--json-output", "-"], timeout=60).stdout), waiting="the phone to be unlocked")
         return u
 
     def build_install(self, sdk: str, udid: str | None) -> None:
-        try:
-            built = [json.loads(l) for l in app_mod.HISTORY.read_text().splitlines() if l.strip()]
-        except (OSError, ValueError):
-            built = []
-        first = not any(b.get("event") == "build" and b.get("sdk") == sdk for b in built)
-        self.say("building the app: " + ("the first build takes several minutes (about 5 on an M4)"
-                                         if first else "about a minute"))
-        t0 = time.time()
+        # What makes a build slow is an empty build directory for this SDK; the
+        # steps below show their own progress, so only a cold build gets a warning.
+        cold = not app_mod.product(sdk).exists()
+        self.say("building the app" + (": the first build takes several minutes" if cold else ""))
         try:
             p = app_mod.build(sdk)
         except (RuntimeError, LookupError) as e:
             self.say(f"  the build failed: {e}")
             raise Stop("fix that and run `pocketnode setup` again") from None
-        self.say(f"  built in {time.time() - t0:.0f} s")
         try:
             if sdk == "iphonesimulator":
                 app_mod.install_sim(p)
             else:
-                self.say("installing it on the phone")
                 app_mod.install_device(p, udid, launch=False)
         except RuntimeError as e:
             self.say(f"  installing failed: {e}")
@@ -473,12 +475,13 @@ class Setup:
             self.toolchain()
             if self.sim:
                 self.say("Apple ID and team: not needed for the simulator")
-                self.step("simulator", _simulator_check)
+                self.step("simulator", _simulator_check, waiting="an iPhone simulator")
                 self.build_install("iphonesimulator", None)
                 self.say("starting the app in the simulator")
                 end = time.monotonic() + 120
-                while not address_answers() and time.monotonic() < end:
-                    time.sleep(1)
+                with progress.step("  waiting for the app to answer"):
+                    while not address_answers() and time.monotonic() < end:
+                        time.sleep(1)
                 code = self.acceptance(SIM_ADDRESS)
             else:
                 self.signing()

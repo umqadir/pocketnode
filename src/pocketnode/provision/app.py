@@ -14,9 +14,11 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 
+from .. import progress
 from ..sources import CONFIG_DIR, pairing_token
 from ..sources import bundle_id as configured_bundle_id
 from . import stage as stage_mod
@@ -33,6 +35,80 @@ def _run(cmd: list[str], log: Path | None = None, **kw) -> subprocess.CompletedP
     if log is not None:
         log.write_text(r.stdout + r.stderr)
     return r
+
+
+def _run_streaming(cmd: list[str], on_line, log: Path | None = None, **kw) -> subprocess.CompletedProcess:
+    """_run, handing each line of standard output to on_line(line) as it arrives."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, **kw)
+    err: list[str] = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()), daemon=True)
+    reader.start()
+    out = []
+    for line in proc.stdout:
+        out.append(line)
+        try:
+            on_line(line)
+        except Exception:  # noqa: BLE001 - progress must never break the build
+            pass
+    proc.wait()
+    reader.join()
+    proc.stdout.close()
+    proc.stderr.close()
+    r = subprocess.CompletedProcess(cmd, proc.returncode, "".join(out), "".join(err))
+    if log is not None:
+        log.write_text(r.stdout + r.stderr)
+    return r
+
+
+def _follow(path: Path, on_line, stop: threading.Event, every: float = 0.2) -> None:
+    """Hand each complete line appended to `path` to on_line(line) until `stop` is set
+    (then once more, for the last lines). The file needn't exist yet."""
+    pos, rest = 0, b""
+    while True:
+        last = stop.wait(every)
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError:
+            data = b""
+        pos += len(data)
+        *lines, rest = (rest + data).split(b"\n")
+        for line in lines:
+            try:
+                on_line(line.decode(errors="replace"))
+            except Exception:  # noqa: BLE001 - progress must never break the build
+                pass
+        if last:
+            return
+
+
+# What xcodebuild is doing, from the start of its task lines.
+_XCODE_TASKS = {
+    **dict.fromkeys(("PrecompileModule", "ScanDependencies", "CompileC", "SwiftCompile", "CompileSwift",
+                     "SwiftDriver", "Ld"), "compiling sources"),
+    "ProcessXCFramework": "copying Python", "PhaseScriptExecution": "installing Python and packages",
+    "CodeSign": "signing the app", "Validate": "signing the app",
+}
+# Marker lines from scripts/install_python.sh:
+#   POCKETNODE_PROGRESS phase <name>  or  POCKETNODE_PROGRESS <what> <done> <total>
+_MARKER = re.compile(r"POCKETNODE_PROGRESS (?:phase (\S+)|(\S+) (\d+) (\d+))\s*$")
+_MARKER_DETAIL = {"copying-python": "copying Python", "copying-packages": "copying packages",
+                  "frameworks": "copying frameworks", "sign": "signing frameworks"}
+
+
+def build_progress(line: str) -> tuple[str, int | None, int | None] | None:
+    """(detail, done, total) for a line of xcodebuild output, or None if it says nothing new."""
+    m = _MARKER.search(line)
+    if m:
+        phase, what, done, total = m.groups()
+        name = phase or what
+        detail = _MARKER_DETAIL.get(name, name.replace("-", " "))
+        return (detail, None, None) if phase else (detail, int(done), int(total))
+    task = line.split(" ", 1)[0]
+    if task in _XCODE_TASKS and len(line) > len(task) + 1:
+        return _XCODE_TASKS[task], None, None
+    return None
 
 
 def config() -> dict:
@@ -121,7 +197,8 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
     if restage == "pocketnode":
         stage_mod.refresh_pocketnode(sdk)
     elif restage:
-        rep = stage_mod.stage(pkgs, sdk, bundle_id=bundle_id)
+        with progress.step("Staging packages") as p:
+            rep = stage_mod.stage(pkgs, sdk, bundle_id=bundle_id, progress=p)
         for mod, why in rep.excluded.items():
             print(f"  left out {mod}: {why}")
         for w in rep.warnings:
@@ -168,9 +245,38 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         cmd += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
     log = work / "build" / f"{sdk}.log"
     log.parent.mkdir(exist_ok=True)
-    r = _run(cmd, log=log, cwd=work, env=env)
-    if r.returncode:
-        raise RuntimeError(build_failure(r.stdout + r.stderr, bundle_id, log))
+    # The build script's markers come from this file as it writes them: xcodebuild
+    # passes a script's output on in chunks of several kilobytes.
+    markers = log.with_suffix(".progress")
+    markers.unlink(missing_ok=True)
+    env["POCKETNODE_PROGRESS_FILE"] = str(markers)
+    with progress.step("Building the app") as p:
+        seen = {"marker": False, "after": False}
+
+        def from_script(line: str) -> None:
+            got = build_progress(line)
+            if got and not seen["after"]:
+                seen["marker"] = True
+                p.update(got[1], got[2], detail=got[0])
+
+        def from_xcodebuild(line: str) -> None:
+            got = build_progress(line) if "POCKETNODE_PROGRESS" not in line else None
+            if got:
+                # A task after the script's own markers: the script is over, and
+                # markers still being read from the file are stale.
+                seen["after"] = seen["marker"]
+                p.update(got[1], got[2], detail=got[0])
+
+        stop = threading.Event()
+        follower = threading.Thread(target=_follow, args=(markers, from_script, stop), daemon=True)
+        follower.start()
+        try:
+            r = _run_streaming(cmd, from_xcodebuild, log=log, cwd=work, env=env)
+        finally:
+            stop.set()
+            follower.join()
+        if r.returncode:
+            raise RuntimeError(build_failure(r.stdout + r.stderr, bundle_id, log))
     t2 = time.time()
     _record({"event": "build", "sdk": sdk, "packages": pkgs, "stage_s": t1 - t0, "build_s": t2 - t1})
     out = product(sdk)
@@ -269,24 +375,43 @@ def simulator() -> str:
 
 def install_sim(app: Path, device: str | None = None, launch: bool = True) -> None:
     device = device or simulator()
-    _run(["xcrun", "simctl", "boot", device])
-    _run(["xcrun", "simctl", "bootstatus", device, "-b"])
-    bid = bundle_id("iphonesimulator")
-    _run(["xcrun", "simctl", "terminate", device, bid])
-    r = _run(["xcrun", "simctl", "install", device, str(app)])
-    if r.returncode:
-        raise RuntimeError(r.stderr)
-    if launch:
-        _run(["xcrun", "simctl", "launch", device, bid])
+    with progress.step("Installing in the simulator") as p:
+        p.detail("starting the simulator")
+        _run(["xcrun", "simctl", "boot", device])
+        _run(["xcrun", "simctl", "bootstatus", device, "-b"])
+        bid = bundle_id("iphonesimulator")
+        _run(["xcrun", "simctl", "terminate", device, bid])
+        p.detail("installing")
+        r = _run(["xcrun", "simctl", "install", device, str(app)])
+        if r.returncode:
+            raise RuntimeError(r.stderr)
+        if launch:
+            p.detail("launching")
+            _run(["xcrun", "simctl", "launch", device, bid])
+
+
+_PERCENT = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+
+def install_percent(line: str) -> float | None:
+    """A percentage in a line of `devicectl device install app` output, if it reports one."""
+    m = _PERCENT.search(line)
+    return float(m.group(1)) if m and float(m.group(1)) <= 100 else None
 
 
 def install_device(app: Path, udid: str | None = None, launch: bool = True) -> None:
     from ..sources import launch_failure
     udid = udid or device_udid()
     t0 = time.time()
-    r = _run(["xcrun", "devicectl", "device", "install", "app", "--device", udid, str(app)])
-    if r.returncode:
-        raise RuntimeError(r.stderr or r.stdout)
+    with progress.step("Installing on the iPhone") as p:
+        def on_line(line: str) -> None:
+            pct = install_percent(line)
+            if pct is not None:
+                p.update(round(pct), 100, detail="installing", unit="%")
+        p.detail("installing")
+        r = _run_streaming(["xcrun", "devicectl", "device", "install", "app", "--device", udid, str(app)], on_line)
+        if r.returncode:
+            raise RuntimeError(r.stderr or r.stdout)
     _record({"event": "install", "seconds": time.time() - t0})
     if launch:
         r = _run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid, bundle_id("iphoneos")])
@@ -305,15 +430,19 @@ _UDID = re.compile(r"\b([0-9A-F]{8}-[0-9A-F]{16})\b")
 
 def parse_devices(text: str) -> list[dict]:
     """Physical iPhones in `xcrun devicectl list devices` output:
-    [{"udid", "available", "paired", "line"}]. Simulators have a different UDID form and are skipped."""
+    [{"udid", "available", "paired", "line"}]. Simulators have a different UDID form and are skipped.
+
+    The State column reads `available (paired)` while the phone is idle and `connected` or
+    `connected (no DDI)` while a CoreDevice tunnel is up; a connected phone is paired."""
     out = []
     for line in text.splitlines():
         m = _UDID.search(line)
         if not m or "iPhone" not in line or "simulated" in line:
             continue
         low = line.lower()
+        connected = re.search(r"\bconnected\b", low[m.end():]) is not None
         out.append({"udid": m.group(1), "available": "unavailable" not in low,
-                    "paired": "paired" in low and "unpaired" not in low and "not paired" not in low,
+                    "paired": connected or ("paired" in low and "unpaired" not in low and "not paired" not in low),
                     "line": line.strip()})
     return out
 
