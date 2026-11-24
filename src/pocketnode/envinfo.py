@@ -228,6 +228,10 @@ def package_module(top: str) -> tuple[dict, bytes | None]:
     return {**info, "hash": h}, data
 
 
+# Modules only the Mac side uses. check.py's tasks travel by value, so it counts too.
+_MAC_ONLY = {"cli.py", "sources.py", "check.py", "progress.py", "usbmux.py", "router.py", "verify.py"}
+
+
 @lru_cache(maxsize=1)
 def source_version() -> str:
     """A fingerprint of pocketnode's own source. The Mac and the phone app each
@@ -236,8 +240,8 @@ def source_version() -> str:
     root = Path(__file__).resolve().parent
     for f in sorted(root.rglob("*.py")):
         parts = f.relative_to(root).parts
-        if "provision" in parts or parts[0] == "ios" or f.name in ("cli.py", "sources.py"):
-            continue  # Mac-only code (and the app's sources): the phone's copy of pocketnode lacks them
+        if "provision" in parts or parts[0] == "ios" or f.name in _MAC_ONLY:
+            continue  # code the phone never runs: changing it doesn't make the app on the phone stale
         h.update(f.relative_to(root).as_posix().encode())
         h.update(f.read_bytes())
     return h.hexdigest()[:12]
