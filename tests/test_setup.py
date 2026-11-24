@@ -324,6 +324,10 @@ def test_build_failure_messages(tmp_path):
     msg = app_mod.build_failure("error: No Account for Team \"X\".", "b", tmp_path / "log")
     assert "Apple Accounts" in msg
     assert "full log" in app_mod.build_failure("error: something new", "b", tmp_path / "log")
+    script = ("Signing framework...\nxargs: command line cannot be assembled, too long\n"
+              "Command PhaseScriptExecution failed with a nonzero exit code\n** BUILD FAILED **\n")
+    msg = app_mod.build_failure(script, "b", tmp_path / "log")
+    assert "xargs: command line cannot be assembled" in msg and "PhaseScriptExecution" not in msg
 
 
 # ----------------------------------------------------- app sources as package data

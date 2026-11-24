@@ -40,9 +40,11 @@ if [ -d "$STAGE/Frameworks" ]; then
     done < "$STAGED_LIST"
   fi
   (cd "$STAGE/Frameworks" && ls -d *.framework) > "$STAGED_LIST"
-  xargs -P 8 -I{} /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" ${OTHER_CODE_SIGN_FLAGS:-} \
-      -o runtime --timestamp=none --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der \
-      "$DEST/{}" < "$TODO"
+  # Names relative to $DEST, appended by xargs: `xargs -I` caps each substituted
+  # argument at 255 bytes, which a long home folder path exceeds.
+  (cd "$DEST" && xargs -P 8 -n 1 /usr/bin/codesign --force --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
+      ${OTHER_CODE_SIGN_FLAGS:-} -o runtime --timestamp=none \
+      --preserve-metadata=identifier,entitlements,flags --generate-entitlement-der < "$TODO")
   rm -f "$TODO"
 fi
 cp "$PN_HOME/token" "$CODESIGNING_FOLDER_PATH/pocketnode_token"

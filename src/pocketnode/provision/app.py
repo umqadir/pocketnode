@@ -196,8 +196,12 @@ def build_failure(output: str, bundle: str, log: Path) -> str:
     if "Developer Mode disabled" in output or ("developer mode" in output.lower() and "disabled" in output):
         return ("Developer Mode is off on the iPhone: Settings > Privacy & Security > Developer Mode, "
                 "restart when asked, then confirm with your passcode.")
-    errs = [l for l in output.splitlines() if "error:" in l][:10]
-    return "xcodebuild failed:\n" + "\n".join(errs) + f"\n(full log: {log})"
+    lines = output.splitlines()
+    errs = [l for l in lines if "error:" in l][:10]
+    if not errs:  # a build script that failed says so in its own words
+        errs = [l for l in lines if re.search(r"failed|cannot|not found|no such file", l, re.I)
+                and not re.search(r"BUILD FAILED|build commands failed|Command \w+ failed", l)][-5:]
+    return "xcodebuild failed:\n" + "\n".join(l.strip()[:300] for l in errs) + f"\n(full log: {log})"
 
 
 def profile_expiry(app: Path) -> str | None:
