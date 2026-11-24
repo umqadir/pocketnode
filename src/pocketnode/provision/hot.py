@@ -109,7 +109,8 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
     try:
         rep = prepare(list(names), node.hello.get("packages", {}), node_sdk(node), out)
         if not rep.dists:
-            return {"added": {}, "seconds": 0.0, "mb": 0.0, "excluded": rep.excluded, "note": "already there"}
+            return {"added": {}, "seconds": 0.0, "send_s": 0.0, "mb": 0.0, "excluded": rep.excluded,
+                    "warnings": rep.warnings, "failed": {}, "restart": False, "note": "already there"}
         pk = out / "app_packages"
         files = sorted(p for p in pk.rglob("*") if p.is_file())
         total = sum(p.stat().st_size for p in files)
@@ -142,10 +143,11 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
             raise CantAdd(f"{node.name} didn't confirm the install in time")
         if msg.get("error"):
             raise CantAdd(msg["error"])
+        msg["failed"] = {k: v for k, v in (msg.get("failed") or {}).items() if _imports_here(k)}
     finally:
         import shutil
         shutil.rmtree(out, ignore_errors=True)
-    ex.packages_changed(node, msg.get("packages", {}), rep.dists)
+    ex.packages_changed(node, msg.get("packages", {}), rep.dists, msg.get("failed"))
     result = {"added": rep.dists, "seconds": round(time.time() - t0, 1), "send_s": round(time.time() - t1, 1),
               "mb": round(total / 2**20, 1), "excluded": rep.excluded, "warnings": rep.warnings,
               "failed": msg.get("failed", {}), "restart": bool(msg.get("restart"))}
@@ -161,6 +163,15 @@ def add(ex, names: list[str], on: str = "phone", timeout: float = 1800, quiet: b
         ex._note(None, f"pocketnode: {', '.join(rep.dists)} now on {node.name} ({result['seconds']} s)"
                  + (f"; couldn't import {', '.join(bad)} there, so tasks using it stay on the Mac" if bad else ""))
     return result
+
+
+def _imports_here(module: str) -> bool:
+    """Can this Mac import the module? A package's optional extra that needs
+    something not installed here either (duckdb's ADBC driver) isn't a failure
+    of the phone."""
+    import sys
+    r = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, timeout=120)
+    return r.returncode == 0
 
 
 def remove(ex, names: list[str], on: str = "phone", timeout: float = 120) -> dict:

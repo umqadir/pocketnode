@@ -1,7 +1,8 @@
 """What's on the phone, what could be, and what changing it costs.
 
     pn.packages()                      # table: Mac env vs phone, with status
-    pn.packages.add("lightgbm")        # stage, rebuild, reinstall (asks first)
+    pn.packages.add("lightgbm")        # onto the running app, in seconds (no restart)
+    pn.packages.add("lightgbm", bundle=True)  # rebuild the app with it baked in (asks first)
     pn.packages.always_mac("lightgbm") # never offer it again; run it on the Mac
 
 Pure-Python packages never need installing: the phone imports them from the
@@ -12,6 +13,7 @@ iOS SDK first, and anything that can't work says why.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata as md
 import json
 import time
@@ -156,6 +158,26 @@ def estimate(names: list[str]) -> dict:
     return {"build_s": round(build_s), "install_s": round(install_s), "measured": measured}
 
 
+@contextlib.contextmanager
+def _live(executor=None):
+    """An executor with the phone connected (a temporary one if needed), or None."""
+    import pocketnode
+    ex, temp = executor or pocketnode._current, None
+    if ex is None:
+        prev = pocketnode._current
+        ex = temp = pocketnode.connect(mac_workers=0, notes=False, auto_add=False)
+        pocketnode._current = prev  # connect() makes it current; it's only borrowed here
+        ex.wait_for("phone", 30)
+    try:
+        yield ex if any(n.kind == "phone" for n in ex.nodes.values()) else None
+    finally:
+        if temp is not None:
+            end = time.monotonic() + 2  # let a queued restart request reach the phone
+            while time.monotonic() < end and any(not n.outbox.empty() for n in temp.nodes.values()):
+                time.sleep(0.05)
+            temp.shutdown(wait=False)
+
+
 class Packages:
     """`pn.packages` — call it for the table; methods change what's on the phone."""
 
@@ -170,10 +192,49 @@ class Packages:
         lines.append(f"(+{n_pure} pure-Python packages: always available, imported from the Mac on demand)")
         print("\n".join(lines))
 
-    def add(self, *names: str, yes: bool = False, when_idle: bool = False, sdk: str | None = None):
+    def add(self, *names: str, yes: bool = False, when_idle: bool = False, sdk: str | None = None,
+            bundle: bool = False, executor=None):
+        """Put compiled packages on the running phone app (seconds, nothing restarts).
+        bundle=True instead rebuilds the app with them baked in (asks first)."""
+        if not bundle:
+            from . import hot
+            with _live(executor) as ex:
+                if ex is not None:
+                    est = hot.estimate(list(names))
+                    print(f"adding {', '.join(names)}: about {est['seconds']} s, {est['mb']} MB"
+                          f"{' (measured)' if est['measured'] else ' (estimate)'}")
+                    r = hot.add(ex, list(names), quiet=True)
+                    if not r["added"]:
+                        print(f"nothing to add: {', '.join(names)} already on the phone "
+                              "(or pure Python, which the phone imports from the Mac on demand)")
+                    else:
+                        got = ", ".join(f"{k} {v}" for k, v in r["added"].items())
+                        print(f"added {got} in {r['seconds']} s ({r['mb']} MB)")
+                    for m, why in r.get("excluded", {}).items():
+                        print(f"  {m} can't run on iOS: {why}")
+                    for m, why in r.get("failed", {}).items():
+                        print(f"  {m} is there but failed to import ({why}); tasks using it run on the Mac")
+                    if r.get("restart"):
+                        print("  an older version was already loaded: the app restarts to switch")
+                    return r
+            print("no phone reachable; adding it to the app build instead")
         return self._change(add=list(names), yes=yes, when_idle=when_idle, sdk=sdk)
 
-    def remove(self, *names: str, yes: bool = False, sdk: str | None = None):
+    def remove(self, *names: str, yes: bool = False, sdk: str | None = None, bundle: bool = False,
+               executor=None):
+        """Take packages added at runtime off the phone. bundle=True rebuilds the app without them."""
+        if not bundle:
+            from . import hot
+            with _live(executor) as ex:
+                if ex is not None:
+                    r = hot.remove(ex, list(names))
+                    if r["removed"]:
+                        print(f"removed {', '.join(r['removed'])}")
+                    for b in r["bundled"]:
+                        print(f"{b} is part of the app build; `pocketnode packages remove --bundle {b}` "
+                              "rebuilds without it")
+                    return r
+            print("no phone reachable; removing it from the app build instead")
         return self._change(remove=list(names), yes=yes, sdk=sdk)
 
     def always_mac(self, *names: str):
@@ -181,8 +242,9 @@ class Packages:
         app_mod.save_config(always_mac=sorted(set(cfg.get("always_mac", [])) | set(names)))
         print(f"won't offer {', '.join(names)} again; tasks needing them run on the Mac")
 
-    def select(self, sdk: str | None = None):
-        """Interactive checklist: what's on the phone, what could be, what changing it costs."""
+    def select(self, sdk: str | None = None, bundle: bool = False):
+        """Interactive checklist: what's on the phone, what could be, what changing it costs.
+        Changes go to the running app; bundle=True rebuilds the app with exactly the ticked set."""
         rows = [r for r in table(check=True) if r.kind == "compiled"]
         on_phone = phone_packages()
         if on_phone is None:  # first use: a sensible scientific stack is pre-checked
@@ -192,12 +254,23 @@ class Packages:
         else:
             checked = {r.name.lower() for r in rows if r.status == "on phone"}
             first = False
-        chosen = _checklist(rows, checked, recent_misses(), first)
+        chosen = _checklist(rows, set(checked), recent_misses(), first)  # a copy: the checklist edits it
         if chosen is None:
             print("left as is")
             return
         names = {r.name.lower(): r.name for r in rows}
-        return self._change(new=sorted(names[n] for n in chosen), sdk=sdk, before=None if first else checked)
+        if bundle:
+            return self._change(new=sorted(names[n] for n in chosen), sdk=sdk, before=None if first else checked)
+        had = set() if first else checked
+        added = sorted(names[n] for n in chosen - had)
+        dropped = sorted(names.get(n, n) for n in had - chosen)
+        if not added and not dropped:
+            print("nothing to change")
+            return
+        if added:
+            self.add(*added, sdk=sdk)
+        if dropped:
+            self.remove(*dropped, sdk=sdk)
 
     def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None, new=None, before=None):
         if new is not None:

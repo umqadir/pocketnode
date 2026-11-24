@@ -46,7 +46,20 @@ static NSString *const kTaskPrefix = @"compute";
 @property (strong) BGContinuedProcessingTask *bgTask;
 @property (assign) UIBackgroundTaskIdentifier graceTask;
 @property (assign) BOOL pythonReady;
+@property (assign) BOOL bgPending;
+- (void)keepComputing;
+- (void)stopComputing;
 @end
+
+// Called from Python (ctypes) on any thread: 1 asks iOS for continued
+// processing, 0 gives it back.
+__attribute__((visibility("default"), used))
+void pocketnode_keep_computing(int on) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        AppDelegate *app = (AppDelegate *)[UIApplication sharedApplication].delegate;
+        if (on) [app keepComputing]; else [app stopComputing];
+    });
+}
 
 #pragma mark - Python
 
@@ -135,12 +148,7 @@ static void *python_main(void *ctx) {
     pthread_create(&thread, &attr, python_main, (__bridge void *)self);
     pthread_attr_destroy(&attr);
 
-    NSString *ident = [NSString stringWithFormat:@"%@.%@.*", [NSBundle mainBundle].bundleIdentifier, kTaskPrefix];
     __weak AppDelegate *weak = self;
-    [[BGTaskScheduler sharedScheduler] registerForTaskWithIdentifier:ident usingQueue:nil launchHandler:^(BGTask *task) {
-        [weak runContinued:(BGContinuedProcessingTask *)task];
-    }];
-
     self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { [weak refresh]; }];
     return YES;
 }
@@ -242,28 +250,62 @@ static void *python_main(void *ctx) {
 
 #pragma mark - Continued processing
 
+// Ask iOS to let the work continue if the user leaves the app. The worker calls
+// this when tasks arrive (and stopComputing when it has been idle), and the
+// button does the same by hand. Each request needs its own identifier under the
+// wildcard in Info.plist, and its handler is registered just before submitting:
+// a handler registered for the wildcard itself is never matched, and submitting
+// without a matching handler throws.
 - (void)keepComputing {
+    if (self.bgTask || self.bgPending) return;
     NSString *ident = [NSString stringWithFormat:@"%@.%@.%@", [NSBundle mainBundle].bundleIdentifier, kTaskPrefix,
                        [[NSUUID UUID].UUIDString substringToIndex:8]];
-    BGContinuedProcessingTaskRequest *req = [[BGContinuedProcessingTaskRequest alloc]
-        initWithIdentifier:ident title:@"pocketnode" subtitle:@"Computing for your Mac"];
-    req.strategy = BGContinuedProcessingTaskRequestSubmissionStrategyFail;
-    NSError *err = nil;
-    if (![[BGTaskScheduler sharedScheduler] submitTaskRequest:req error:&err]) {
-        NSLog(@"pocketnode: continued processing refused: %@", err);
-        py_call("note", [[NSString stringWithFormat:@"background refused: %@", err.localizedDescription] UTF8String]);
+    __weak AppDelegate *weak = self;
+    @try {
+        BOOL ok = [[BGTaskScheduler sharedScheduler] registerForTaskWithIdentifier:ident usingQueue:nil
+                                                                     launchHandler:^(BGTask *task) {
+            [weak runContinued:(BGContinuedProcessingTask *)task];
+        }];
+        if (!ok) { py_call("continued", "refused: identifier not permitted"); return; }
+        BGContinuedProcessingTaskRequest *req = [[BGContinuedProcessingTaskRequest alloc]
+            initWithIdentifier:ident title:@"pocketnode" subtitle:@"Computing for your Mac"];
+        req.strategy = BGContinuedProcessingTaskRequestSubmissionStrategyFail;
+        NSError *err = nil;
+        self.bgPending = YES;
+        if (![[BGTaskScheduler sharedScheduler] submitTaskRequest:req error:&err]) {
+            self.bgPending = NO;
+            NSLog(@"pocketnode: continued processing refused: %@", err);
+            py_call("continued", [[NSString stringWithFormat:@"refused: %@", err.localizedDescription] UTF8String]);
+        }
+    } @catch (NSException *e) {
+        self.bgPending = NO;
+        py_call("continued", [[NSString stringWithFormat:@"refused: %@", e.reason] UTF8String]);
     }
+}
+
+- (void)stopComputing {
+    BGContinuedProcessingTask *t = self.bgTask;
+    if (!t) return;
+    self.bgTask = nil;
+    [t setTaskCompletedWithSuccess:YES];
+    py_call("continued", "off");
+    [self.keepButton setTitle:@"Keep computing in the background" forState:UIControlStateNormal];
 }
 
 - (void)runContinued:(BGContinuedProcessingTask *)task {
     self.bgTask = task;
-    py_call("note", "background: continued processing active");
+    self.bgPending = NO;
+    py_call("continued", "on");
     __weak AppDelegate *weak = self;
     task.expirationHandler = ^{
-        py_call("lifecycle", "background");
-        py_call("note", "background: continued processing expired");
         [task setTaskCompletedWithSuccess:NO];
         weak.bgTask = nil;
+        py_call("continued", "expired");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([UIApplication sharedApplication].applicationState == UIApplicationStateBackground)
+                py_call("lifecycle", "background");
+            [weak.keepButton setTitle:@"Keep computing in the background" forState:UIControlStateNormal];
+        });
     };
     dispatch_async(dispatch_get_main_queue(), ^{
         [weak.keepButton setTitle:@"Computing in the background ✓" forState:UIControlStateNormal];

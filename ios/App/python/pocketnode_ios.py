@@ -60,14 +60,57 @@ def main() -> None:
     token = (_bundle() / "pocketnode_token").read_text().strip()
     cores = device.core_layout()
     worker = Worker(token, slots=cores.get("logical", 6), cache_dir=str(_caches()), phone=True,
-                    name=device.model())
+                    name=device.model(),
+                    site_dir=str(Path.home() / "Library" / "Application Support" / "pocketnode" / "site"))
     worker.last_crash = last_crash
     # USB connections arrive on loopback, so that is all the app listens on
     # unless Wi-Fi was asked for when the app was built.
     wifi = bool(_settings().get("wifi"))
     listen = [f"0.0.0.0:{PORT}"] if wifi else [f"127.0.0.1:{PORT}", f"[::1]:{PORT}"]
     note(f"listening on :{PORT}" + (" (USB and Wi-Fi)" if wifi else " (USB)"))
+    threading.Thread(target=_keep_computing_loop, daemon=True, name="pn-keepalive").start()
     worker.serve(listen=listen)
+
+
+_continued = "off"  # off | asking | on | expired | refused
+_refused_at = 0.0
+
+
+def continued(state: str) -> str:
+    """The host reports what became of a request to keep computing in the background."""
+    global _continued, _refused_at
+    _continued = state.split(":")[0]
+    if _continued == "refused":
+        _refused_at = time.time()
+    note(f"background computing: {state}")
+    if worker is not None:
+        worker.continued = _continued == "on"
+        worker.notify()
+    return state
+
+
+def _keep_computing_loop() -> None:
+    """Hold an iOS continued-processing task while there is work, so switching
+    apps doesn't suspend it; give it back after a quiet half minute. iOS only
+    grants one while the app is in front, so it is asked for when work arrives."""
+    import ctypes
+    global _continued
+    try:
+        ask = ctypes.CDLL(None).pocketnode_keep_computing
+    except (AttributeError, OSError):
+        return
+    idle_since = time.time()
+    while True:
+        time.sleep(1.0)
+        busy = bool(worker.inflight)
+        if busy:
+            idle_since = time.time()
+        if busy and _continued in ("off", "expired", "refused") and worker.lifecycle == "active" \
+                and time.time() - _refused_at > 60:
+            _continued = "asking"
+            ask(1)
+        elif not busy and _continued == "on" and time.time() - idle_since > 30:
+            ask(0)
 
 
 def lifecycle(state: str) -> str:

@@ -239,23 +239,43 @@ def compute(ex) -> dict:
 
 
 def background(ex, udid: str, seconds: float = 120, other_app: str = "com.apple.Preferences") -> dict:
-    """How long the phone keeps computing after the user switches apps."""
+    """What happens to work on the phone when the user switches to another app.
+
+    Runs a steady BLAS load and a heartbeat, brings another app to the front
+    for `seconds`, then returns: how long the work kept going, how fast, and
+    whether it picked up again afterwards.
+    """
     from .provision.app import config
     from .sources import BUNDLE_ID
-    fut = ex.on("phone").submit(_heartbeat, seconds + 30)
-    time.sleep(10)
+    node = _node(ex, "phone")
+    hb = ex.on("phone").submit(_heartbeat, seconds + 40)
+    burn = ex.on("phone").submit(_burn, seconds + 30, 512)
+    time.sleep(12)
     t_bg = time.time()
-    subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid, other_app],
-                   capture_output=True)
-    time.sleep(seconds)
+    r = subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid, other_app],
+                       capture_output=True)
+    if r.returncode:
+        return {"error": "couldn't bring another app to the front (is the phone unlocked?)"}
+    states = []
+    while time.time() - t_bg < seconds:
+        st = node.state.get("lifecycle")
+        if not states or states[-1][1] != st:
+            states.append((round(time.time() - t_bg, 1), st))
+        time.sleep(0.5)
     subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid,
                     config().get("bundle_id", BUNDLE_ID)], capture_output=True)
-    ticks = fut.result(timeout=seconds + 600)
-    gaps = [(a, b - a) for a, b in zip(ticks, ticks[1:]) if b - a > 2]
-    ran_after_bg = max((t for t in ticks if t >= t_bg), default=t_bg) - t_bg
-    first_gap = next(((a - t_bg) for a, g in gaps if a >= t_bg - 1), None)
-    return {"backgrounded_for_s": seconds, "kept_running_s": round(first_gap if first_gap is not None else ran_after_bg, 1),
-            "gaps": [(round(a - t_bg, 1), round(g, 1)) for a, g in gaps]}
+    ticks = hb.result(timeout=seconds + 600)
+    samples = burn.result(timeout=seconds + 600)
+    gaps = [(round(a - t_bg, 1), round(b - a, 1)) for a, b in zip(ticks, ticks[1:]) if b - a > 2]
+    before = [g for t, g, _ in samples if t < t_bg]
+    during = [g for t, g, _ in samples if t_bg + 6 < t < t_bg + seconds and not any(a <= t - t_bg <= a + n for a, n in gaps)]
+    first_gap = next((a for a, _ in gaps if a >= 0), None)
+    return {"backgrounded_for_s": seconds,
+            "kept_running_s": round(first_gap if first_gap is not None else seconds, 1),
+            "suspended_s": round(sum(n for a, n in gaps if a >= 0), 1),
+            "gflops_foreground": round(sum(before) / len(before)) if before else None,
+            "gflops_background": round(sum(during) / len(during)) if during else None,
+            "lifecycle": states, "resumed": True}
 
 
 def thermal(ex, seconds: float = 600) -> dict:

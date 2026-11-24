@@ -3,7 +3,9 @@
     pocketnode status                 nodes, phone state, link
     pocketnode packages               what's on the phone vs this Mac's environment
     pocketnode packages select        checklist: tick what should be on the phone, see what it costs
-    pocketnode packages add NAME...   put compiled packages on the phone
+    pocketnode packages add NAME...   put compiled packages on the running phone app (seconds, no restart)
+    pocketnode packages remove NAME...  take them off again
+                                      (--bundle: rebuild the app with the change baked in instead)
     pocketnode app build|install      build/install the iOS app (--sim for the simulator)
     pocketnode bench                  link + compute, phone vs Mac
     pocketnode experiments            device experiments that decide design branches
@@ -38,17 +40,21 @@ def cmd_status(args):
 
 
 def cmd_packages(args):
+    from .provision.hot import CantAdd
     from .provision.packages import packages
-    if args.action == "add":
-        packages.add(*args.names, yes=args.yes, when_idle=args.when_idle, sdk=_sdk(args))
-    elif args.action == "remove":
-        packages.remove(*args.names, yes=args.yes, sdk=_sdk(args))
-    elif args.action == "select":
-        packages.select(sdk=_sdk(args))
-    elif args.action == "always-mac":
-        packages.always_mac(*args.names)
-    else:
-        packages(check=not args.fast)
+    try:
+        if args.action == "add":
+            packages.add(*args.names, yes=args.yes, when_idle=args.when_idle, sdk=_sdk(args), bundle=args.bundle)
+        elif args.action == "remove":
+            packages.remove(*args.names, yes=args.yes, sdk=_sdk(args), bundle=args.bundle)
+        elif args.action == "select":
+            packages.select(sdk=_sdk(args), bundle=args.bundle)
+        elif args.action == "always-mac":
+            packages.always_mac(*args.names)
+        else:
+            packages(check=not args.fast)
+    except CantAdd as e:
+        raise SystemExit(str(e))
 
 
 def _sdk(args):
@@ -132,6 +138,8 @@ def main(argv=None) -> None:
     p.add_argument("names", nargs="*")
     p.add_argument("-y", "--yes", action="store_true")
     p.add_argument("--when-idle", action="store_true")
+    p.add_argument("--bundle", action="store_true",
+                   help="rebuild the app with the change baked in instead of changing the running app")
     p.add_argument("--sim", action="store_true")
     p.add_argument("--fast", action="store_true", help="skip the static iOS check")
     p.set_defaults(fn=cmd_packages)

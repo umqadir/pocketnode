@@ -219,3 +219,45 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
   - In the simulator, MLX segfaults because the virtual GPU has no `architecture.name`. GPU numbers wait for the device.
 - [M] A bug in the static check: with chained-fixup binaries, `dyld_info` prints an index before each import (`0x0014 _sym (from Lib)`), which the original regex skipped. Those binaries passed unchecked until this was fixed.
 - [M] Verification of each function's first phone result against the Mac (tolerance-aware, with a second Mac run to tell nondeterminism from real differences) is on by default for automatically placed work.
+
+## Device results — Nov 24, 2026 (iPhone 18 Pro, iOS 27.2.1, free Apple ID, Xcode 27.1)
+
+[M] = measured on the phone in this session. The Mac was busy with other jobs all session, so Mac-side timings from today are not a fair reference and are left out.
+
+### Getting onto the device
+- [M] A free personal team works end to end: `xcodebuild -allowProvisioningUpdates -allowProvisioningDeviceRegistration` creates the certificate, registers the phone and issues the profile, but only when the destination names the phone (`id=<udid>`); with a generic destination it stops at "Your team has no devices".
+- [M] The team ID isn't visible in Xcode's UI or to the command line until Xcode has loaded the account's teams once (Settings › Apple Accounts › click the account). After that it is in Xcode's preferences (`IDEProvisioningTeamByIdentifier`), which `pocketnode app install` reads.
+- [M] Developer Mode can't be armed from the Mac when the phone has a passcode (`devmodectl`: "Device has a passcode set"). It is a one-time toggle on the phone. The first launch also needs the developer trusted once in Settings › General › VPN & Device Management.
+- [M] `com.apple.developer.kernel.increased-memory-limit` is granted to a free account. The app sees about 6.1 GB available (`os_proc_available_memory`) on the 12 GB phone, and a probe allocated 5.6 GB before stopping at its safety margin.
+- [M] `devicectl device process launch` fails while the phone is locked. The app keeps the phone awake while it runs, but after a crash the phone locks itself and the Mac can't relaunch the app until it's unlocked.
+- [M] usbmux reaches a listener bound to loopback only, so the app doesn't need to listen on any network interface for USB.
+- [M] Build and install times: first signed build 279 s (signing 328 frameworks one at a time), install 41 s. With per-framework stamps and parallel signing a rebuild that only changes pocketnode itself takes 53–130 s and the install about 30 s.
+
+### Retagged macOS binaries on the device
+- [M] The Mac's own arm64 builds load and run on the phone after retagging, with results matching the Mac: numpy 2.3.4, pandas 2.3.3, scipy 1.16.3, scikit-learn 1.8.0, torch 2.11.0 (autograd, Adam), pyarrow 22, polars 1.40. The simulator had predicted this; device code-signing enforcement didn't change it.
+- [M] One device-only failure: torch's Metal backend calls `-[MTLDevice isLowPower]` while choosing a GPU. That selector exists on macOS only, and on the phone the unrecognized selector aborts the app the first time autograd runs. (The simulator's Metal device answers it, so it never showed there.) The host app now adds `isLowPower`, `isHeadless` and `isRemovable` to the device class at startup.
+- [M] torch's MPS backend is compiled in (`mps.is_built()` is true). It reports unavailable because the app answers "low power"; whether it works on the phone GPU when allowed is untested.
+
+### Code signed after install loads (HANDOFF §3's decisive unknown)
+- [M] A dylib written to the app's data container loads with `dlopen` if it is signed with the app's development certificate **and its signing identifier equals the app's bundle identifier**:
+  `codesign -f -s "Apple Development: …" --identifier dev.pocketnode.app --timestamp=none lib.dylib`
+- [M] What doesn't work: ad-hoc signing; the same certificate with the default identifier (the file name), with any other identifier (including the bundle ID plus a suffix), with SHA-1+SHA-256 digests, with the hardened-runtime flag, or with the app's entitlements attached. Entitlements make no difference either way. The error is always `code signature invalid … (errno=1)`. This is very likely what InjectionNext hit on iOS 26.3.
+- [M] No on-device signing and no copy of the private key on the phone are needed (LiveContainer's approach), and no debugger.
+- [M] A real package confirmed it: kiwisolver's C++ extension, retagged in place, signed that way, unzipped into `Library/Application Support/pocketnode/site` and imported as a plain `.so`. iOS CPython's import system accepts `.cpython-313-iphoneos.so`, `.abi3.so` and `.so` outside frameworks; wrapping extensions as frameworks is an App Store rule, not a loader requirement.
+- Consequence: adding a compiled package doesn't need a rebuild or a restart. Packages added this way keep their normal layout, so the libraries they bundle keep finding each other.
+
+### Subinterpreters and PyTorch
+- [M] Creating any subinterpreter makes `PyGILState_Check()` return true for the rest of the process (CPython sets `gilstate.check_enabled = 0`). PyTorch's autograd engine asserts that it is *not* true, so every `backward()` afterwards fails with "The autograd engine was called while holding the GIL".
+- [M] Fix: subinterpreter work runs on its own threads that never do anything else, and the host app turns the check back on (it is accurate on every other thread). torch autograd and subinterpreter tasks then coexist.
+- [M] Each new subinterpreter spent about 0.45 s importing pocketnode. The package now imports lazily (0.05 s) and the pool is created ahead of the first task.
+- [M] On the phone (2 performance + 4 efficiency cores), six 20M-iteration pure-Python loops finish in 1.15 s against 0.59 s for one: 3.1× the throughput of a single core.
+
+### Speed (phone only)
+- [M] Pure Python: 25–36 M simple loop iterations per second on one core.
+- [M] `float32` matrix multiply through Accelerate (numpy): about 2,000 GFLOPS; `float64`: about 500 GFLOPS. These are far above what NEON cores deliver, so Accelerate is using the chip's matrix extension. Limiting BLAS to one thread doesn't change the figure.
+- [M] scikit-learn random forest (5,000 × 40, 100 trees, `n_jobs=-1`): 0.26 s. torch MLP training step (256 × 512 → 1024 → 10): 0.55–0.65 ms.
+- [M] USB with the cable in use (480 Mb/s): 34 MB/s Mac to phone, round-trip latency 1.1–1.3 ms median. A 320 MB array took 9.0 s the first time and 0.05 s from the phone's cache after that.
+
+### Leaving the app
+- [M] Without a background task: the app is reported in the background within 2 s and throughput drops at once (923 → 53 GFLOPS on the same load). After about 33 s it is suspended. When the app comes back to the front, the same tasks continue and the USB connection is still open; nothing has to be re-sent.
+- [M] The handoff's "Keep computing in the background" button crashed the app: it submitted a continued-processing request whose handler had been registered for the wildcard identifier, which iOS never matches (`_handleSubmissionWithoutRegistrationForTaskRequest` throws). Handlers have to be registered for the exact identifier, just before submitting.

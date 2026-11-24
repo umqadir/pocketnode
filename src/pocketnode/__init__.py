@@ -70,7 +70,7 @@ def _setup_logging() -> None:
 def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True, udid: str | None = None,
             placement: str = "auto", strict: bool = False, version_policy: str = "minor",
             speculate: bool = True, notes: bool = True, verify: bool = True, wait: float | None = None,
-            simulate_phone: bool | str = False) -> "PocketExecutor":
+            simulate_phone: bool | str = False, auto_add: bool = True) -> "PocketExecutor":
     """Start an executor that pools this Mac's cores and the phone.
 
     addresses: extra workers at "host:port" (e.g. the phone over Wi-Fi).
@@ -81,6 +81,8 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
     wait: seconds to wait for the phone to connect before returning.
     simulate_phone: run a local stand-in that behaves like the phone (a path to
         a Python interpreter whose environment mimics the phone's, or True).
+    auto_add: when a task needs a compiled package the phone lacks, put it on the phone
+        in the background (seconds, no restart) while that task runs on the Mac.
     """
     global _current
     from .executor import PocketExecutor
@@ -88,7 +90,7 @@ def connect(*addresses: str, mac_workers: int | None = None, phone: bool = True,
 
     _setup_logging()
     ex = PocketExecutor(placement=placement, strict=strict, version_policy=version_policy,
-                        speculate=speculate, notes=notes, verify=verify)
+                        speculate=speculate, notes=notes, verify=verify, auto_add=auto_add)
     n = os.cpu_count() if mac_workers is None else mac_workers
     if n:
         ex.add_source(LocalWorkers(n))

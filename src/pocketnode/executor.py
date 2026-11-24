@@ -35,6 +35,9 @@ log = logging.getLogger("pocketnode")
 _placement_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("pocketnode_placement", default=None)
 
 THERMAL_SCALE = {"nominal": 1.0, "fair": 1.0, "serious": 0.5, "critical": 0.0}
+# With the app in the background under iOS continued processing, the phone keeps
+# computing at roughly 1/15 of its foreground speed (measured: 108 vs 1,649 GFLOPS).
+BACKGROUND_SLOWDOWN = 15.0
 
 
 # ------------------------------------------------------------------ records
@@ -305,8 +308,10 @@ def _fn_identity(fn, args=()) -> tuple[str, str]:
 class PocketExecutor(Executor):
     def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str = "minor",
                  speculate: bool = True, confirm_errors: bool = True, notes: bool = True,
-                 verify: bool = True):
+                 verify: bool = True, auto_add: bool = True):
         self.session = uuid.uuid4().hex
+        self.auto_add = auto_add
+        self._adding: set[str] = set()  # distributions already offered or added
         # First phone result per function is checked against the Mac before it's trusted.
         self.verify = verify
         self.verified: dict[str, str] = {}  # fn_key -> "pending" | "ok" | "mac"
@@ -324,6 +329,7 @@ class PocketExecutor(Executor):
         self.attempts: dict[str, Attempt] = {}
         self.stats = FnStats()
         self.mac_only: dict[str, tuple[str, str | None]] = {}  # fn_key -> (reason, suggestion)
+        self._mac_only_mod: dict[str, str] = {}  # fn_key -> the missing module that put it in mac_only
         self.missing_packages: dict[str, int] = defaultdict(int)
         self.crashes: dict[str, int] = defaultdict(int)
         self._gone: dict[str, Node] = {}  # disconnected nodes, in case the same worker comes back
@@ -427,13 +433,46 @@ class PocketExecutor(Executor):
         node = next((n for n in self.nodes.values() if _matches(n, what)), None)
         if node is None:
             raise PlacementError(f"no connected node matches {what!r}")
-        req, ev = uuid.uuid4().hex, (threading.Event(), [])
-        self._replies[req] = ev
+        req = uuid.uuid4().hex
+        reply = self.expect(req)
         node.post({"t": "stacks", "req": req})
-        if not ev[0].wait(timeout):
-            self._replies.pop(req, None)
+        msg = reply(timeout)
+        if msg is None:
             raise TimeoutError(f"{node.name} didn't answer (its interpreter may be stuck in native code)")
-        return ev[1][0]
+        return msg.get("text", "")
+
+    def expect(self, req: str) -> Callable[[float | None], dict | None]:
+        """Register for a node's reply to request `req`; call the result to wait for it (None on timeout)."""
+        ev = self._replies[req] = (threading.Event(), [])
+
+        def wait(timeout: float | None) -> dict | None:
+            got = ev[0].wait(timeout)
+            self._replies.pop(req, None)
+            return ev[1][0] if got and ev[1] else None
+
+        return wait
+
+    def packages_changed(self, node: Node, packages: dict, added: dict, failed: dict | None = None) -> None:
+        """A node's packages changed while it runs: route by what it has now."""
+        added_n = {router._norm(d) for d in added}
+        mods = {m for m, i in envinfo.manifest().items() if router._norm(i["dist"]) in added_n}
+        with self._cv:
+            node.hello["packages"] = packages
+            node.packages = {router._norm(k): v for k, v in packages.items()}
+            node.verdicts.clear()
+            for m in mods:
+                node.mac_only_modules.pop(m, None)
+            for key, m in list(self._mac_only_mod.items()):
+                if m in mods:
+                    self.mac_only.pop(key, None)
+                    del self._mac_only_mod[key]
+            for k in list(self.missing_packages):
+                if k in mods or router._norm(k) in added_n:
+                    del self.missing_packages[k]
+            for name, text in (failed or {}).items():
+                node.mac_only_modules[name] = f"{name} is on {node.name} but failed to import there ({text})"
+            self._qgen += 1
+            self._cv.notify_all()
 
     def wait_for(self, what: str = "phone", timeout: float | None = None) -> bool:
         """Block until a node matching `what` (kind or name) is connected."""
@@ -638,6 +677,8 @@ class PocketExecutor(Executor):
         if c is None:
             return None
         tc, _ = node.transfer_cost(task)
+        if node.state.get("lifecycle") == "background-continued":
+            c *= BACKGROUND_SLOWDOWN
         return c * task.weight + tc
 
     def _mac_finish_estimate(self, task: Task, queued: int | None = None) -> float | None:
@@ -663,6 +704,9 @@ class PocketExecutor(Executor):
                 continue
             if node.kind != "mac" and task.placement in ("auto", None):
                 mine = self._estimate(task, node)
+                if mine is None and node.state.get("lifecycle") == "background-continued" \
+                        and any(n.kind == "mac" for n in self.nodes.values()):
+                    continue  # no timing yet, and the phone is at a fraction of its speed: not the place to find out
                 if mine is not None and queued is None:
                     queued = sum(1 for t in self.queue if t.queued)
                 mac = self._mac_finish_estimate(task, queued) if mine is not None else None
@@ -748,6 +792,19 @@ class PocketExecutor(Executor):
         self.attempts[att.id] = att
         node.running[att.id] = att
         node.outbox.put(att)  # sent by the node's own thread, outside the scheduler lock
+        if node.kind == "mac" and not task.shadow and not speculative and task.placement in ("auto", None):
+            # A free Mac slot took it before any phone looked at it. If a phone
+            # couldn't have run it for want of a package, that still counts as a
+            # miss, so the package gets offered (or added) either way.
+            mods = frozenset(task.packed.modules)
+            for n in self.nodes.values():
+                if n.kind == "mac" or n.kind in task.excluded:
+                    continue
+                v = n.verdicts.get(mods)
+                if v is None:
+                    v = n.verdicts[mods] = router.check(task.packed.modules, n, self.version_policy)
+                if not v.ok and v.missing:
+                    self._missing(v.missing, task)
 
     def _send_failed(self, att: Attempt) -> None:
         with self._cv:
@@ -789,10 +846,10 @@ class PocketExecutor(Executor):
                 self._cv.notify_all()
         elif t == "pong":
             node.state = msg.get("state", node.state)
-        elif t == "stacks":
-            ev = self._replies.pop(msg.get("req"), None)
-            if ev:
-                ev[1].append(msg.get("text", ""))
+        elif t in ("stacks", "installed"):
+            ev = self._replies.get(msg.get("req"))
+            if ev and not ev[0].is_set():
+                ev[1].append(msg)
                 ev[0].set()
         elif t == "echo":
             node.source.on_echo(node, msg, bufs) if hasattr(node.source, "on_echo") else None
@@ -872,6 +929,8 @@ class PocketExecutor(Executor):
                                                        + (f". {suggestion}" if suggestion else "")))
             if u.get("kind") not in ("memory", "cache"):  # those depend on the inputs, not the function
                 self.mac_only[task.fn_key] = (reason, suggestion)
+                if u.get("module"):  # undone when the module is added to the node
+                    self._mac_only_mod[task.fn_key] = u["module"]
             self._requeue(task, node, reason, suggestion, quiet=bool(u.get("module")))
             return
         # The task raised. Raise it as-is on the Mac, unless it came from the
@@ -1038,31 +1097,53 @@ class PocketExecutor(Executor):
             node.bandwidth = 0.7 * node.bandwidth + 0.3 * (moved / wire)
 
     def _missing(self, package: str, task: Task) -> None:
-        """A compiled package kept a task off the phone: offer to add it, once, with an estimate."""
-        first = package not in self.missing_packages
-        self.missing_packages[package] += 1
-        if not first or not self.notes:
+        """A compiled package kept a task off the phone: add it in the background (or offer to), once."""
+        info = envinfo.manifest().get(package)  # a module name, or already a distribution
+        dist = info["dist"] if info else package
+        with self._cv:
+            self.missing_packages[dist] += 1
+            if dist in self._adding:
+                return
+            self._adding.add(dist)
+        threading.Thread(target=self._add_missing, args=(dist, task), daemon=True, name="pn-add").start()
+
+    def _add_missing(self, dist: str, task: Task) -> None:
+        try:
+            from .provision import app, hot, packages
+        except ImportError:  # provisioning needs packaging/pyyaml
             return
-
-        def offer():
+        try:
+            packages.record_miss(dist)
+            if router._norm(dist) in {router._norm(n) for n in app.config().get("always_mac", [])}:
+                return
+            est = hot.estimate([dist])
+            if not self.auto_add:
+                how = ", measured" if est["measured"] else ", estimate"
+                self._note(("missing", dist),
+                           f"pocketnode: {dist} isn't on the phone ({task.fn_label} needs it).\n"
+                           f"  add it without restarting anything (~{est['seconds']} s, {est['mb']} MB{how}): "
+                           f"pn.packages.add({dist!r})\n"
+                           f"  or keep it on the Mac without asking again: pn.packages.always_mac({dist!r})")
+                return
+            if est["mb"] > 1500:
+                self._note(("missing", dist),
+                           f"pocketnode: {dist} isn't on the phone ({task.fn_label} needs it). It is large "
+                           f"({est['mb']} MB, about {est['seconds']} s to send): pn.packages.add({dist!r}) adds it")
+                return
             try:
-                from .provision import app, packages
-                packages.record_miss(package)
-                if package in app.config().get("always_mac", []):
-                    return
-                est = packages.estimate([package])
-                how = "measured" if est["measured"] else "first-time estimate"
-                total = est["build_s"] + est["install_s"]
-                when = f"~{total // 60} min" if total >= 90 else f"~{total} s"
-                self._note(("missing", package),
-                           f"pocketnode: {package} isn't on the phone, so {task.fn_label} ran on the Mac.\n"
-                           f"  add it ({when}: build ~{est['build_s']} s, install/restart ~{est['install_s']} s, "
-                           f"{how}): pn.packages.add({package!r})\n"
-                           f"  or keep it on the Mac without asking again: pn.packages.always_mac({package!r})")
-            except Exception:  # noqa: BLE001 - the offer is advisory
-                log.debug("pocketnode: couldn't estimate adding %s", package, exc_info=True)
-
-        threading.Thread(target=offer, daemon=True).start()
+                r = hot.add(self, [dist])
+            except Exception as e:  # noqa: BLE001
+                self._note(("missing", dist), f"pocketnode: couldn't add {dist} to the phone ({e}); "
+                                              "tasks that need it run on the Mac")
+                return
+            if r.get("excluded"):
+                parts = "; ".join(f"{m}: {why}" for m, why in list(r["excluded"].items())[:3])
+                more = len(r["excluded"]) - 3
+                self._note(("excluded", dist), f"pocketnode: parts of {dist} can't run on iOS ({parts}"
+                                               + (f"; and {more} more" if more > 0 else "")
+                                               + "); tasks using them run on the Mac")
+        except Exception:  # noqa: BLE001 - advisory: the task already runs on the Mac
+            log.debug("pocketnode: couldn't add %s", dist, exc_info=True)
 
     def _note(self, key, text: str) -> None:
         if not self.notes:

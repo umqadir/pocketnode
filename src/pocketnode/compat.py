@@ -95,19 +95,29 @@ class _PostImportFinder:
 
 
 def _redirect_ctypes() -> None:
-    """Route ctypes loads of relocated dylibs to their frameworks.
+    resolve = _resolver(Path(sys.prefix).parent)
+    real_init = ctypes.CDLL.__init__
 
-    Staging moves every bundled dylib (e.g. torch/lib/libtorch_global_deps.dylib)
-    into Frameworks/ so it can be signed. Packages that ctypes-load those files
-    by path, or that guess a `.so` suffix because platform.system() isn't
-    "Darwin", get the framework binary instead.
+    def __init__(self, name, *a, **k):
+        real_init(self, resolve(name), *a, **k)
+
+    ctypes.CDLL.__init__ = __init__
+
+
+def _resolver(bundle: Path):
+    """Where a ctypes load of `name` should really go.
+
+    Packages that guess a `.so` suffix because platform.system() isn't "Darwin"
+    (torch does) get the `.dylib` next to it. Staging for the app bundle also
+    moves every bundled dylib (e.g. torch/lib/libtorch_global_deps.dylib) into
+    Frameworks/ so it can be signed; loads of those by path get the framework
+    binary. Packages added to a running app keep their layout.
     """
-    bundle = Path(sys.prefix).parent
     pk = bundle / "app_packages"
     try:
         moved = json.loads((pk / "pocketnode_dylib_map.json").read_text())
     except OSError:
-        return
+        moved = {}
     by_name = {}
     for rel, fw in moved.items():
         by_name.setdefault(Path(rel).name, fw)
@@ -118,6 +128,10 @@ def _redirect_ctypes() -> None:
             return name
         s = os.fspath(name)
         if not os.path.isabs(s) or os.path.exists(s):
+            return name
+        if s.endswith(".so") and os.path.exists(s[:-3] + ".dylib"):
+            return s[:-3] + ".dylib"
+        if not moved:
             return name
         try:
             rel = str(Path(s).resolve().relative_to(pk.resolve()))
@@ -130,12 +144,7 @@ def _redirect_ctypes() -> None:
             fw = by_name.get(Path(s).name)
         return str(bundle / fw) if fw else name
 
-    real_init = ctypes.CDLL.__init__
-
-    def __init__(self, name, *a, **k):
-        real_init(self, resolve(name), *a, **k)
-
-    ctypes.CDLL.__init__ = __init__
+    return resolve
 
 
 def _stub_multiprocessing() -> None:

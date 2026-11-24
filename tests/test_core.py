@@ -9,13 +9,17 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-import pocketnode as pn
+# Keep test runs out of the real config: measured install times, misses, always_mac.
+os.environ["POCKETNODE_HOME"] = tempfile.mkdtemp(prefix="pn-test-home-")
+
+import pocketnode as pn  # noqa: E402
 from pocketnode.errors import PlacementError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,7 +31,7 @@ def ex():
     if not SIM_PY.exists():
         pytest.skip("create the phone stand-in env: uv venv .phone-sim && uv pip install --python "
                     ".phone-sim/bin/python numpy cloudpickle")
-    e = pn.connect(mac_workers=2, phone=False, simulate_phone=str(SIM_PY), notes=False)
+    e = pn.connect(mac_workers=2, phone=False, simulate_phone=str(SIM_PY), notes=False, auto_add=False)
     assert e.wait_for("phone", 30)
     assert e.wait_for("mac", 30)
     yield e
@@ -367,6 +371,7 @@ def test_verification_ignores_fields_that_vary_but_checks_the_rest(ex):
     # Like scikit-learn's _fit_and_score: timings differ on every run, scores must not.
     def timed_ok(i):
         import time
+        time.sleep(0.05)  # long enough that two Mac workers can't finish all of them before the phone takes one
         return {"fit_time": time.perf_counter(), "score": i * 2.0}
 
     def timed_wrong(i):
@@ -374,8 +379,8 @@ def test_verification_ignores_fields_that_vary_but_checks_the_rest(ex):
         import time
         return {"fit_time": time.perf_counter(), "score": 41.0 if sys.prefix.endswith(".phone-sim") else 42.0}
 
-    futs = [ex.submit(timed_ok, i) for i in range(20)]
-    assert [f.result()["score"] for f in futs] == [i * 2.0 for i in range(20)]
+    futs = [ex.submit(timed_ok, i) for i in range(60)]
+    assert [f.result()["score"] for f in futs] == [i * 2.0 for i in range(60)]
     assert any(f.placement.kind == "phone" for f in futs), "a function with a timing field still uses the phone"
     futs = [ex.submit(timed_wrong, i) for i in range(12)]
     assert all(f.result()["score"] == 42.0 for f in futs)
@@ -436,6 +441,50 @@ def test_cancelled_duplicates_leave_every_phone_slot_working(ex):
     futs = [ex.on("phone").submit(nap) for _ in range(node.slots)]
     assert sum(f.result(timeout=30) for f in futs) == node.slots
     assert time.time() - t0 < 4.0, "all phone slots ran at once"
+
+
+def test_cancelling_a_subinterpreter_task_frees_its_slot(ex):
+    # Pure-Python tasks run in subinterpreters on the phone; a cancel must stop
+    # them there too, not leave them spinning in a slot the Mac thinks is free.
+    node = phone(ex)
+
+    def spin():
+        import time
+        t = time.time()
+        while time.time() - t < 15:
+            pass
+        return "finished"
+
+    f = ex.on("phone").submit(spin)
+    deadline = time.time() + 10
+    att = None
+    while att is None and time.time() < deadline:
+        att = next((a for a in list(node.running.values()) if a.task.future is f), None)
+        time.sleep(0.05)
+    assert att is not None
+    time.sleep(0.5)  # well inside the loop
+    with ex._cv:  # what the scheduler does when another copy wins
+        ex.attempts.pop(att.id, None)
+        node.running.pop(att.id, None)
+        node.post({"t": "cancel", "id": att.id})
+
+    def nap():
+        import time
+        time.sleep(2.0)
+        return 1
+
+    # One round of naps takes about 2.5 s; a lost slot forces a second round.
+    t0 = time.time()
+    futs = [ex.on("phone").submit(nap) for _ in range(node.slots)]
+    assert sum(_result_or_dump(ex, g) for g in futs) == node.slots
+    assert time.time() - t0 < 3.5, "the cancelled task still holds a phone slot"
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        _result_or_dump(ex, ex.on("phone").submit(lambda: 0))
+        if node.state.get("running") == 0:
+            break
+        time.sleep(0.1)
+    assert node.state.get("running") == 0
 
 
 def test_c_level_relative_write_goes_to_mac(ex):
@@ -520,6 +569,74 @@ def test_input_bigger_than_the_phone_cache(tmp_path):
         src.stop()
         e.shutdown(wait=False)
         proc.kill()
+
+
+def _uses_yaml(pause=0.0):
+    import time
+    import yaml
+    time.sleep(pause)
+    return yaml.__version__
+
+
+def test_add_compiled_package_to_running_phone(tmp_path):
+    # PyYAML is compiled, installed here and absent from the stand-in's environment.
+    yaml = pytest.importorskip("yaml")
+    from pocketnode.provision import hot
+    from pocketnode.sources import Address
+    proc, port = _standalone_phone(tmp_path)
+    e = pn.PocketExecutor(notes=False, auto_add=False)
+    src = Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5)
+    e.add_source(src)
+    try:
+        assert e.wait_for("phone", 20)
+        with pytest.raises(PlacementError, match="PyYAML"):
+            e.on("phone").submit(_uses_yaml).result(timeout=30)
+        r = hot.add(e, ["PyYAML"])
+        assert "PyYAML" in r["added"] and not r["failed"], r
+        assert e.on("phone").submit(_uses_yaml).result(timeout=30) == yaml.__version__
+        assert "PyYAML" in hot.remove(e, ["PyYAML"])["removed"]
+    finally:
+        src.stop()
+        e.shutdown(wait=False)
+        proc.kill()
+
+
+def test_missing_package_is_added_automatically(tmp_path):
+    yaml = pytest.importorskip("yaml")
+    from pocketnode.sources import Address, LocalWorkers
+    proc, port = _standalone_phone(tmp_path)
+    e = pn.PocketExecutor(notes=False, auto_add=True)
+    srcs = [LocalWorkers(1), Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5)]
+    for s in srcs:
+        e.add_source(s)
+    try:
+        assert e.wait_for("phone", 20) and e.wait_for("mac", 30)
+        # The one Mac slot is busy with the first, so the phone considers the rest.
+        futs = [e.submit(_uses_yaml, 0.3) for _ in range(3)]
+        assert [f.result(timeout=60) for f in futs] == [yaml.__version__] * 3
+        deadline = time.time() + 60
+        while time.time() < deadline and not any("pyyaml" in n.packages for n in e.nodes.values()
+                                                 if n.kind == "phone"):
+            time.sleep(0.2)
+        assert any("pyyaml" in n.packages for n in e.nodes.values() if n.kind == "phone")
+        assert e.on("phone").submit(_uses_yaml).result(timeout=30) == yaml.__version__
+    finally:
+        for s in srcs:
+            s.stop()
+        e.shutdown(wait=False)
+        proc.kill()
+
+
+def test_ctypes_so_guess_finds_the_dylib(tmp_path):
+    # torch guesses `.so` when platform.system() isn't "Darwin", as on iOS.
+    from pocketnode import compat
+    lib = tmp_path / "pkg" / "lib"
+    lib.mkdir(parents=True)
+    (lib / "libfoo.dylib").write_bytes(b"")
+    resolve = compat._resolver(tmp_path)
+    assert resolve(str(lib / "libfoo.so")) == str(lib / "libfoo.dylib")
+    assert resolve(str(lib / "libbar.so")) == str(lib / "libbar.so")
+    assert resolve("libfoo.so") == "libfoo.so"
 
 
 def test_large_buffers_hash_the_same_in_pieces():

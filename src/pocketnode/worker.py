@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import importlib
 import queue
 import ctypes
 import io
 import json
 import os
+import shutil
 import socket
 import sys
 import tempfile
@@ -24,17 +26,19 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import compat, device, guards, serialize, subinterp
 from .errors import TaskCancelled, Unavailable
-from .importer import RemoteFinder, install as install_finder
+from .importer import RemoteFinder, _local_versions, _norm, install as install_finder
 from .store import BufferStore
 from .wire import Connection, ConnectionClosed, digest, server_handshake
 
 PROTOCOL = 1
 DEFAULT_PORT = 7151
+SHIMS = "_pocketnode_shims"  # shared by every added package: merged, never replaced
 
 
 # ------------------------------------------------------------ stdout capture
@@ -114,7 +118,7 @@ def _env_key(manifest) -> str | None:
 class Worker:
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
-                 node_kind: str | None = None):
+                 node_kind: str | None = None, site_dir: str | None = None):
         self.token = token
         self.phone = device.IS_IOS if phone is None else phone
         self.kind = node_kind or ("phone" if self.phone else "mac")
@@ -125,6 +129,13 @@ class Worker:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.scratch = self.cache_dir / "scratch"
         self.scratch.mkdir(exist_ok=True)
+        # Packages added while the app runs. First on sys.path, so an added
+        # version wins over one bundled with the app.
+        self.site = Path(site_dir or self.cache_dir / "site")
+        self.site.mkdir(parents=True, exist_ok=True)
+        if str(self.site) not in sys.path:
+            sys.path.insert(0, str(self.site))
+        self._installs: dict[str, set[str] | None] = {}  # req -> modules loaded before it (None: failed)
         self.store = BufferStore(store_budget or self._default_budget())
         self.pool = ThreadPoolExecutor(self.slots, thread_name_prefix="pn-task")
         self.sessions: dict[str, _Session] = {}
@@ -134,6 +145,7 @@ class Worker:
         self.inflight: set[str] = set()      # accepted and not yet finished
         self.running: dict[str, int] = {}    # task id -> thread ident, only while user code runs
         self.cancelled: set[str] = set()
+        self._sub_cancels: dict[str, Callable[[], None]] = {}  # task id -> interrupts its subinterpreter run
         self._reserved: dict[str, list[str]] = {}  # task id -> buffer hashes it holds in the store
         self._lock = threading.RLock()
         self._tl = threading.local()
@@ -150,11 +162,11 @@ class Worker:
         compat.install()
         self._phone_dirs = tuple(
             os.path.realpath(p) for p in {sys.prefix, sys.base_prefix, os.path.dirname(os.__file__),
-                                           str(self.finder.cache_dir), *[p for p in sys.path if p]}
+                                           str(self.finder.cache_dir), str(self.site), *[p for p in sys.path if p]}
         )
         roots = None
         if self.phone:
-            roots = [str(self.cache_dir), tempfile.gettempdir(), sys.prefix, sys.base_prefix,
+            roots = [str(self.cache_dir), str(self.site), tempfile.gettempdir(), sys.prefix, sys.base_prefix,
                      os.path.dirname(os.__file__), "/System", "/usr/lib", "/usr/share", "/dev",
                      "/private/var/db/timezone", "/var/db/timezone", "/etc", "/private/etc",
                      os.path.expanduser("~"), *[p for p in sys.path if p and os.path.isabs(p)]]
@@ -188,13 +200,18 @@ class Worker:
 
     # -------------------------------------------------------- capabilities
 
-    def hello(self) -> dict:
+    def packages(self) -> dict[str, str]:
         import importlib.metadata as md
-        pkgs = {}
+        pkgs, seen = {}, set()
         for d in md.distributions():
             n = d.metadata["Name"]
-            if n:
+            # The first copy on sys.path is the one that imports (an added one before a bundled one).
+            if n and _norm(n) not in seen:
+                seen.add(_norm(n))
                 pkgs[n] = d.version
+        return pkgs
+
+    def hello(self) -> dict:
         return {
             "protocol": PROTOCOL,
             "id": self.id,
@@ -209,17 +226,21 @@ class Worker:
             "cores": device.core_layout(),
             "model": device.model(),
             "memory": device.total_memory(),
-            "packages": pkgs,
+            "packages": self.packages(),
             "stdlib_missing": _stdlib_missing(),
             "state": self.state(),
             "store": self.store.stats(),
             "last_crash": self.last_crash,
+            "simulator": bool(os.environ.get("SIMULATOR_UDID")),
+            "site": str(self.site),
+            "disk_free": shutil.disk_usage(self.site).free,
         }
 
     def state(self) -> dict:
         s = device.snapshot()
         s["lifecycle"] = self.lifecycle
         s["running"] = len(self.inflight)
+        s["continued"] = bool(getattr(self, "continued", False))  # iOS background computing is armed
         if self.sub_fallbacks:
             s["sub_fallbacks"] = dict(list(self.sub_fallbacks.items())[-8:])
         s.update(self.override)
@@ -427,6 +448,140 @@ class Worker:
             self._send({"t": "stacks", "req": msg.get("req"), "text": text[-60000:]}, sid=sid)
         elif t == "echo":  # throughput probe
             self._send({"t": "echo", "n": sum(len(b) for b in bufs)}, bufs if msg.get("back") else (), sid=sid)
+        elif t == "install":
+            self._on_install(sid, msg, bufs)
+        elif t == "uninstall":
+            threading.Thread(target=self._uninstall, args=(sid, msg), daemon=True, name="pn-install").start()
+        elif t == "restart":
+            def bye():
+                time.sleep(0.5)  # let queued replies go out
+                os._exit(0)
+            threading.Thread(target=bye, daemon=True, name="pn-restart").start()
+
+    # ------------------------------------------------- packages added live
+
+    def _on_install(self, sid: str, msg: dict, bufs: list[bytearray]) -> None:
+        """One batch of an added package's files. They land in an incoming
+        directory; the last batch moves them into the site directory."""
+        req = str(msg["req"])
+        inc = self.site.parent / f"site.incoming-{req}"
+        try:
+            if msg.get("seq", 0) == 0:
+                shutil.rmtree(inc, ignore_errors=True)
+                inc.mkdir(parents=True)
+                self._installs[req] = {m.split(".")[0] for m in list(sys.modules)}
+            elif self._installs.get(req, False) is None:  # an earlier batch failed and said so
+                if msg.get("last"):
+                    self._installs.pop(req, None)
+                return
+            elif req not in self._installs:
+                raise RuntimeError("files arrived for an install that never started")
+            files = msg.get("files", [])
+            if len(files) != len(bufs):
+                raise ValueError(f"{len(files)} files listed but {len(bufs)} sent")
+            for f, b in zip(files, bufs):
+                rel = Path(f["p"])
+                if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+                    raise ValueError(f"refusing to write {f['p']!r} outside the site directory")
+                dst = inc / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with open(dst, "wb") as fh:
+                    fh.write(b)
+                os.chmod(dst, 0o755 if f.get("x") else 0o644)
+            if msg.get("last"):
+                before = self._installs.pop(req)
+                # Not a task slot: those may all be busy for a long time.
+                threading.Thread(target=self._finish_install, args=(sid, req, inc, before),
+                                 daemon=True, name="pn-install").start()
+        except Exception as e:  # noqa: BLE001 - must not take down the session's reader
+            self._installs[req] = None
+            if msg.get("last"):
+                self._installs.pop(req, None)
+            shutil.rmtree(inc, ignore_errors=True)
+            self._send({"t": "installed", "req": req,
+                        "error": f"writing the files on {self.name} failed: {type(e).__name__}: {e}"}, sid=sid)
+
+    def _finish_install(self, sid: str, req: str, inc: Path, before: set[str]) -> None:
+        try:
+            names, tops = set(), set()
+            for e in sorted(inc.iterdir()):
+                dst = self.site / e.name
+                tops.add(e.name.split(".")[0])
+                if e.name == SHIMS and e.is_dir() and dst.is_dir():
+                    for c in e.iterdir():
+                        _remove(dst / c.name)
+                        os.replace(c, dst / c.name)
+                    continue
+                _remove(dst)
+                os.replace(e, dst)
+                top = _importable(dst)
+                if top:
+                    names.add(top)
+            shutil.rmtree(inc, ignore_errors=True)
+            self._refresh_imports(tops)
+            # A native library can't be swapped under a running process: modules
+            # already loaded switch to the new version when the app restarts.
+            restart = sorted(n for n in names if n in before)
+            failed = {}
+            for n in sorted(names - set(restart)):
+                try:
+                    importlib.import_module(n)
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except BaseException as e:  # noqa: BLE001 - reported to the Mac
+                    failed[n] = f"{type(e).__name__}: {e}"[:300]
+            reply = {"t": "installed", "req": req, "packages": self.packages(), "failed": failed, "restart": restart}
+        except BaseException as e:  # noqa: BLE001
+            shutil.rmtree(inc, ignore_errors=True)
+            reply = {"t": "installed", "req": req,
+                     "error": f"installing on {self.name} failed: {type(e).__name__}: {e}"}
+        self._send(reply, sid=sid)
+
+    def _uninstall(self, sid: str, msg: dict) -> None:
+        import importlib.metadata as md
+        req = msg.get("req")
+        try:
+            want = {_norm(n): n for n in msg.get("dists", ())}
+            removed, bundled, tops = [], [], set()
+            for d in md.distributions(path=[str(self.site)]):
+                n = d.metadata["Name"]
+                if not n or _norm(n) not in want:
+                    continue
+                entries = {f.parts[0] for f in d.files or () if f.parts}
+                info = getattr(d, "_path", None)
+                if info is not None:
+                    entries.add(Path(info).name)
+                for first in entries:
+                    if first.startswith("..") or os.path.isabs(first) or first == SHIMS:
+                        continue
+                    _remove(self.site / first)
+                    tops.add(first.split(".")[0])
+                removed.append(n)
+                want.pop(_norm(n), None)
+            for key, n in want.items():
+                try:
+                    md.distribution(n)
+                    bundled.append(n)
+                except md.PackageNotFoundError:
+                    pass
+            loaded = {m.split(".")[0] for m in list(sys.modules)}
+            restart = sorted(t for t in tops if t in loaded)
+            self._refresh_imports(tops)
+            reply = {"t": "installed", "req": req, "packages": self.packages(), "removed": removed,
+                     "bundled": bundled, "restart": restart}
+        except BaseException as e:  # noqa: BLE001
+            reply = {"t": "installed", "req": req,
+                     "error": f"removing on {self.name} failed: {type(e).__name__}: {e}"}
+        self._send(reply, sid=sid)
+
+    def _refresh_imports(self, tops: set[str]) -> None:
+        importlib.invalidate_caches()
+        f = self.finder
+        with f._lock:
+            for n in tops:
+                f.resolved.pop(n, None)
+                f.missing_compiled.pop(n, None)
+            f.local_versions = _local_versions()
 
     def _accept_task(self, msg: dict, bufs: list[bytearray]) -> None:
         # bufs[0] is the pickle; then inline buffers for specs with "i": 1.
@@ -501,7 +656,8 @@ class Worker:
         User code running in the main interpreter is interrupted with an
         asynchronous exception. It is only ever posted while the task's thread
         is registered in `running`, under the lock that _unregister takes, so
-        it can't land in a later task or in the thread pool's own loop.
+        it can't land in a later task or in the thread pool's own loop. A task in
+        a subinterpreter is interrupted there (see subinterp._RUNNER).
         """
         with self._lock:
             if tid not in self.inflight or tid in self.cancelled:
@@ -511,6 +667,9 @@ class Worker:
             ident = self.running.get(tid)
             if ident:
                 ctypes.pythonapi.PyThreadState_SetAsyncExc(ctypes.c_ulong(ident), ctypes.py_object(TaskCancelled))
+            sub_cancel = self._sub_cancels.get(tid)
+            if sub_cancel is not None:
+                sub_cancel()  # only writes a byte to a pipe
         if waiting is not None:
             self._cleanup(tid)
 
@@ -533,6 +692,7 @@ class Worker:
             self.inflight.discard(tid)
             cancelled = tid in self.cancelled
             self.cancelled.discard(tid)
+            self._sub_cancels.pop(tid, None)
             hashes = self._reserved.pop(tid, None)
         if hashes:
             self.store.release(hashes)
@@ -658,14 +818,26 @@ class Worker:
 
     def _run_sub(self, msg, payload, views, header, t0, t1) -> list | None:
         """Run a pure task in a subinterpreter. None means: run it in the main interpreter."""
-        fk = msg.get("fk")
+        fk, tid = msg.get("fk"), msg["id"]
+
+        def on_cancel(cancel):
+            with self._lock:
+                self._sub_cancels[tid] = cancel
+                if tid in self.cancelled:
+                    cancel()
+
         try:
             self._prefetch(msg.get("mods", ()))
-            out = self.subpool.run(payload, views)
+            out = self.subpool.run(payload, views, on_cancel=on_cancel)
         except Exception as e:  # noqa: BLE001 - infrastructure trouble: fall back
             out = {"status": "needs-main", "detail": repr(e)}
+        finally:
+            with self._lock:
+                self._sub_cancels.pop(tid, None)
         t3 = time.perf_counter()
         status = out["status"]
+        if status == "cancelled":
+            raise TaskCancelled
         if status == "needs-main":
             # Usually a module the main interpreter fetches on first import; after
             # that the subinterpreter finds it too. Twice means it can't run there.
@@ -731,6 +903,26 @@ class Worker:
             self._pending_imports.pop(req, None)
 
 
+def _remove(p: Path) -> None:
+    if p.is_dir() and not p.is_symlink():
+        shutil.rmtree(p)
+    elif p.exists() or p.is_symlink():
+        p.unlink()
+
+
+def _importable(p: Path) -> str | None:
+    """The top-level module name a site-directory entry provides, if any."""
+    if p.name == SHIMS or p.name.endswith((".dist-info", ".data")):
+        return None
+    if p.is_dir():
+        if (p / "__init__.py").exists() or any(p.rglob("*.so")):
+            return p.name
+        return None
+    if p.name.endswith((".py", ".so")):
+        return p.name.split(".")[0]
+    return None
+
+
 def _format_exc(exc: BaseException) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
@@ -768,13 +960,14 @@ def main(argv=None) -> None:
     ap.add_argument("--name")
     ap.add_argument("--kind")
     ap.add_argument("--store-budget", type=int, help="bytes of input data to keep cached")
+    ap.add_argument("--site-dir", help="where packages added at runtime go (default: under the cache dir)")
     a = ap.parse_args(argv)
     import faulthandler
     import signal
     faulthandler.register(signal.SIGUSR1, file=sys.__stderr__, all_threads=True)  # `kill -USR1` dumps stacks
     w = Worker(_read_token(a.token_file), slots=a.slots, cache_dir=a.cache_dir,
                phone=a.phone or None, name=a.name, node_kind=a.kind,
-               store_budget=a.store_budget)
+               store_budget=a.store_budget, site_dir=a.site_dir)
     w.serve(listen=a.listen, unix=a.unix, connect=a.connect,
             ready=lambda addr: print(json.dumps({"ready": str(addr)}), file=sys.__stdout__, flush=True))
 
