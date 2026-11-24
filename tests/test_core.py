@@ -361,3 +361,171 @@ def test_nondeterministic_function_still_uses_phone(ex):
 
     futs = [ex.submit(noisy) for _ in range(20)]
     assert all(0 <= f.result() < 1 for f in futs)
+
+
+def test_verification_ignores_fields_that_vary_but_checks_the_rest(ex):
+    # Like scikit-learn's _fit_and_score: timings differ on every run, scores must not.
+    def timed_ok(i):
+        import time
+        return {"fit_time": time.perf_counter(), "score": i * 2.0}
+
+    def timed_wrong(i):
+        import sys
+        import time
+        return {"fit_time": time.perf_counter(), "score": 41.0 if sys.prefix.endswith(".phone-sim") else 42.0}
+
+    futs = [ex.submit(timed_ok, i) for i in range(20)]
+    assert [f.result()["score"] for f in futs] == [i * 2.0 for i in range(20)]
+    assert any(f.placement.kind == "phone" for f in futs), "a function with a timing field still uses the phone"
+    futs = [ex.submit(timed_wrong, i) for i in range(12)]
+    assert all(f.result()["score"] == 42.0 for f in futs)
+
+
+def test_batches_are_identified_by_the_function_inside():
+    pytest.importorskip("joblib")
+    from joblib import delayed
+    from joblib.parallel import BatchedCalls
+    from pocketnode.executor import _fn_identity, _run_chunk, _unwrap
+
+    def f(x):
+        return x
+
+    def g(x):
+        return x + 1
+
+    def key(batch):
+        inner, weight, args = _unwrap(batch, ())
+        return _fn_identity(inner, args)[0], weight
+
+    bf = BatchedCalls([delayed(f)(1), delayed(f)(2)], ("threading", 1))
+    bg = BatchedCalls([delayed(g)(1)], ("threading", 1))
+    assert key(bf)[1] == 2 and key(bg)[1] == 1
+    assert key(bf)[0] != key(bg)[0]
+    inner, weight, args = _unwrap(_run_chunk, (f, [(1,), (2,), (3,)]))
+    assert inner is f and weight == 3 and args == (1,)
+    assert _fn_identity(f, (1,))[0] != _fn_identity(f, ("a",))[0]
+
+
+def test_cancelled_duplicates_leave_every_phone_slot_working(ex):
+    # Tasks the Mac finishes first are cancelled on the phone mid-run. The
+    # cancel must never land outside the task it was meant for.
+    node = phone(ex)
+
+    def spin_on_phone(i):
+        import sys
+        import time
+        if sys.prefix.endswith(".phone-sim"):
+            t = time.time()
+            while time.time() - t < 20:
+                sum(range(2000))
+        return i
+
+    for _ in range(3):
+        futs = [ex.submit(spin_on_phone, i) for i in range(10)]
+        assert [f.result(timeout=30) for f in futs] == list(range(10))
+
+    def nap():
+        import time
+        time.sleep(1.0)
+        return 1
+
+    deadline = time.time() + 10
+    while node.running and time.time() < deadline:
+        time.sleep(0.05)
+    t0 = time.time()
+    futs = [ex.on("phone").submit(nap) for _ in range(node.slots)]
+    assert sum(f.result(timeout=30) for f in futs) == node.slots
+    assert time.time() - t0 < 4.0, "all phone slots ran at once"
+
+
+def test_c_level_relative_write_goes_to_mac(ex):
+    # A relative path written from C (pyarrow, HDF5, ...) bypasses the Python
+    # guards. The phone's working directory refuses it, so the Mac runs it.
+    def write_from_c():
+        import ctypes
+        import os
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.open(b"pn-c-write.bin", os.O_CREAT | os.O_WRONLY, 0o644)
+        if fd < 0:
+            raise OSError(ctypes.get_errno(), "open failed")
+        os.close(fd)
+        return "written"
+
+    try:
+        f = ex.submit(write_from_c)
+        assert f.result(timeout=30) == "written"
+        assert f.placement.kind == "mac"
+        assert Path("pn-c-write.bin").exists(), "the file is on the Mac, where the user asked for it"
+    finally:
+        Path("pn-c-write.bin").unlink(missing_ok=True)
+
+
+def _standalone_phone(tmp_path, *extra):
+    import socket
+    import subprocess
+    tok = tmp_path / "token"
+    tok.write_text("t0ken")
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    proc = subprocess.Popen([str(SIM_PY), "-m", "pocketnode.worker", "--listen", f"127.0.0.1:{port}",
+                             "--token-file", str(tok), "--phone", "--kind", "phone", "--name", "standalone",
+                             "--cache-dir", str(tmp_path / "cache"), *extra],
+                            env={**os.environ, "PYTHONPATH": str(ROOT / "src")}, stdout=subprocess.DEVNULL)
+    return proc, port
+
+
+def test_two_sessions_share_the_phone(tmp_path):
+    from pocketnode.sources import Address
+    proc, port = _standalone_phone(tmp_path)
+    a, b = pn.PocketExecutor(notes=False), pn.PocketExecutor(notes=False)
+    srcs = []
+    try:
+        for e in (a, b):
+            srcs.append(Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5))
+            e.add_source(srcs[-1])
+        assert a.wait_for("phone", 20) and b.wait_for("phone", 20)
+
+        def work(tag, i):
+            import time
+            time.sleep(0.05)
+            return tag, i
+
+        fa = [a.on("phone").submit(work, "a", i) for i in range(20)]
+        fb = [b.on("phone").submit(work, "b", i) for i in range(20)]
+        assert [f.result(timeout=30) for f in fa] == [("a", i) for i in range(20)]
+        assert [f.result(timeout=30) for f in fb] == [("b", i) for i in range(20)]
+        assert a.nodes and b.nodes, "neither session was kicked off"
+    finally:
+        for s in srcs:
+            s.stop()
+        a.shutdown(wait=False)
+        b.shutdown(wait=False)
+        proc.kill()
+
+
+def test_input_bigger_than_the_phone_cache(tmp_path):
+    from pocketnode.sources import Address
+    proc, port = _standalone_phone(tmp_path, "--store-budget", str(1 << 20))
+    e = pn.PocketExecutor(notes=False)
+    src = Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5)
+    e.add_source(src)
+    try:
+        assert e.wait_for("phone", 20)
+        x = np.arange(1_000_000, dtype="float64")  # 8 MB against a 1 MB cache
+        futs = [e.on("phone").submit(lambda a, i: float(a[i]), x, i) for i in range(4)]
+        assert [f.result(timeout=30) for f in futs] == [0.0, 1.0, 2.0, 3.0]
+    finally:
+        src.stop()
+        e.shutdown(wait=False)
+        proc.kill()
+
+
+def test_large_buffers_hash_the_same_in_pieces():
+    from pocketnode.wire import digest
+    x = np.random.default_rng(5).integers(0, 255, 20_000_003, dtype="uint8")
+    assert digest(x) == digest(bytes(x)) == digest(memoryview(x))
+    y = x.copy()
+    y[12_345_678] ^= 1
+    assert digest(x) != digest(y)

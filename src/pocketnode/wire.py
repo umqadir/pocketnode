@@ -26,18 +26,62 @@ _IOV_MAX = 512
 _CHUNK = 8 << 20
 
 
+# Until a peer has proved it holds the pairing token, it may only send small
+# JSON frames: nothing it says can make us allocate much or unpickle anything.
+_PREAUTH_HEADER_MAX = 4 << 20
+HANDSHAKE_TIMEOUT = 15.0
+
+
 class ConnectionClosed(ConnectionError):
     pass
 
 
+class Refused(ConnectionError):
+    """The worker is paired with us but can't take this session right now."""
+
+
+_TREE_MIN = 8 << 20
+_TREE_CHUNK = 4 << 20
+_hash_pool = None
+
+
 def digest(buf) -> str:
-    """Content address of a buffer (hardware-accelerated SHA-256 on Apple chips)."""
-    return hashlib.sha256(buf).hexdigest()[:32]
+    """Content address of a buffer (hardware-accelerated SHA-256 on Apple chips).
+
+    Large buffers are hashed as fixed 4 MB chunks in parallel (hashlib releases
+    the GIL) and the chunk digests are hashed together, so a 1 GB array costs a
+    fraction of a second instead of most of one. The chunking is fixed, so the
+    Mac and the phone always compute the same address.
+    """
+    view = memoryview(buf)
+    if view.nbytes < _TREE_MIN:
+        return hashlib.sha256(view).hexdigest()[:32]
+    global _hash_pool
+    if _hash_pool is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _hash_pool = ThreadPoolExecutor(min(8, os.cpu_count() or 2), thread_name_prefix="pn-hash")
+    view = view.cast("B") if view.format != "B" or view.ndim != 1 else view
+    parts = _hash_pool.map(lambda i: hashlib.sha256(view[i:i + _TREE_CHUNK]).digest(),
+                           range(0, view.nbytes, _TREE_CHUNK))
+    top = hashlib.sha256(b"pn-tree:%d:" % view.nbytes)
+    for d in parts:
+        top.update(d)
+    return top.hexdigest()[:32]
 
 
 def tune(sock: socket.socket) -> None:
     if sock.family in (socket.AF_INET, socket.AF_INET6):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Kernel keepalive notices a peer that vanished without closing (Wi-Fi
+        # dropping out) within ~25 s, and unlike a ping from Python it keeps
+        # working while a task holds the GIL.
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPALIVE", 0x10), 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        except (OSError, AttributeError):
+            pass
     for opt in (socket.SO_SNDBUF, socket.SO_RCVBUF):
         try:
             sock.setsockopt(socket.SOL_SOCKET, opt, 4 << 20)
@@ -92,6 +136,7 @@ class Connection:
         self.name = name
         self._wlock = threading.Lock()
         self.closed = False
+        self.authenticated = False
         self.bytes_out = 0
         self.bytes_in = 0
 
@@ -115,10 +160,12 @@ class Connection:
             magic, hlen, nbuf = _PREFIX.unpack(_recv_exact(self.sock, _PREFIX.size))
             if magic != MAGIC:
                 raise ConnectionClosed(f"bad magic from {self.name}: {magic!r}")
+            if not self.authenticated and (nbuf or hlen > _PREAUTH_HEADER_MAX):
+                raise ConnectionClosed(f"oversized frame from {self.name} before pairing")
             lens = struct.unpack(f"!{nbuf}Q", _recv_exact(self.sock, 8 * nbuf)) if nbuf else ()
             header = json.loads(_recv_exact(self.sock, hlen))
             bufs = [_recv_exact(self.sock, n) for n in lens]
-        except OSError as e:
+        except (OSError, ValueError, struct.error) as e:
             self.close()
             raise ConnectionClosed(str(e)) from e
         self.bytes_in += hlen + sum(lens)
@@ -145,34 +192,56 @@ def _mac(token: str, nonce: str, role: str) -> str:
     return hmac.new(token.encode(), f"{role}:{nonce}".encode(), "sha256").hexdigest()
 
 
-def server_handshake(conn: Connection, token: str, hello: dict) -> dict:
-    """Worker side. Sends hello (with a challenge), checks the client's proof."""
+def server_handshake(conn: Connection, token: str, hello: dict, admit=None) -> dict:
+    """Worker side. Sends hello (with a challenge), checks the client's proof.
+
+    admit(msg) may return a reason to turn a correctly paired client away
+    (the phone is serving a different Python environment, say).
+    """
+    conn.sock.settimeout(HANDSHAKE_TIMEOUT)
     nonce = os.urandom(16).hex()
     conn.send({"t": "hello", "nonce": nonce, **hello})
     msg, _ = conn.recv()
     if msg.get("t") != "auth" or not hmac.compare_digest(
-        msg.get("proof", ""), _mac(token, nonce, "client")
+        str(msg.get("proof", "")), _mac(token, nonce, "client")
     ):
         conn.send({"t": "auth_fail"})
         conn.close()
         raise PermissionError("client failed pairing-token check")
-    conn.send({"t": "auth_ok", "proof": _mac(token, msg["nonce"], "server")})
+    proof = _mac(token, str(msg.get("nonce", "")), "server")
+    why = admit(msg) if admit else None
+    if why:
+        conn.send({"t": "refused", "proof": proof, "reason": why})
+        conn.close()
+        raise Refused(why)
+    conn.send({"t": "auth_ok", "proof": proof})
+    conn.authenticated = True
+    conn.sock.settimeout(None)
     return msg
 
 
 def client_handshake(conn: Connection, token: str, info: dict) -> dict:
     """Mac side. Returns the worker's hello once both sides are verified."""
-    hello, _ = conn.recv()
-    if hello.get("t") != "hello":
-        raise ConnectionClosed(f"unexpected greeting from {conn.name}: {hello.get('t')}")
-    nonce = os.urandom(16).hex()
-    conn.send({"t": "auth", "proof": _mac(token, hello["nonce"], "client"), "nonce": nonce, **info})
-    ok, _ = conn.recv()
-    if ok.get("t") != "auth_ok" or not hmac.compare_digest(
-        ok.get("proof", ""), _mac(token, nonce, "server")
-    ):
+    conn.sock.settimeout(HANDSHAKE_TIMEOUT)
+    try:
+        hello, _ = conn.recv()
+        if hello.get("t") != "hello":
+            raise ConnectionClosed(f"unexpected greeting from {conn.name}: {hello.get('t')}")
+        nonce = os.urandom(16).hex()
+        conn.send({"t": "auth", "proof": _mac(token, str(hello.get("nonce", "")), "client"), "nonce": nonce, **info})
+        ok, _ = conn.recv()
+    except TimeoutError as e:
+        conn.close()
+        raise ConnectionClosed(f"{conn.name} didn't answer the handshake") from e
+    proved = hmac.compare_digest(str(ok.get("proof", "")), _mac(token, nonce, "server"))
+    if ok.get("t") == "refused" and proved:
+        conn.close()
+        raise Refused(ok.get("reason", "the worker refused this session"))
+    if ok.get("t") != "auth_ok" or not proved:
         conn.close()
         raise PermissionError(f"{conn.name} rejected the pairing token (or failed to prove it)")
+    conn.authenticated = True
+    conn.sock.settimeout(None)
     return hello
 
 

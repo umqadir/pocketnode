@@ -12,6 +12,7 @@ from pathlib import Path
 PORT = int(os.environ.get("POCKETNODE_PORT", "7151"))
 
 worker = None
+_fault_file = None
 _notes: deque[str] = deque(maxlen=4)
 _started = time.time()
 
@@ -24,22 +25,49 @@ def _caches() -> Path:
     return Path.home() / "Library" / "Caches" / "pocketnode"
 
 
+def _settings() -> dict:
+    try:
+        import json
+        return json.loads((_bundle() / "pocketnode_settings.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _fault_log() -> str | None:
+    """Arm faulthandler on a file that survives the process, and return what the
+    previous run left there (a segfault in a native library, an abort)."""
+    import faulthandler
+    global _fault_file
+    path = _caches() / "fault.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last = None
+    try:
+        text = path.read_text(errors="replace").strip()
+        last = text[-6000:] or None
+    except OSError:
+        pass
+    _fault_file = open(path, "w")
+    faulthandler.enable(file=_fault_file, all_threads=True)
+    return last
+
+
 def main() -> None:
     global worker
     from pocketnode import device
     from pocketnode.worker import Worker
 
+    last_crash = _fault_log()
     token = (_bundle() / "pocketnode_token").read_text().strip()
     cores = device.core_layout()
     worker = Worker(token, slots=cores.get("logical", 6), cache_dir=str(_caches()), phone=True,
                     name=device.model())
-    note(f"listening on :{PORT}")
-    try:
-        import importlib
-        importlib.import_module("pocketnode_ios_experiments")  # registers diagnostics if bundled
-    except ImportError:
-        pass
-    worker.serve(listen=f"0.0.0.0:{PORT}")
+    worker.last_crash = last_crash
+    # USB connections arrive on loopback, so that is all the app listens on
+    # unless Wi-Fi was asked for when the app was built.
+    wifi = bool(_settings().get("wifi"))
+    listen = [f"0.0.0.0:{PORT}"] if wifi else [f"127.0.0.1:{PORT}", f"[::1]:{PORT}"]
+    note(f"listening on :{PORT}" + (" (USB and Wi-Fi)" if wifi else " (USB)"))
+    worker.serve(listen=listen)
 
 
 def lifecycle(state: str) -> str:
@@ -69,7 +97,7 @@ def status() -> str:
         return "starting…"
     from pocketnode import device
     st = worker.state()
-    mac = "connected" if worker.conn is not None else "waiting for Mac"
+    mac = "connected" if worker.connected else "waiting for Mac"
     avail = st.get("avail_mem")
     lines = [
         f"Mac: {mac}",

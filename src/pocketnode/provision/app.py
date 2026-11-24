@@ -66,6 +66,13 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
     if r.returncode:
         raise RuntimeError(r.stderr)
     dest = "generic/platform=iOS Simulator" if sdk == "iphonesimulator" else "generic/platform=iOS"
+    if sdk == "iphoneos":
+        # Naming the connected phone lets Xcode register it with the team, which
+        # a new (free) team needs before it can issue a provisioning profile.
+        try:
+            dest = f"id={device_udid()}"
+        except RuntimeError:
+            pass
     cmd = ["xcodebuild", "-project", "PocketNode.xcodeproj", "-scheme", "PocketNode", "-sdk", sdk,
            "-destination", dest, "-derivedDataPath", "build", "-configuration", "Debug", "build"]
     if sdk == "iphonesimulator":

@@ -76,6 +76,11 @@ class Task:
     placement: str  # auto | mac | phone | <node name>
     ro: int | None = None  # buffers this big or bigger are shared read-only
     pure: bool = False  # only stdlib/pure-Python modules: may run in a phone subinterpreter
+    weight: int = 1  # calls inside this task (a joblib batch or a map chunk); stats are per call
+    shadow: bool = False  # the Mac's copy of a task whose phone result is being verified
+    verifying: bool = False  # its phone result is waiting for the Mac's
+    cache_retries: int = 0
+    eligible: dict = field(default_factory=dict)  # node id -> True, once checked
     submitted: float = field(default_factory=time.monotonic)
     attempts: dict[str, "Attempt"] = field(default_factory=dict)
     excluded: dict[str, str] = field(default_factory=dict)  # node kind/name -> reason
@@ -106,7 +111,8 @@ class FnStats:
         self.t: dict[tuple[str, str], float] = {}
         self.n: dict[tuple[str, str], int] = defaultdict(int)
 
-    def add(self, key: str, kind: str, secs: float) -> None:
+    def add(self, key: str, kind: str, secs: float, weight: int = 1) -> None:
+        secs /= max(1, weight)
         k = (key, kind)
         self.n[k] += 1
         old = self.t.get(k)
@@ -134,6 +140,8 @@ class Node:
         self.running: dict[str, Attempt] = {}
         self.connected = True
         self.mac_only_modules: dict[str, str] = {}
+        self.verdicts: dict[frozenset, router.Verdict] = {}
+        self.packages = {router._norm(k): v for k, v in hello.get("packages", {}).items()}
         self.bandwidth = source.bandwidth_guess  # bytes/s, refined by measurement
         self.latency = source.latency_guess
         self.bytes_sent = 0
@@ -202,6 +210,7 @@ class Node:
         header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key}
         if t.pure:
             header["pure"] = 1
+            header["mods"] = sorted(t.packed.modules - router.IGNORE)
         if t.ro is not None:
             header["ro"] = t.ro
         self.conn.send(header, [t.packed.data, *inline])
@@ -255,16 +264,40 @@ def attach(ex: "PocketExecutor", sock, source: Source, token: str) -> Node | Non
 
 # ----------------------------------------------------------------- executor
 
-def _fn_identity(fn) -> tuple[str, str]:
-    f = getattr(fn, "func", fn)  # functools.partial
-    f = getattr(f, "__func__", f)
+def _unwrap(fn, args):
+    """Look through batching wrappers: (the function doing the work, calls in this task, its args).
+
+    A joblib batch and a map() chunk are containers. Timing, verification and
+    "keep it on the Mac" decisions belong to the function inside, per call.
+    """
+    if fn is _run_chunk:
+        inner, chunk = args
+        return inner, max(1, len(chunk)), (chunk[0] if chunk else ())
+    items = getattr(fn, "items", None)
+    if type(fn).__name__ == "BatchedCalls" and items:
+        f, a, _ = items[0]
+        return f, len(items), a
+    return fn, 1, args
+
+
+def _fn_identity(fn, args=()) -> tuple[str, str]:
+    f = fn
+    for _ in range(6):  # functools.partial, bound methods, sklearn's delayed wrapper, decorators
+        inner = (getattr(f, "func", None) or getattr(f, "__func__", None) or getattr(f, "function", None)
+                 or getattr(f, "__wrapped__", None))
+        if inner is None or not callable(inner):
+            break
+        f = inner
     code = getattr(f, "__code__", None)
     label = getattr(f, "__qualname__", None) or type(f).__name__
+    # The same function on different kinds of input is different work
+    # (scikit-learn runs every estimator through one _fit_and_score).
+    kinds = ",".join(type(a).__name__ for a in tuple(args)[:3])
     if code is not None:
         label = f"{label} ({os.path.basename(code.co_filename)}:{code.co_firstlineno})"
         h = hashlib.sha1(code.co_code + repr(code.co_consts).encode("utf-8", "replace")).hexdigest()[:12]
-        return f"{getattr(f, '__module__', '')}.{f.__qualname__}:{h}", label
-    return f"{type(f).__module__}.{type(f).__qualname__}", label
+        return f"{getattr(f, '__module__', '')}.{f.__qualname__}:{h}({kinds})", label
+    return f"{type(f).__module__}.{type(f).__qualname__}({kinds})", label
 
 
 class PocketExecutor(Executor):
@@ -296,6 +329,7 @@ class PocketExecutor(Executor):
         self._shutdown = False
         self._noted: set[tuple] = set()
         self._buf_by_hash: dict[str, tuple[memoryview, int]] = {}
+        self._pins: dict[tuple, tuple] = {}
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
@@ -318,17 +352,22 @@ class PocketExecutor(Executor):
         where = (placement or getattr(fn, "__pocketnode_placement__", None)
                  or _placement_ctx.get() or self.default_placement)
         packed = serialize.dumps((fn, args, kwargs), memo=memo)
-        key, label = _fn_identity(fn)
-        return self._enqueue(packed, key, label, where, ro)
+        inner, weight, inner_args = _unwrap(fn, args)
+        key, label = _fn_identity(inner, inner_args)
+        return self._enqueue(packed, key, label, where, ro, weight=weight)
 
-    def _enqueue(self, packed, key, label, where, ro=None) -> PocketFuture:
+    def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False) -> PocketFuture:
         fut = PocketFuture()
-        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules))
+        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules),
+                    weight=weight, shadow=shadow)
         with self._cv:
             for b, h in zip(packed.buffers, packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)
             self.tasks[task.id] = task
-            self.queue.append(task)
+            if shadow:  # someone's result is waiting on this: it goes first
+                self.queue.appendleft(task)
+            else:
+                self.queue.append(task)
             self._cv.notify_all()
         fut.add_done_callback(lambda f, t=task: self._release(t))
         return fut
@@ -360,16 +399,21 @@ class PocketExecutor(Executor):
         targets = [n for n in self.nodes.values() if _matches(n, on)]
         if not targets:
             raise PlacementError(f"no connected node matches {on!r}")
+        self._pins[tuple(packed.hashes)] = (packed, on)
         for n in targets:
-            new = [(h, b) for h, b in zip(packed.hashes, packed.buffers) if h not in n.known]
-            if new:
-                n.post({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new])
-                n.known.update(h for h, _ in new)
-            n.post({"t": "pin", "hashes": packed.hashes})
+            self._pin_on(n, packed)
         return obj
+
+    def _pin_on(self, n: Node, packed) -> None:
+        new = [(h, b) for h, b in zip(packed.hashes, packed.buffers) if h not in n.known]
+        if new:
+            n.post({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new])
+            n.known.update(h for h, _ in new)
+        n.post({"t": "pin", "hashes": packed.hashes})
 
     def unpin(self, obj) -> None:
         packed = serialize.dumps(obj, scan=False)
+        self._pins.pop(tuple(packed.hashes), None)
         for n in self.nodes.values():
             n.post({"t": "unpin", "hashes": packed.hashes})
 
@@ -436,6 +480,10 @@ class PocketExecutor(Executor):
     def _release(self, task: Task) -> None:
         with self._cv:
             self.tasks.pop(task.id, None)
+            if task.verifying:
+                w = self._verify_wait.get(task.fn_key)
+                if w:
+                    w[:] = [e for e in w if e[0] is not task]
             for h in task.packed.hashes:
                 b, n = self._buf_by_hash.get(h, (None, 0))
                 if n <= 1:
@@ -470,6 +518,14 @@ class PocketExecutor(Executor):
         if node.kind != "mac":
             self._note(("node", node.name), f"pocketnode: {node.label()} connected "
                        f"({node.slots} slots, Python {'.'.join(map(str, node.hello['python']))})")
+            crash = node.hello.get("last_crash")
+            if crash:
+                top = next((l.strip() for l in crash.splitlines() if l.strip()), "")
+                self._note(("crash", node.id), f"pocketnode: the app on {node.name} crashed last time ({top}); "
+                           "details in ex.nodes[...].hello['last_crash']")
+            for packed, on in self._pins.values():  # data pinned earlier lives on this node again
+                if _matches(node, on):
+                    self._pin_on(node, packed)
 
     def _on_disconnect(self, node: Node) -> None:
         node.outbox.put(None)
@@ -510,7 +566,27 @@ class PocketExecutor(Executor):
             return False, task.excluded.get(node.kind) or task.excluded[node.name]
         if node.kind != "mac" and task.fn_key in self.mac_only and p in ("auto", None):
             return False, self.mac_only[task.fn_key][0]
-        v = router.check(task.packed.modules, node, self.version_policy)
+        if task.eligible.get(node.id):
+            return True, ""
+        if node.kind != "mac":
+            # The phone holds each input once in its cache and once more as the
+            # task's own writable copy; sending something it can't hold would
+            # get the app killed instead of answered.
+            need = sum(b.nbytes * (1 if task.ro is not None and b.nbytes >= task.ro else 2)
+                       for b in task.packed.buffers)
+            avail = node.state.get("avail_mem")
+            if avail and need > 0.8 * avail:
+                why = (f"its inputs need about {need / 2**30:.1f} GB on {node.name}, "
+                       f"which has {avail / 2**30:.1f} GB free")
+                if p not in ("auto", None) or self.strict:
+                    self._fail(task, PlacementError(f"{task.fn_label} can't run on {node.label()}: {why}"))
+                else:
+                    task.excluded[node.kind] = why
+                return False, why
+        mods = frozenset(task.packed.modules)
+        v = node.verdicts.get(mods)
+        if v is None:
+            v = node.verdicts[mods] = router.check(task.packed.modules, node, self.version_policy)
         if not v.ok:
             if p not in ("auto", None) or self.strict:
                 self._fail(task, PlacementError(f"{task.fn_label} can't run on {node.label()}: {v.reason}"
@@ -521,6 +597,7 @@ class PocketExecutor(Executor):
                     self._missing(v.missing, task)
                 task.suggestion = v.suggestion
             return False, v.reason
+        task.eligible[node.id] = True
         return True, ""
 
     def _estimate(self, task: Task, node: Node) -> float | None:
@@ -528,19 +605,21 @@ class PocketExecutor(Executor):
         if c is None:
             return None
         tc, _ = node.transfer_cost(task)
-        return c + tc
+        return c * task.weight + tc
 
-    def _mac_finish_estimate(self, task: Task) -> float | None:
+    def _mac_finish_estimate(self, task: Task, queued: int | None = None) -> float | None:
         macs = [n for n in self.nodes.values() if n.kind == "mac"]
         c = self.stats.get(task.fn_key, "mac")
         if not macs or c is None:
             return None
         slots = sum(n.effective_slots() for n in macs) or 1
-        ahead = sum(1 for t in self.queue if t.queued) / slots
-        return (ahead + 1) * c
+        if queued is None:
+            queued = sum(1 for t in self.queue if t.queued)
+        return (queued / slots + 1) * c * task.weight
 
     def _pick(self, node: Node) -> Task | None:
         """Next queued task this node should run, or None."""
+        queued = None
         for task in list(self.queue):
             if task.done or not task.queued:
                 continue
@@ -551,7 +630,9 @@ class PocketExecutor(Executor):
                 continue
             if node.kind != "mac" and task.placement in ("auto", None):
                 mine = self._estimate(task, node)
-                mac = self._mac_finish_estimate(task)
+                if mine is not None and queued is None:
+                    queued = sum(1 for t in self.queue if t.queued)
+                mac = self._mac_finish_estimate(task, queued) if mine is not None else None
                 if mine is not None and mac is not None and mine > mac:
                     task.reason = f"Mac was faster ({mac:.2g}s vs {mine:.2g}s estimated on {node.name})"
                     continue
@@ -595,13 +676,14 @@ class PocketExecutor(Executor):
         now = time.monotonic()
         launched = False
         for task in sorted(self.tasks.values(), key=lambda t: t.submitted):
-            if task.done or task.queued or len(task.attempts) >= 2:
+            if task.done or task.queued or task.verifying or len(task.attempts) >= 2:
                 continue
             atts = list(task.attempts.values())
             if not atts or any(a.node.kind == "mac" for a in atts):
                 continue
             a = atts[0]
             mac_t = self.stats.get(task.fn_key, "mac")
+            mac_t = mac_t * task.weight if mac_t is not None else None
             stuck = (not a.node.connected or a.node.effective_slots() == 0
                      or (mac_t is not None and now - a.started > mac_t * 1.5)
                      or (mac_t is None and now - a.started > 2.0))
@@ -707,7 +789,7 @@ class PocketExecutor(Executor):
                 value = serialize.loads(bufs[0], bufs[1:])
             except Exception as e:  # result can't be rebuilt on the Mac
                 return self._fail(task, e)
-            self.stats.add(task.fn_key, kind, timing.get("run", elapsed))
+            self.stats.add(task.fn_key, kind, timing.get("run", elapsed), task.weight)
             self._measure_link(node, att, elapsed, timing, sum(len(b) for b in bufs))
             if task.confirm_error is not None:
                 task.reason = (f"{task.confirm_error[0]} raised {task.confirm_error[1]} on the phone; "
@@ -715,22 +797,34 @@ class PocketExecutor(Executor):
                 self.mac_only[task.fn_key] = (task.reason, None)
             # Verify automatically placed work; forced placement means "run it there".
             if (node.kind != "mac" and self.verify and task.placement in ("auto", None)
-                    and self.verified.get(task.fn_key) != "ok"):
+                    and not task.shadow and self.verified.get(task.fn_key) != "ok"):
                 self._verify(task, node, att, value)
                 return
             self._finish(task, node, att, value=value)
             return
         if msg.get("unavailable"):
             u = msg["unavailable"]
+            if u.get("kind") == "cache" and task.cache_retries < 2:
+                # Its inputs were evicted between arriving and running: send them again.
+                task.cache_retries += 1
+                with self._cv:
+                    node.known.difference_update(task.packed.hashes)
+                    if not task.done and not any(a.id in self.attempts for a in task.attempts.values()):
+                        task.queued = True
+                        self.queue.appendleft(task)
+                    self._cv.notify_all()
+                return
             reason = _unavailable_reason(u, node)
             suggestion = _unavailable_suggestion(u)
             if u.get("module"):
                 node.mac_only_modules.setdefault(u["module"], reason)
+                node.verdicts.clear()
                 self._missing(u["module"], task)
             if task.placement not in ("auto", None) or self.strict:
                 return self._fail(task, PlacementError(f"{task.fn_label}: {reason}"
                                                        + (f". {suggestion}" if suggestion else "")))
-            self.mac_only[task.fn_key] = (reason, suggestion)
+            if u.get("kind") not in ("memory", "cache"):  # those depend on the inputs, not the function
+                self.mac_only[task.fn_key] = (reason, suggestion)
             self._requeue(task, node, reason, suggestion, quiet=bool(u.get("module")))
             return
         # The task raised. Raise it as-is on the Mac, unless it came from the
@@ -765,61 +859,81 @@ class PocketExecutor(Executor):
             if state == "mac":  # decided meanwhile: this function runs on the Mac
                 self._requeue(task, node, self.mac_only.get(key, ("",))[0], None, quiet=True)
                 return
-            if not any(n.kind == "mac" for n in self.nodes.values()):
-                self.verified[key] = "ok"
-                state = "ok"
-            else:
+            if state is None and not any(n.kind == "mac" for n in self.nodes.values()):
+                state = self.verified[key] = "ok"  # nothing to check against
+            if state != "ok":
+                task.verifying = True
                 self._verify_wait[key].append((task, node, att, value))
+                if state is None:
+                    self.verified[key] = "pending"
         if state == "ok":
             self._finish(task, node, att, value=value)
-            return
-        if state == "pending":
-            return
-        self.verified[key] = "pending"
-        shadow = self._enqueue(task.packed, key, task.fn_label, "mac", task.ro)
-        shadow.add_done_callback(lambda f: self._verify_done(key, f, task.packed, task.fn_label, task.ro))
+        elif state is None:
+            self._shadow(key, task, [])
 
-    def _verify_done(self, key, mac_fut, packed, label, ro, second=None) -> None:
+    def _shadow(self, key: str, task: Task, earlier: list) -> None:
+        """Run `task` on the Mac ahead of the queue; its phone result waits for the answer."""
+        fut = self._enqueue(task.packed, key, task.fn_label, "mac", task.ro, weight=task.weight, shadow=True)
+        fut.add_done_callback(lambda f: self._verify_done(key, task, [*earlier, f]))
+
+    def _verify_done(self, key: str, task0: Task, macs: list) -> None:
         from . import verify as V
-        waiting = self._verify_wait.get(key, [])
-        if not waiting:
-            self.verified[key] = "ok"
+        with self._cv:
+            entry = next((w for w in self._verify_wait.get(key, ()) if w[0] is task0), None)
+        if entry is None:  # the task was cancelled or finished another way
+            with self._cv:
+                self.verified.pop(key, None) if self.verified.get(key) == "pending" else None
+                pending = self._verify_wait.pop(key, [])
+            for t, n, a, v in pending:
+                self._verify(t, n, a, v)
             return
-        task0, node0, att0, phone_value = waiting[0]
-        exc = mac_fut.exception()
+        phone_value = entry[3]
+        first = macs[0]
+        exc = first.exception()
+        note = None
         if exc is not None:
             agree, why = False, f"the Mac raised {type(exc).__name__}"
         else:
-            agree, why = V.same(phone_value, mac_fut.result())
-        if not agree and exc is None and second is None:
-            # Before blaming the phone: does the Mac agree with itself?
-            again = self._enqueue(packed, key, label, "mac", ro)
-            again.add_done_callback(lambda f: self._verify_done(key, mac_fut, packed, label, ro, second=f))
-            return
-        if second is not None and exc is None:
-            consistent, _ = V.same(mac_fut.result(), second.result() if second.exception() is None else object())
-            if not consistent:
-                agree, why = True, ""
-                self._note(("nondet", key), f"pocketnode: {label} gives different results on every run, "
-                           "so its phone results can't be checked against the Mac; trusting them")
+            diffs = V.diff(phone_value, first.result())
+            agree, why = not diffs, (f"{diffs[0][0] or 'result'}: {diffs[0][1]}" if diffs else "")
+            if diffs and len(macs) == 1:
+                # Before blaming the phone: does the Mac agree with itself?
+                self._shadow(key, task0, macs)
+                return
+            if diffs:
+                second = macs[1]
+                unstable = [("", "raised")] if second.exception() is not None else V.diff(first.result(), second.result())
+                real = V.outside(diffs, unstable)
+                agree = not real
+                if real:
+                    why = f"{real[0][0] or 'result'}: {real[0][1]}"
+                elif any(p == "" for p, _ in unstable):
+                    note = (f"pocketnode: {task0.fn_label} gives a different result on every run, so its "
+                            "phone results can't be checked against the Mac; trusting them")
+                # Otherwise only some fields vary run to run (timings, say) and the rest matched.
         with self._cv:
             pending = self._verify_wait.pop(key, [])
             self.verified[key] = "ok" if agree else "mac"
+            for t, *_ in pending:
+                t.verifying = False
+        if note:
+            self._note(("nondet", key), note)
         if agree:
             for t, n, a, v in pending:
                 self._finish(t, n, a, value=v)
             return
         reason = f"its phone result differed from the Mac's ({why}), so it now runs on the Mac"
         self.mac_only[key] = (reason, None)
-        self._note(("verify", key), f"pocketnode: {label}: {reason}")
-        t, n, a, _ = pending[0]
-        t.reason = reason
-        if exc is not None:
-            self._finish(t, n, a, exc=exc)
-        else:
-            self._finish(t, n, a, value=mac_fut.result())
-        for t, n, a, _ in pending[1:]:
-            self._requeue(t, n, reason, None, quiet=True)
+        self._note(("verify", key), f"pocketnode: {task0.fn_label}: {reason}")
+        for t, n, a, _ in pending:
+            if t is task0:
+                t.reason = reason
+                if exc is not None:
+                    self._finish(t, n, a, exc=exc)
+                else:
+                    self._finish(t, n, a, value=first.result())
+            else:
+                self._requeue(t, n, reason, None, quiet=True)
 
     def _requeue(self, task: Task, node: Node, reason: str, suggestion: str | None, quiet=False) -> None:
         with self._cv:
@@ -946,7 +1060,7 @@ def _unavailable_reason(u: dict, node: Node) -> str:
         return f"needs {u.get('module')} (compiled), which isn't installed on {node.name}"
     if kind == "mac-file":
         return u["detail"]
-    if kind == "process":
+    if kind in ("process", "memory"):
         return u["detail"]
     return f"{kind}: {u.get('detail')}"
 
@@ -959,6 +1073,8 @@ def _unavailable_suggestion(u: dict) -> str | None:
         return "load the file on the Mac and pass the data (e.g. a DataFrame) as an argument; it then travels once and can run on the phone"
     if kind == "process":
         return "use threads (joblib/concurrent.futures threads) inside the task, or let pocketnode spread the work instead"
+    if kind == "memory":
+        return "pass smaller pieces (e.g. df.pn.map_partitions or ex.map over chunks) and they fit on the phone"
     return None
 
 

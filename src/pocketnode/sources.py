@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import usbmux
 from .executor import PocketExecutor, Source, attach
+from .wire import Refused
 
 log = logging.getLogger("pocketnode")
 
@@ -173,6 +174,9 @@ class Address(Source):
                 node = attach(ex, s, self, self.token)
                 while node.connected and not self._stop:
                     time.sleep(0.5)
+            except Refused as e:
+                ex._note(("refused", self.addr), f"pocketnode: {self.addr}: {e}")
+                time.sleep(max(self.retry, 5.0))
             except Exception as e:
                 log.debug("pocketnode: %s not reachable: %s", self.addr, e)
             time.sleep(self.retry)
@@ -215,25 +219,38 @@ class PhoneLink(Source):
                 self.status = "no phone attached"
                 time.sleep(1.0)
                 continue
-            dev = usb[0]
-            try:
-                s = usbmux.connect(dev.id, self.port)
-                node = attach(ex, s, self, self.token)
-                failures = 0
-                self.status = f"connected to {node.name}"
-                while node.connected and not self._stop:
-                    time.sleep(0.3)
-            except PermissionError as e:
-                self.status = f"phone rejected pairing: {e}"
-                log.warning("pocketnode: %s", self.status)
-                time.sleep(10)
-            except Exception:
+            # Several devices may be attached (an iPad, a second phone): the one
+            # running the app is the one that answers on its port.
+            node = None
+            for dev in usb:
+                try:
+                    s = usbmux.connect(dev.id, self.port)
+                    node = attach(ex, s, self, self.token)
+                    break
+                except Refused as e:
+                    self.status = str(e)
+                    ex._note(("refused", dev.serial), f"pocketnode: {e}")
+                    time.sleep(5)
+                except PermissionError:
+                    self.status = ("the phone app was built with a different pairing token; "
+                                   "reinstall it with `pocketnode app install`")
+                    ex._note(("pairing", dev.serial), f"pocketnode: {self.status}")
+                    time.sleep(10)
+                except Exception:  # noqa: BLE001 - not listening (yet), or not this device
+                    continue
+            if node is None:
                 failures += 1
-                self.status = "phone attached, app not answering"
+                if not self.status.startswith(("the phone", "pocketnode")):
+                    self.status = "phone attached, app not answering"
                 if self.relaunch and failures >= 2 and time.monotonic() - self._last_launch > 30:
                     self._last_launch = time.monotonic()
-                    launch_app(dev.serial)
+                    launch_app(usb[0].serial)
                 time.sleep(1.0)
+                continue
+            failures = 0
+            self.status = f"connected to {node.name}"
+            while node.connected and not self._stop:
+                time.sleep(0.3)
 
     def stop(self):
         self._stop = True
@@ -242,8 +259,13 @@ class PhoneLink(Source):
 def launch_app(udid: str) -> bool:
     """Start (or foreground) the pocketnode app on the phone over USB."""
     try:
+        import json
+        try:
+            bundle_id = json.loads((CONFIG_DIR / "app.json").read_text()).get("bundle_id", BUNDLE_ID)
+        except (OSError, ValueError):
+            bundle_id = BUNDLE_ID
         r = subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid,
-                            BUNDLE_ID], capture_output=True, text=True, timeout=60)
+                            bundle_id], capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log.info("pocketnode: launched the app on the phone")
             return True

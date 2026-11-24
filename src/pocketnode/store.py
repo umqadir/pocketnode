@@ -33,6 +33,37 @@ class BufferStore:
             self.size += len(buf)
             self._shrink()
 
+    def reserve(self, hashes, new: dict | None = None) -> list[str]:
+        """Add `new` buffers, hold every buffer in `hashes` that is present, and
+        return the ones that are missing. Held buffers are never evicted, so a
+        task's inputs stay put from the moment they arrive until release()."""
+        with self._lock:
+            for h, buf in (new or {}).items():
+                if h in self._bufs:
+                    self._bufs.move_to_end(h)
+                else:
+                    self._bufs[h] = buf
+                    self.size += len(buf)
+            missing = []
+            for h in hashes:
+                if h in self._bufs:
+                    self._bufs.move_to_end(h)
+                    self._in_use[h] = self._in_use.get(h, 0) + 1
+                else:
+                    missing.append(h)
+            self._shrink()
+            return missing
+
+    def get(self, hashes) -> list[bytearray]:
+        """Buffers previously held with reserve()."""
+        with self._lock:
+            return [self._bufs[h] for h in hashes]
+
+    def forget(self, h: str) -> None:
+        """Tell the Mac (with the next result) that it can't rely on `h` being here."""
+        with self._lock:
+            self._evicted.append(h)
+
     def acquire(self, hashes) -> list[bytearray] | None:
         """Look up and hold buffers for a running task (held ones are never evicted)."""
         with self._lock:

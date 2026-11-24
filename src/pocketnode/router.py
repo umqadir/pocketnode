@@ -33,7 +33,9 @@ def check(modules: set[str], node, version_policy: str = "minor") -> Verdict:
     if node.kind == "mac" and node.same_env:
         return Verdict(True)
     hello = node.hello
-    pkgs = {_norm(k): v for k, v in hello.get("packages", {}).items()}
+    pkgs = getattr(node, "packages", None)
+    if pkgs is None:
+        pkgs = {_norm(k): v for k, v in hello.get("packages", {}).items()}
     man = envinfo.manifest()
     for m in sorted(modules - IGNORE):
         if m in node.mac_only_modules:
