@@ -27,6 +27,7 @@ PHONE_PORT = 7151
 UNPAIRED = ("this iPhone runs the App Store edition of pocketnode and isn't paired with this Mac: "
             "in the app tap Pair a Mac, then run `pocketnode pair`")
 REVOKED = "the iPhone no longer has this Mac's pairing: run `pocketnode pair` again"
+OPEN_APP = "open the pocketnode app on the iPhone"
 
 
 def app_config() -> dict:
@@ -208,7 +209,7 @@ class Address(Source):
 
     def __init__(self, addr: str, token: str | None = None, retry: float = 2.0, credentials=None):
         self.addr = addr
-        self.token = token or pairing_token()
+        self.token = token  # None: the dev token, made only if a dev phone answers
         self.retry = retry
         self.credentials = credentials  # App Store edition: (token, extra) for a hello; default the paired.json
         self._stop = False
@@ -229,7 +230,7 @@ class Address(Source):
             try:
                 s = self._connect()
                 s.settimeout(None)
-                node = attach(ex, s, self, self.token)
+                node = attach(ex, s, self, self.token or pairing_token)
                 self.status = f"connected to {node.name}"
                 while node.connected and not self._stop:
                     time.sleep(0.5)
@@ -263,8 +264,9 @@ class PhoneLink(Source):
                  relaunch: bool = True):
         self.udid = udid
         self.port = port
-        self.token = token or pairing_token()
+        self.token = token  # None: the dev token, made only if a dev phone answers
         self.relaunch = relaunch
+        self.store_seen = False  # a phone here runs the App Store edition
         self._stop = False
         self._last_launch = 0.0
         self._launches = 0
@@ -312,18 +314,20 @@ class PhoneLink(Source):
             for dev in usb:
                 try:
                     s = usbmux.connect(dev.id, self.port)
-                    node = attach(ex, s, self, self.token)
+                    node = attach(ex, s, self, self.token or pairing_token)
+                    self.store_seen |= node.hello.get("edition") == "store"
                     break
                 except Refused as e:
+                    self.store_seen |= (getattr(e, "hello", None) or {}).get("edition") == "store"
                     self.status = str(e)
                     ex._note(("refused", dev.serial), f"pocketnode: {e}")
                     time.sleep(5)
                 except NotPaired:
-                    pairing = True
+                    pairing = self.store_seen = True
                     self.status = UNPAIRED
                     ex._note(("unpaired", dev.serial), f"pocketnode: {UNPAIRED}")
                 except PairingRevoked:
-                    pairing = True
+                    pairing = self.store_seen = True
                     self.status = REVOKED
                     ex._note(("revoked", dev.serial), f"pocketnode: {REVOKED}")
                 except PermissionError:
@@ -335,6 +339,13 @@ class PhoneLink(Source):
                     continue
             if node is None and pairing:
                 time.sleep(3.0)  # waiting for `pocketnode pair`, which saves new credentials
+                continue
+            if node is None and self._store_edition():
+                # The App Store edition can't be launched from the Mac (devicectl only starts
+                # apps signed for development): the person opens it.
+                if self.status.startswith(("no phone", "waiting", "phone attached", "connected to")):
+                    self.status = OPEN_APP  # (a refusal, "paused" say, keeps its own words)
+                time.sleep(1.0)
                 continue
             if node is None:
                 failures += 1
@@ -360,6 +371,17 @@ class PhoneLink(Source):
             self.status = f"connected to {node.name}"
             while node.connected and not self._stop:
                 time.sleep(0.3)
+
+    def _store_edition(self) -> bool:
+        """Is the phone here the App Store edition? Seen in a hello, or this Mac has store pairings
+        and never built the sideloaded app."""
+        if self.store_seen:
+            return True
+        from .pairing import load
+        if not load():
+            return False
+        cfg = app_config()
+        return not any(k in cfg for k in ("team", "profile_expires", "bundle_ids"))
 
     def stop(self):
         self._stop = True

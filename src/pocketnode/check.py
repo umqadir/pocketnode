@@ -519,6 +519,49 @@ def _t_work(tag, i):
     return tag, i
 
 
+def _store_phone(ex):
+    node = _phone(ex)
+    if node.hello.get("edition") != "store":
+        raise Skip("only for a phone running the App Store edition")
+    return node
+
+
+def store_install_refused(ex, quick):
+    from .provision import hot
+    from .storeworker import FIXED
+    _store_phone(ex)
+    try:
+        hot.add(ex, ["numpy"])
+    except hot.CantAdd as e:
+        _expect(str(e).startswith(FIXED), f"refused, but with {str(e)[:120]!r}")
+        return "adding a package is refused with the fixed-set sentence"
+    raise AssertionError("hot.add didn't refuse")
+
+
+def _t_visible(x):
+    return x + 1
+
+
+def store_code_visible(ex, quick):
+    import hashlib
+    import inspect
+    import textwrap
+    node = _store_phone(ex)
+    _expect(ex.on("phone").submit(_t_visible, 1).result(timeout=T) == 2, "wrong result")
+    req = uuid.uuid4().hex
+    reply = ex.expect(req)
+    node.post({"t": "code_log", "req": req})
+    msg = reply(30)
+    _expect(msg is not None, "the phone didn't answer the code-log request")
+    rows = [r for r in msg.get("codes", []) if "_t_visible" in str(r.get("label"))]
+    _expect(rows, "the phone's code log has no entry for _t_visible")
+    src = textwrap.dedent(inspect.getsource(_t_visible))
+    _expect(rows[0].get("srckind") == "source", f"logged as {rows[0].get('srckind')!r}, not source")
+    _expect(rows[0].get("src_digest") == hashlib.sha256(src.encode()).hexdigest()[:16],
+            "the source the phone holds isn't the function's")
+    return f"logged {rows[0]['label']} with its source"
+
+
 def two_sessions(ex, quick):
     from .executor import PocketExecutor
     from .sources import Address, PhoneLink
@@ -575,6 +618,8 @@ CHECKS = [
     ("ex.stacks('phone')", stacks_text),
     ("describe() / explain()", describe_explain),
     ("two sessions share the phone", two_sessions),
+    ("store: install is refused", store_install_refused),
+    ("store: code is visible", store_code_visible),
 ]
 SLOW = {"torch training (after pure)", "joblib GridSearchCV"}  # skipped with quick=True
 LABEL = {True: "PASS", False: "FAIL", None: "SKIP"}

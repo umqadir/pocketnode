@@ -386,18 +386,25 @@ def _sdk_lib_exists(lib: str) -> bool:
 def check_binaries(b: Bundle) -> list[Result]:
     r = []
     rel = {f: str(f.relative_to(b.app)) for f in b.machos}
-    probs = [f"{rel[f]}: {', '.join(s.arch for s in sl)}" for f, sl in b.machos.items()
-             if [s.arch for s in sl] != ["arm64"]]
-    r.append(_check("binaries: arm64 only", probs, f"{len(b.machos)} binaries"))
-    want = SDK_PLATFORM.get(b.sdk, 2)
-    probs = [f"{rel[f]}: {PLATFORMS.get(s.platform, s.platform)}" for f, sl in b.machos.items() for s in sl[:1]
-             if s.platform != want]
-    r.append(_check(f"binaries: LC_BUILD_VERSION platform {PLATFORMS[want]}", probs))
     if b.sdk == "iphoneos":
+        probs = [f"{rel[f]}: {', '.join(s.arch for s in sl)}" for f, sl in b.machos.items()
+                 if [s.arch for s in sl] != ["arm64"]]
+        r.append(_check("binaries: arm64 only", probs, f"{len(b.machos)} binaries"))
+        probs = [f"{rel[f]}: {PLATFORMS.get(s.platform, s.platform)}" for f, sl in b.machos.items()
+                 for s in sl[:1] if s.platform != 2]
+        r.append(_check("binaries: LC_BUILD_VERSION platform iOS", probs))
         probs = [rel[f] for f, sl in b.machos.items() if not all(s.encryption for s in sl)]
         r.append(_check("binaries: LC_ENCRYPTION_INFO_64 present", probs))
     else:
-        r.append(Result("binaries: LC_ENCRYPTION_INFO_64 present", None, "device builds only"))
+        # A simulator build is never uploaded: its Python.framework is fat (arm64 and
+        # x86_64), its binaries are iOS Simulator builds and the linker adds no encryption info.
+        fat = sum(1 for sl in b.machos.values() if len(sl) > 1)
+        sim = sum(1 for sl in b.machos.values() if sl[0].platform == 7)
+        why = "device builds only; this is a simulator build"
+        r.append(Result("binaries: arm64 only", None, f"{why} ({fat} of {len(b.machos)} binaries are fat)"))
+        r.append(Result("binaries: LC_BUILD_VERSION platform iOS", None,
+                        f"{why} ({sim} of {len(b.machos)} binaries are iOS Simulator builds)"))
+        r.append(Result("binaries: LC_ENCRYPTION_INFO_64 present", None, why))
     app_min = _ver(b.info.get("MinimumOSVersion"))
     probs = [f"{rel[f]}: minos {s.minos}" for f, sl in b.machos.items() for s in sl[:1]
              if _ver(s.minos) > app_min]
@@ -605,9 +612,12 @@ def validate(path: Path) -> tuple[Bundle, list[Result]]:
     return b, results
 
 
-def default_path() -> Path | None:
-    """The last store archive, else the newest store build."""
+def default_path(sdk: str | None = None) -> Path | None:
+    """The last store archive, else the newest store build. With `sdk`, the store build for that SDK."""
     from . import app
+    if sdk:
+        p = app.product(sdk, "store")
+        return p if p.exists() else None
     arc = app.archive_path()
     if arc.exists():
         return arc
@@ -615,8 +625,8 @@ def default_path() -> Path | None:
     return max(builds, key=lambda p: p.stat().st_mtime) if builds else None
 
 
-def main(path: str | Path | None = None, out=print) -> int:
-    p = Path(path) if path else default_path()
+def main(path: str | Path | None = None, out=print, sdk: str | None = None) -> int:
+    p = Path(path) if path else default_path(sdk)
     if p is None:
         out("nothing to validate: build the store edition first (`pocketnode app archive` or "
             "`pocketnode app build --store`), or give a path to an .xcarchive or .app")

@@ -199,6 +199,14 @@ def _refuse_fixed(ex) -> None:
         raise CantAdd(fixed_message(node))
 
 
+def _refuse_store_flavour() -> None:
+    """This Mac builds the App Store edition: there is no app here to rebuild with other packages."""
+    if app_mod.current_flavour() == "store":
+        from .hot import CantAdd
+        from ..storeworker import FIXED
+        raise CantAdd(FIXED)
+
+
 class Packages:
     """`pn.packages` — call it for the table; methods change what's on the phone."""
 
@@ -240,6 +248,7 @@ class Packages:
                     if r.get("restart"):
                         print("  an older version was already loaded: the app restarts to switch")
                     return r
+            _refuse_store_flavour()
             print("no phone reachable; adding it to the app build instead")
         return self._change(add=list(names), yes=yes, when_idle=when_idle, sdk=sdk)
 
@@ -264,6 +273,7 @@ class Packages:
                     if r.get("restart"):
                         print(f"  {', '.join(r['restart'])} was loaded: the app restarts to unload it")
                     return r
+            _refuse_store_flavour()
             print("no phone reachable; removing it from the app build instead")
         return self._change(remove=list(names), yes=yes, sdk=sdk)
 
@@ -279,6 +289,10 @@ class Packages:
         if node is not None:
             from .hot import fixed_message
             print(fixed_message(node))
+            return
+        if app_mod.current_flavour() == "store":
+            from ..storeworker import FIXED
+            print(FIXED)
             return
         rows = [r for r in table(check=True, executor=executor) if r.kind == "compiled"]
         on_phone = phone_packages(executor)
@@ -308,6 +322,7 @@ class Packages:
             self.remove(*dropped, sdk=sdk, executor=executor)
 
     def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None, new=None, before=None):
+        _refuse_store_flavour()  # rebuilding here would build the sideloaded app
         if new is not None:
             # From the selector: `new` is everything ticked, `before` what the phone
             # had (which includes dependencies of the packages named in the config).

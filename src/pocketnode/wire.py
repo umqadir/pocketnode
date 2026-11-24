@@ -259,6 +259,8 @@ def client_handshake(conn: Connection, token: str, info: dict, credentials=None)
                 raise pairing.NotPaired(f"this Mac isn't paired with {hello.get('name', conn.name)}")
             token, extra = cred
             info = {**info, **extra}
+        elif callable(token):  # the dev token, only made when a phone actually needs it
+            token = token()
         nonce = os.urandom(16).hex()
         conn.send({"t": "auth", "proof": _mac(token, str(hello.get("nonce", "")), "client"), "nonce": nonce, **info})
         ok, _ = conn.recv()
@@ -272,7 +274,9 @@ def client_handshake(conn: Connection, token: str, info: dict, credentials=None)
     proved = hmac.compare_digest(str(ok.get("proof", "")), _mac(token, nonce, "server"))
     if ok.get("t") == "refused" and proved:
         conn.close()
-        raise Refused(ok.get("reason", "the worker refused this session"))
+        e = Refused(ok.get("reason", "the worker refused this session"))
+        e.hello = hello  # which phone refused (the App Store edition says so in its hello)
+        raise e
     if ok.get("t") != "auth_ok" or not proved:
         conn.close()
         raise PermissionError(f"{conn.name} rejected the pairing token (or failed to prove it)")

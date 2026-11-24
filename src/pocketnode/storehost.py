@@ -26,7 +26,10 @@ IDLE_GIVE_BACK = 30.0  # seconds without work before background computing is han
 
 worker = None
 _settings_file: Path | None = None
-_settings: dict = {"accepting": True, "wifi": False, "keep_awake": False}
+_settings: dict = {"accepting": True, "wifi": False, "keep_awake": False, "review": False}
+FETCHED_LIMIT = 2000      # files listed by fetched_json
+FETCHED_READ = 200_000    # bytes shown by fetched_source
+_fetched_count: tuple[float, int] = (0.0, 0)  # (when counted, how many)
 _build: dict = {}
 _notes: deque[str] = deque(maxlen=40)
 _jobs: dict[str, "_Job"] = {}
@@ -65,7 +68,8 @@ def configure(app_support, caches, backend=None, build: dict | None = None, port
         backend = KeychainBackend() if KeychainBackend.available() else FileBackend(app_support / "paired.json")
     _build = dict(build or {})
     _settings_file = app_support / "store-settings.json"
-    _settings = {"accepting": True, "wifi": False, "keep_awake": False}
+    # Review's first-launch default comes from the build (config key store_review).
+    _settings = {"accepting": True, "wifi": False, "keep_awake": False, "review": bool(_build.get("review", False))}
     try:
         saved = json.loads(_settings_file.read_text())
         _settings.update({k: bool(saved[k]) for k in _settings if k in saved})
@@ -80,6 +84,8 @@ def configure(app_support, caches, backend=None, build: dict | None = None, port
     worker.last_crash = last_crash
     worker.accepting = _settings["accepting"]
     worker._wifi_wanted = _settings["wifi"]
+    worker.review = _settings["review"]
+    worker.set_approvals_file(app_support / "approvals.json")
     p = PORT if port is None else port
     _listen = [f"127.0.0.1:{p}", f"[::1]:{p}"] if p else ["127.0.0.1:0"]
     _debug_pairing()
@@ -193,6 +199,8 @@ def status() -> dict:
         "packages": _compiled_packages(), "python": platform.python_version(), "version": _version(),
         "tls": bool(_build.get("tls", True)), "privacy_url": _build.get("privacy_url"),
         "notes": list(_notes)[-8:],
+        "review": bool(w.review), "waiting": w.waiting_info(), "code_count": len(w.codes),
+        "fetched_count": _count_fetched(),
     }
 
 
@@ -261,6 +269,99 @@ def set_keep_awake(on) -> str:
 
 def task_source(task_id) -> str:
     return worker.task_source(str(task_id)) if worker else ""
+
+
+# ------------------------------------------------------- code made visible
+
+def set_review(on) -> str:
+    """"Ask before running new code": a Mac's own new code waits for Allow."""
+    _settings["review"] = _flag(on)
+    _save_settings()
+    worker.set_review(_settings["review"])
+    note("asking before running new code" if _settings["review"] else "running code without asking")
+    return ""
+
+
+def approve(arg) -> str:
+    """"<code> 1" allows that code, "<code> 0" declines it (for every Mac that sent it)."""
+    parts = str(arg).split()
+    if len(parts) != 2:
+        return "expected '<code> 1' or '<code> 0'"
+    code, allow = parts[0], _flag(parts[1])
+    label = (worker.codes.get(code) or {}).get("label", code)
+    worker.approve(code, allow)
+    note(f"{'allowed' if allow else 'declined'} {label}")
+    return ""
+
+
+def code_list(_arg=None) -> str:
+    return json.dumps(worker.code_list() if worker else [])
+
+
+def code_source(code) -> str:
+    return worker.code_source(str(code)) if worker else ""
+
+
+def _fetched_root() -> Path | None:
+    """Where the worker's import hook keeps the pure-Python modules it fetched from the Mac."""
+    if worker is None:
+        return None
+    return Path(worker.finder.cache_dir).resolve()
+
+
+def _fetched_files():
+    root = _fetched_root()
+    if root is None or not root.is_dir():
+        return root, []
+    files = []
+    for p in root.rglob("*.py"):
+        if p.is_file() and not p.is_symlink():
+            files.append(p)
+    return root, sorted(files, key=lambda p: p.relative_to(root).as_posix())
+
+
+def _count_fetched() -> int:
+    global _fetched_count
+    when, n = _fetched_count
+    if time.monotonic() - when > 5.0:  # status is polled often; the walk needn't be
+        n = len(_fetched_files()[1])
+        _fetched_count = (time.monotonic(), n)
+    return n
+
+
+def fetched_json(_arg=None) -> str:
+    """[{"path", "module", "bytes"}] for the files fetched from the Mac, sorted by path."""
+    root, files = _fetched_files()
+    out = []
+    for p in files[:FETCHED_LIMIT]:
+        rel = p.relative_to(root)
+        # Each fetched package lives in "<name>-<hash>/"; inside it, the path is the module.
+        parts = list(rel.parts[1:]) if len(rel.parts) > 1 else list(rel.parts)
+        parts[-1] = parts[-1][:-3]
+        if parts[-1] == "__init__" and len(parts) > 1:
+            parts = parts[:-1]
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        out.append({"path": rel.as_posix(), "module": ".".join(parts), "bytes": size})
+    return json.dumps(out)
+
+
+def fetched_source(path) -> str:
+    """A fetched file's text (first 200 KB). Paths outside the cache are refused ("")."""
+    root = _fetched_root()
+    if root is None:
+        return ""
+    try:
+        p = (root / str(path)).resolve()
+        if not p.is_relative_to(root) or p == root or not p.is_file():
+            return ""
+        with open(p, "rb") as f:
+            data = f.read(FETCHED_READ)
+    except (OSError, ValueError):
+        return ""
+    return data.decode("utf-8", "replace")
 
 
 DEMOS = [

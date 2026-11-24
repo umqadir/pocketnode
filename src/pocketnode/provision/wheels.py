@@ -30,6 +30,7 @@ from .validate import binary_problem, is_macho, macho
 
 BEEWARE_INDEX = "https://pypi.anaconda.org/beeware/simple"
 PACKAGES_FILE = Path(__file__).resolve().parent.parent / "ios" / "Store" / "packages.txt"
+RECIPE_DIR = PACKAGES_FILE.parent / "wheels"  # builds iOS wheels from an sdist (`pocketnode app wheel`)
 UV_PLATFORM = {"iphoneos": "arm64-apple-ios", "iphonesimulator": "arm64-apple-ios-simulator"}
 PYTHON = "3.13"  # the phone's CPython (tools.PYTHON_SUPPORT)
 # pocketnode's own subpackages the phone never uses.
@@ -75,6 +76,32 @@ def _req_name(req: str) -> str:
     return re.split(r"[\s<>=!~;\[@]", req, maxsplit=1)[0]
 
 
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def build_wheel(name: str, version: str, house: Path | None = None, run=subprocess.run) -> list[Path]:
+    """Build iOS wheels of `name` `version` (device and arm64 simulator) from its sdist
+    with the recipe in Store/wheels, into the wheelhouse. Output streams to the terminal;
+    a build takes minutes (pandas: about four)."""
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+!_-]*", version):
+        raise WheelError(f"not a package name and version: {name!r} {version!r}")
+    house = Path(house or wheelhouse()).expanduser()
+    house.mkdir(parents=True, exist_ok=True)
+    print(f"building iOS wheels of {name} {version} (device and simulator); this takes several minutes", flush=True)
+    r = run(["/bin/bash", str(RECIPE_DIR / "build_ios_wheel.sh"), name, version, str(house)])
+    if r.returncode:
+        raise WheelError(f"building {name} {version} for iOS failed (exit status {r.returncode}); "
+                         "the output above says where")
+    stem = re.sub(r"[-_.]+", "_", name).lower()
+    built = sorted(p for p in house.glob("*.whl")
+                   if p.name.lower().startswith(f"{stem}-{version}-") and "-ios_" in p.name)
+    missing = [k for k in ("iphoneos", "iphonesimulator") if not any(p.name.endswith(f"_{k}.whl") for p in built)]
+    if missing:
+        raise WheelError(f"the build finished but left no {' or '.join(missing)} wheel of {name} {version} in {house}")
+    return built
+
+
 def _no_wheel(output: str, requirements: list[str], sdk: str, house: Path) -> str:
     names = re.findall(r"Wheels are required for `([^`]+)`", output)
     if not names:
@@ -84,9 +111,13 @@ def _no_wheel(output: str, requirements: list[str], sdk: str, house: Path) -> st
     tag = "ios_*_arm64_iphoneos" if sdk == "iphoneos" else "ios_*_arm64_iphonesimulator"
     if names:
         what = ", ".join(names)
+        pins = {_norm(_req_name(r)): m.group(1) for r in requirements if (m := re.search(r"==\s*([^\s;,]+)", r))}
+        build = [f"`pocketnode app wheel {n} {pins[_norm(n)]}`" for n in names if _norm(n) in pins]
+        how = (f"Build one with {' and '.join(build)} (it goes into the wheelhouse, {house})" if build else
+               f"Put a wheel for it in the wheelhouse ({house}, or the store_wheelhouse setting), built with "
+               f"`pocketnode app wheel NAME VERSION`,")
         return (f"no cp313 iOS wheel ({tag}) found for {what}, and the App Store edition never builds from "
-                f"source. Put a wheel for it in the wheelhouse ({house}, or the store_wheelhouse setting) or "
-                f"remove it from the package list. uv said:\n{output.strip()[-1500:]}")
+                f"source. {how} or remove it from the package list. uv said:\n{output.strip()[-1500:]}")
     return f"installing the iOS wheels failed:\n{output.strip()[-2000:]}"
 
 
@@ -108,16 +139,70 @@ def install(requirements: list[str], sdk: str, target: Path, house: Path | None 
         raise WheelError(_no_wheel(r.stdout + r.stderr, requirements, sdk, Path(house or wheelhouse())))
 
 
-def _prune(pk: Path) -> None:
-    """Drop what the phone never runs: scripts, tests, headers, static libraries, sources,
-    and dotfiles (uv's .lock; App Store validation rejects hidden files)."""
+_TEST_STEM = re.compile(r"(^|_)tests?(_|$)")
+
+
+def _in_tests(rel: Path) -> bool:
+    return "tests" in rel.parts[:-1]
+
+
+def test_binaries(pk: Path) -> tuple[dict[str, str], list[str]]:
+    """Extension modules that exist for a package's test suite: those in a `tests`
+    directory and those named like `_xxx_tests`. Returns ({module: file that
+    imports it}, [modules nothing imports]). A module is kept when any of its
+    package's Python files outside tests (conftest.py and PyInstaller hooks don't
+    count) names it. For numpy 2.5 that keeps numpy._core._multiarray_tests, which
+    numpy/testing/print_coercion_tables.py imports, and drops the other four."""
+    keep: dict[str, str] = {}
+    drop: list[str] = []
+    texts: dict[str, list[tuple[str, str]]] = {}
+    for so in sorted(pk.rglob("*.so")):
+        rel = so.relative_to(pk)
+        stem = so.name.split(".")[0]
+        if not (_in_tests(rel) or _TEST_STEM.search(stem)):
+            continue
+        mod = ".".join([*rel.parent.parts, stem])
+        top = rel.parts[0] if len(rel.parts) > 1 else None
+        if top not in texts:
+            files = sorted((pk / top).rglob("*.py")) if top else []
+            # conftest.py runs under pytest only; PyInstaller hooks list modules, they don't import them.
+            texts[top] = [(str(f.relative_to(pk)), f.read_text(errors="replace")) for f in files
+                          if not _in_tests(f.relative_to(pk)) and f.name != "conftest.py"
+                          and "_pyinstaller" not in f.relative_to(pk).parts]
+        word = re.compile(rf"\b{re.escape(stem)}\b")
+        user = next((name for name, text in texts[top] if word.search(text)), None)
+        if user:
+            keep[mod] = user
+        else:
+            drop.append(mod)
+    return keep, drop
+
+
+def _prune(pk: Path) -> tuple[dict[str, str], list[str]]:
+    """Drop what the phone never runs: scripts, tests (and test-only binaries nothing
+    else imports), headers, static libraries, sources, and dotfiles (uv's .lock; App
+    Store validation rejects hidden files). Returns test_binaries()'s answer."""
+    keep, drop = test_binaries(pk)
     shutil.rmtree(pk / "bin", ignore_errors=True)
+    for so in pk.rglob("*.so"):
+        rel = so.relative_to(pk)
+        if ".".join([*rel.parent.parts, so.name.split(".")[0]]) in drop:
+            so.unlink()
+    kept_files = {pk / Path(*m.split(".")[:-1]) for m in keep}  # directories holding kept modules
     for p in sorted(pk.rglob("*"), key=lambda p: -len(p.parts)):
-        if p.is_dir() and p.name in ("__pycache__", "tests") and not p.is_symlink():
+        if p.is_dir() and p.name == "__pycache__" and not p.is_symlink():
             shutil.rmtree(p, ignore_errors=True)
+        elif p.is_dir() and p.name == "tests" and not p.is_symlink():
+            if not any(d == p or p in d.parents for d in kept_files):
+                shutil.rmtree(p, ignore_errors=True)
+            else:  # a tests package holding a module imported from outside: keep it and its __init__.py
+                for f in p.rglob("*"):
+                    if f.is_file() and f.suffix not in (".so",) and f.name != "__init__.py":
+                        f.unlink()
         elif (p.is_file() or p.is_symlink()) and (p.name.endswith(stage_mod._SKIP_SUFFIXES) or p.name.startswith(".")):
             p.unlink()
     _remove_empty_dirs(pk)
+    return keep, drop
 
 
 def _remove_empty_dirs(root: Path) -> None:
@@ -233,7 +318,8 @@ def stage_store(requirements: list[str], sdk: str, out: Path, bundle_id: str,
         install(requirements, sdk, s.pk, wheelhouse, indexes)
     else:
         s.pk.mkdir(parents=True)
-    _prune(s.pk)
+    kept, dropped = _prune(s.pk)
+    s.report.notes["test_binaries"] = {"kept": kept, "dropped": dropped}
     s.report.dists = _dists(s.pk)
     s.wrap_all()
     s.report.dists.update(copy_pocketnode(s.pk))

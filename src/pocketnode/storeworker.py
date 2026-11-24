@@ -7,16 +7,24 @@ Same runtime as the sideloaded app's worker, with these differences:
   removed or restarted at a Mac's request, and no runtime site directory exists.
 - The person holding the phone can see who is connected and what is running,
   stop tasks, refuse all work, forget a Mac, and turn Wi-Fi access on and off.
+- Every piece of code a Mac sends is kept in a code log the person can read, and
+  with review on ("Ask before running new code") a Mac's own new code waits for
+  Allow before it runs.
 """
 
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import ipaddress
+import json
+import os
 import socket
 import sys
 import threading
 import time
+from collections import OrderedDict
+from pathlib import Path
 
 from .pairing import PairingWindow, PairStore
 from .wire import Connection, server_handshake
@@ -25,6 +33,7 @@ from .worker import Worker, _Session
 FIXED = ("this iPhone runs the App Store edition of pocketnode: its compiled packages are fixed when "
          "the app is built")
 PAUSED = "pocketnode is paused on the phone (Accept work is off)"
+CODE_LOG_SIZE = 500
 
 
 def _ssl_missing() -> bool:
@@ -45,8 +54,12 @@ class StoreWorker(Worker):
         self.accepting = True
         self.port: int | None = None
         self.ready = False
-        self._task_meta: dict[str, dict] = {}   # task id -> label, fk, sid, start
-        self._src: dict[str, str] = {}          # function key -> its source text, as the Mac sent it
+        self._task_meta: dict[str, dict] = {}   # task id -> label, fk, code, sid, start
+        self.codes: OrderedDict[str, dict] = OrderedDict()  # code hash -> the code log entry (newest last)
+        self.review = False                     # "Ask before running new code"
+        self.decisions: dict[str, str] = {}     # "<pair_id>:<code>" -> "allowed" | "denied"
+        self.waiting: dict[tuple[str, str], dict] = {}  # (pair_id, code) -> a request on screen
+        self._approvals_file: Path | None = None
         self._wifi_srv: socket.socket | None = None
         self._wifi_wanted = False
         self._no_ssl = _ssl_missing()
@@ -104,11 +117,24 @@ class StoreWorker(Worker):
             return [{"mac": getattr(s, "mac", "a Mac"), "pair_id": getattr(s, "pair_id", None),
                      "link": getattr(s, "link", "usb"), "since": getattr(s, "since", None)} for s in live]
 
-    def _close_sessions(self, which=lambda s: True) -> None:
+    def _close_sessions(self, which=lambda s: True, why: str | None = None) -> None:
+        """Close sessions; with `why`, say {"t": "bye"} first so the Mac knows it wasn't a crash."""
         with self._lock:
-            conns = [s.conn for s in self.sessions.values() if s.live and which(s)]
-        for c in conns:
-            c.close()
+            targets = [s for s in self.sessions.values() if s.live and which(s)]
+        if why:
+            for s in targets:
+                self._send({"t": "bye", "why": why}, sid=s.id)
+            self._drain()
+        for s in targets:
+            if s.conn is not None:
+                s.conn.close()
+
+    def _drain(self, timeout: float = 1.0) -> None:
+        """Wait (briefly) until the writer has sent what is queued."""
+        end = time.monotonic() + timeout
+        while not self._outq.empty() and time.monotonic() < end:
+            time.sleep(0.01)
+        time.sleep(0.02)  # the last item may still be on its way out
 
     # ---------------------------------------------------------- messages
 
@@ -120,19 +146,142 @@ class StoreWorker(Worker):
             return
         if t == "restart":
             return
+        if t == "code_log":  # diagnostics (read-only): what the code log holds, without the texts
+            self._send({"t": "code_log", "req": msg.get("req"), "codes": self.code_list(with_digest=True)},
+                       sid=sess.id)
+            return
         super()._dispatch(sess, msg, bufs)
 
     def _accept_task(self, msg: dict, bufs: list[bytearray]) -> None:
         fk = msg.get("fk")
+        sess = self.sessions.get(msg.get("_sid"))
+        pid = str(getattr(sess, "pair_id", None) or "")
+        mac = getattr(sess, "mac", None) or "a Mac"
+        label = str(msg.get("label") or fk or "task")
+        # An older Mac sends no code hash or origin: its code is identified by the function key,
+        # and counts as the user's own.
+        code = str(msg.get("code") or hashlib.sha256(str(fk).encode()).hexdigest()[:16])
+        origin = msg.get("origin") if msg.get("origin") in ("user", "library") else "user"
         src = msg.pop("src", None)
+        now = time.time()
         with self._lock:
-            if src and fk:
-                if len(self._src) > 500:
-                    self._src.pop(next(iter(self._src)))
-                self._src[fk] = str(src)
-            self._task_meta[msg["id"]] = {"label": msg.get("label") or fk or "task", "fk": fk,
-                                          "sid": msg.get("_sid"), "start": time.time()}
+            e = self.codes.pop(code, None)
+            if e is None:
+                e = {"code": code, "label": label, "origin": origin, "dist": msg.get("dist"),
+                     "where": msg.get("where"), "srckind": msg.get("srckind") or ("source" if src else "none"),
+                     "src": "", "macs": [], "pairs": [], "runs": 0, "first": now, "last": now,
+                     "state": "not needed"}
+            if src:
+                e["src"], e["srckind"] = str(src), msg.get("srckind") or "source"
+            if mac not in e["macs"]:
+                e["macs"].append(mac)
+            if pid and pid not in e["pairs"]:
+                e["pairs"].append(pid)
+            e["last"] = now
+            self.codes[code] = e
+            while len(self.codes) > CODE_LOG_SIZE:
+                self.codes.popitem(last=False)
+            refuse = None
+            if origin == "user" and self.review:
+                d = self.decisions.get(f"{pid}:{code}")
+                if d == "denied":
+                    e["state"] = "denied"
+                    refuse = ("denied", f"{label} was declined on {self.name}")
+                elif d != "allowed":
+                    e["state"] = "waiting"
+                    self.waiting[(pid, code)] = {"code": code, "label": label, "mac": mac, "pair_id": pid,
+                                                 "where": e["where"]}
+                    refuse = ("approval", f"{label} is waiting for approval on {self.name}")
+                else:
+                    e["state"] = "allowed"
+            else:
+                d = self.decisions.get(f"{pid}:{code}") if origin == "user" else None
+                e["state"] = d or "not needed"
+            if refuse is None:
+                e["runs"] += 1
+                self._task_meta[msg["id"]] = {"label": label, "fk": fk, "code": code,
+                                              "sid": msg.get("_sid"), "start": now}
+        if refuse is not None:
+            self._deliver({"t": "result", "id": msg["id"], "node": self.id, "ok": False,
+                           "unavailable": {"kind": refuse[0], "detail": refuse[1], "module": None, "code": code},
+                           "state": self.state()}, [], msg.get("_sid"))
+            return
         super()._accept_task(msg, bufs)
+
+    # --------------------------------------------------------- code log
+
+    def set_approvals_file(self, path) -> None:
+        """Where approvals and denials persist (keyed by pair id and code hash)."""
+        self._approvals_file = Path(path)
+        try:
+            d = json.loads(self._approvals_file.read_text())
+            if isinstance(d, dict):
+                with self._lock:
+                    self.decisions = {str(k): v for k, v in d.items() if v in ("allowed", "denied")}
+        except (OSError, ValueError):
+            pass
+
+    def _save_decisions(self) -> None:
+        if self._approvals_file is None:
+            return
+        try:
+            self._approvals_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._approvals_file.with_name(self._approvals_file.name + ".tmp")
+            tmp.write_text(json.dumps(self.decisions))
+            os.replace(tmp, self._approvals_file)
+        except OSError:
+            pass
+
+    def approve(self, code: str, allow: bool) -> int:
+        """The person's answer for a piece of code, for every Mac that sent it. Returns how many Macs."""
+        code = str(code)
+        verdict = "allowed" if allow else "denied"
+        with self._lock:
+            e = self.codes.get(code)
+            pids = set(e["pairs"]) if e else set()
+            pids |= {p for p, c in self.waiting if c == code}
+            for pid in pids:
+                self.decisions[f"{pid}:{code}"] = verdict
+                self.waiting.pop((pid, code), None)
+            if e is not None and e["origin"] == "user":
+                e["state"] = verdict
+            sids = [s.id for s in self.sessions.values() if s.live and getattr(s, "pair_id", None) in pids]
+            self._save_decisions()
+        for sid in sids:
+            self._send({"t": "approved" if allow else "denied", "code": code}, sid=sid)
+        return len(pids)
+
+    def code_list(self, with_digest: bool = False) -> list[dict]:
+        """The code log, newest first, without the texts."""
+        with self._lock:
+            entries = list(reversed(self.codes.values()))
+            out = []
+            for e in entries:
+                row = {"code": e["code"], "label": e["label"], "origin": e["origin"], "dist": e["dist"],
+                       "where": e["where"], "srckind": e["srckind"], "runs": e["runs"], "last": e["last"],
+                       "state": e["state"], "macs": list(e["macs"])}
+                if with_digest:  # proves which text the phone holds without sending it back
+                    row["src_digest"] = hashlib.sha256(e["src"].encode()).hexdigest()[:16] if e["src"] else None
+                out.append(row)
+            return out
+
+    def code_source(self, code: str) -> str:
+        with self._lock:
+            e = self.codes.get(str(code))
+            return e["src"] if e else ""
+
+    def waiting_info(self) -> list[dict]:
+        with self._lock:
+            return [dict(w) for w in self.waiting.values()]
+
+    def set_review(self, on: bool) -> None:
+        with self._lock:
+            self.review = bool(on)
+            if not on:
+                self.waiting.clear()
+                for e in self.codes.values():
+                    if e["state"] == "waiting":
+                        e["state"] = "not needed"
 
     def _cleanup(self, tid: str) -> bool:
         cancelled = super()._cleanup(tid)
@@ -155,8 +304,8 @@ class StoreWorker(Worker):
 
     def task_source(self, tid: str) -> str:
         with self._lock:
-            fk = self._task_meta.get(tid, {}).get("fk")
-            return self._src.get(fk, "") if fk else ""
+            code = self._task_meta.get(tid, {}).get("code")
+        return self.code_source(code) if code else ""
 
     def stop_tasks(self, which=lambda meta: True) -> int:
         """Cancel tasks in flight; each Mac hears they were stopped and runs them itself."""
@@ -173,21 +322,21 @@ class StoreWorker(Worker):
     def set_accepting(self, on: bool) -> None:
         self.accepting = bool(on)
         if not on:
-            self.stop_tasks()
-            end = time.monotonic() + 1.0  # let the Macs hear about the stopped tasks first
-            while not self._outq.empty() and time.monotonic() < end:
-                time.sleep(0.01)
-            self._close_sessions()
+            self.stop_tasks()  # the Macs hear about the stopped tasks before the goodbye
+            self._close_sessions(why="paused")
 
     def forget(self, pair_id: str) -> bool:
-        """Drop a Mac's pairing; its sessions close and its tasks stop."""
+        """Drop a Mac's pairing (and its approvals); its sessions close and its tasks stop."""
         ok = self.pairs.forget(pair_id)
         with self._lock:
             sids = {s.id for s in self.sessions.values() if getattr(s, "pair_id", None) == pair_id}
             tids = [t for t, m in self._task_meta.items() if m.get("sid") in sids]
+            self.decisions = {k: v for k, v in self.decisions.items() if not k.startswith(f"{pair_id}:")}
+            self.waiting = {k: v for k, v in self.waiting.items() if k[0] != pair_id}
+            self._save_decisions()
         for tid in tids:
             self._cancel(tid)
-        self._close_sessions(lambda s: s.id in sids)
+        self._close_sessions(lambda s: s.id in sids, why="forgotten")
         return ok
 
     # ------------------------------------------------------------ network

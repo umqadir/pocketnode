@@ -27,7 +27,7 @@ targets:
       - path: App
         excludes: ["python/**", "pn_core.c", "Info.plist", "PocketNode.entitlements"]
       - path: Store
-        excludes: ["packages.txt"]
+        excludes: ["packages.txt", "wheels/**"]  # Mac-side tooling, not part of the app
     dependencies:
       - framework: Python.xcframework
         embed: true

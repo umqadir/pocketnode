@@ -13,6 +13,7 @@
                                       --store / --dev switch between the App Store edition and the sideloaded one)
     pocketnode app archive            App Store archive of the store edition (unsigned without --team)
     pocketnode app validate [PATH]    check a store archive or app against App Store rules, PASS/FAIL per item
+    pocketnode app wheel NAME VERSION build iOS wheels of a package into the wheelhouse (for the App Store edition)
     pocketnode bench                  link + compute, phone vs Mac
     pocketnode check [--quick]        release acceptance check: every feature, PASS/FAIL per item
     pocketnode experiments            device experiments that decide design branches
@@ -114,7 +115,21 @@ def cmd_app(args):
     from .provision import app
     if args.action == "validate":
         from .provision import validate
-        raise SystemExit(validate.main(args.path))
+        raise SystemExit(validate.main(args.path, sdk="iphonesimulator" if args.sim else None))
+    if args.action == "wheel":
+        from .provision import wheels
+        if not args.path or not args.version:
+            raise SystemExit("usage: pocketnode app wheel NAME VERSION (builds iOS wheels for the App Store edition)")
+        try:
+            built = wheels.build_wheel(args.path, args.version, house=wheels.wheelhouse(app.config()))
+        except RuntimeError as e:
+            raise SystemExit(str(e))
+        print("built:")
+        for w in built:
+            print(f"  {w}")
+        print(f"to put it in the App Store edition, add this line to {wheels.packages_file(app.config())}:\n"
+              f"  {args.path}=={args.version}")
+        return
     if args.action == "archive":
         if args.dev:
             raise SystemExit("`pocketnode app archive` builds the App Store edition; the sideloaded one isn't archived")
@@ -124,7 +139,7 @@ def cmd_app(args):
             raise SystemExit(str(e))
         print(arc)
         if not signed:
-            print("built without code signing (no team configured): `pocketnode app validate` checks its "
+            print("built without code signing (no --team given): `pocketnode app validate` checks its "
                   "structure, but exporting it for upload needs the owner's distribution signing (--team TEAMID)")
         return
     chosen = "store" if args.store else "dev" if args.dev else None
@@ -136,6 +151,7 @@ def cmd_app(args):
                     **({"torch_mps": args.torch_mps} if args.torch_mps is not None else {}),
                     **({"flavour": chosen} if chosen else {}))
     if args.action in ("build", "install") and store:
+        print("building the App Store edition (store flavour; `--dev` switches back to the sideloaded app)")
         try:
             p = app.build(sdk, restage=not args.no_stage, flavour="store")
             print(p)
@@ -266,10 +282,12 @@ def main(argv=None) -> None:
     p.set_defaults(fn=cmd_packages)
 
     p = sub.add_parser("app")
-    p.add_argument("action", choices=["build", "install", "launch", "archive", "validate"])
+    p.add_argument("action", choices=["build", "install", "launch", "archive", "validate", "wheel"])
     p.add_argument("path", nargs="?", help="validate: an .xcarchive or .app (default: the last store archive, "
-                                           "else the last store build)")
-    p.add_argument("--sim", action="store_true", help="build for the iOS simulator")
+                                           "else the last store build); wheel: the package name")
+    p.add_argument("version", nargs="?", help="wheel: the package version to build")
+    p.add_argument("--sim", action="store_true",
+                   help="build for the iOS simulator (validate: the last store simulator build)")
     which = p.add_mutually_exclusive_group()
     which.add_argument("--store", action="store_true",
                        help="build the App Store edition from now on (fixed packages from iOS wheels, pairing at run time)")

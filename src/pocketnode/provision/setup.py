@@ -414,7 +414,7 @@ class Setup:
                                          if first else "about a minute"))
         t0 = time.time()
         try:
-            p = app_mod.build(sdk)
+            p = app_mod.build(sdk, flavour="dev")  # setup is for the sideloaded app, whatever `app --store` saved
         except (RuntimeError, LookupError) as e:
             self.say(f"  the build failed: {e}")
             raise Stop("fix that and run `pocketnode setup` again") from None

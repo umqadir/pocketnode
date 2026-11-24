@@ -103,9 +103,9 @@ def test_store_build_has_its_own_everything_and_no_token(home, monkeypatch):
     assert not (home / "app-settings.json").exists()
     s = json.loads((home / "store-settings.json").read_text())
     assert s == {"edition": "store", "tls": True, "privacy_url": None, "debug": True}
-    # the configured flavour is used when none is passed; store_build and store_tls reach the build
+    # store_build, store_tls and store_privacy_url reach the build
     app_mod.save_config(flavour="store", store_build=7, store_tls=False, store_privacy_url="https://x.example/p")
-    app_mod.build("iphonesimulator")
+    app_mod.build("iphonesimulator", flavour="store")
     assert seen["prepare"][-1][3]["POCKETNODE_BUILD"] == "7"
     s = json.loads((home / "store-settings.json").read_text())
     assert s["tls"] is False and s["privacy_url"] == "https://x.example/p"
@@ -121,12 +121,24 @@ def test_dev_build_unchanged_next_to_store(home, monkeypatch):
     assert not (home / "store-settings.json").exists()
     assert seen["run"][-1][1]["POCKETNODE_BUNDLE_ID"] == "dev.pocketnode.app"
     app_mod.save_config(flavour="store")
-    app_mod.build("iphonesimulator", flavour="dev")  # an explicit flavour wins
+    app_mod.build("iphonesimulator")  # a saved "store" doesn't reach dev-only callers
     assert seen["prepare"][-1][2] == "dev"
+    assert not (home / "store-settings.json").exists()
+
+
+def test_setup_builds_the_dev_flavour_whatever_is_saved(home, monkeypatch):
+    from pocketnode.provision import setup
+    app_mod.save_config(flavour="store")
+    got = []
+    monkeypatch.setattr(app_mod, "build", lambda sdk, **kw: got.append(kw) or home / "x.app")
+    monkeypatch.setattr(app_mod, "install_sim", lambda p, **kw: got.append(("installed", kw)))
+    setup.Setup(out=lambda s: None).build_install("iphonesimulator", None)
+    assert got[0] == {"flavour": "dev"} and got[1] == ("installed", {})
 
 
 def test_archive_unsigned_without_team_signed_with(home, monkeypatch):
     seen = _fake_build(monkeypatch, home)
+    app_mod.save_config(team="AB12CD34EF")  # saved by a dev build: never signs an archive
     arc, signed = app_mod.archive()
     cmd = seen["run"][-1][0]
     assert not signed and arc == home / "ios-store/build/PocketNode.xcarchive"
@@ -173,7 +185,7 @@ def test_store_install_uses_its_simulator_and_port(home, monkeypatch):
     assert launch[0][3:] == ["F9730BBF-0000-0000-0000-000000000000", "dev.pocketnode.app"] and not launch[1]
 
 
-def test_cli_store_switch_and_back(home, monkeypatch):
+def test_cli_store_switch_and_back(home, monkeypatch, capsys):
     from pocketnode import cli
     got = []
     monkeypatch.setattr(app_mod, "build", lambda sdk, restage=True, flavour=None: got.append((sdk, flavour))
@@ -182,10 +194,26 @@ def test_cli_store_switch_and_back(home, monkeypatch):
     assert got[-1] == ("iphonesimulator", "store")
     c = app_mod.config()
     assert c["flavour"] == "store" and c["store_bundle_id"] == "org.example.s" and "bundle_id" not in c
-    cli.main(["app", "build", "--sim"])  # stays store
+    capsys.readouterr()
+    cli.main(["app", "build", "--sim"])  # stays store, and says so
     assert got[-1] == ("iphonesimulator", "store")
+    assert capsys.readouterr().out.startswith("building the App Store edition")
     cli.main(["app", "build", "--dev", "--sim"])
     assert app_mod.config()["flavour"] == "dev" and got[-1] == ("iphonesimulator", None)
+    assert "App Store" not in capsys.readouterr().out
+
+
+def test_cli_archive_signs_only_with_team_on_the_command_line(home, monkeypatch, capsys):
+    from pocketnode import cli
+    got = []
+    monkeypatch.setattr(app_mod, "archive", lambda team=None, restage=True: got.append(team)
+                        or (home / "a.xcarchive", bool(team)))
+    app_mod.save_config(team="AB12CD34EF")
+    cli.main(["app", "archive"])
+    assert got[-1] is None and "without code signing" in capsys.readouterr().out
+    cli.main(["app", "archive", "--team", "ZZ99YY88XX"])
+    assert got[-1] == "ZZ99YY88XX" and "without code signing" not in capsys.readouterr().out
+    assert app_mod.config()["team"] == "AB12CD34EF"  # an archive's --team isn't saved
 
 
 def test_store_project_generates(home, monkeypatch):
@@ -229,9 +257,9 @@ def test_store_sources_ship_in_the_package():
 def test_package_list():
     reqs = wheels.read_requirements(wheels.PACKAGES_FILE)
     names = [wheels._req_name(r) for r in reqs]
-    assert names == ["numpy", "pillow", "kiwisolver", "markupsafe", "contourpy", "cffi"]
-    assert all("==" in r for r in reqs) and "numpy==2.5.2.post1" in reqs
-    assert "pandas" in wheels.PACKAGES_FILE.read_text() and "pandas" not in names
+    assert names == ["numpy", "pillow", "kiwisolver", "markupsafe", "contourpy", "cffi", "pandas"]
+    assert all("==" in r for r in reqs) and "numpy==2.5.2.post1" in reqs and "pandas==3.1.1" in reqs
+    assert "pocketnode app wheel pandas 3.1.1" in wheels.PACKAGES_FILE.read_text()
 
 
 def test_package_settings(home):
@@ -246,6 +274,101 @@ def test_missing_wheel_message(tmp_path):
     msg = wheels._no_wheel(out, ["numpy==2.5.2.post1", "pandas"], "iphoneos", tmp_path / "wh")
     assert msg.startswith("no cp313 iOS wheel") and "pandas" in msg.split("uv said")[0]
     assert "numpy" not in msg.split("uv said")[0] and str(tmp_path / "wh") in msg
+    assert "pocketnode app wheel NAME VERSION" in msg  # unpinned: the generic form
+    msg = wheels._no_wheel(out, ["numpy==2.5.2.post1", "pandas==3.1.1"], "iphonesimulator", tmp_path / "wh")
+    assert "Build one with `pocketnode app wheel pandas 3.1.1`" in msg
+
+
+def test_build_wheel_runs_the_recipe_into_the_wheelhouse(tmp_path):
+    house = tmp_path / "wh"
+    calls = []
+
+    def stub(cmd, **kw):  # stands in for the minutes-long recipe
+        calls.append(cmd)
+        for tag in ("iphoneos", "iphonesimulator"):
+            (Path(cmd[4]) / f"pandas-3.1.1-cp313-cp313-ios_13_0_arm64_{tag}.whl").write_bytes(b"w")
+        return cp()
+    built = wheels.build_wheel("pandas", "3.1.1", house=house, run=stub)
+    assert calls == [["/bin/bash", str(wheels.RECIPE_DIR / "build_ios_wheel.sh"), "pandas", "3.1.1", str(house)]]
+    assert [p.name for p in built] == ["pandas-3.1.1-cp313-cp313-ios_13_0_arm64_iphoneos.whl",
+                                       "pandas-3.1.1-cp313-cp313-ios_13_0_arm64_iphonesimulator.whl"]
+    with pytest.raises(wheels.WheelError, match="failed"):
+        wheels.build_wheel("pandas", "3.1.1", house=house, run=lambda cmd, **kw: cp(code=1))
+    with pytest.raises(wheels.WheelError, match="iphoneos"):
+        wheels.build_wheel("lxml", "6.0.0", house=house, run=lambda cmd, **kw: (
+            Path(cmd[4], "lxml-6.0.0-cp313-cp313-ios_13_0_arm64_iphonesimulator.whl").write_bytes(b"w"), cp())[1])
+    with pytest.raises(wheels.WheelError, match="not a package"):
+        wheels.build_wheel("pandas; rm", "3.1.1", house=house, run=stub)
+
+
+def test_recipe_ships_and_checks_its_arguments():
+    names = {p.name for p in wheels.RECIPE_DIR.iterdir()}
+    assert {"build_ios_wheel.sh", "cibw_local.py", "fetch_sdist.py", "patch_pandas.py",
+            "inspect_ios_wheel.sh", "audit_ios_wheel.sh"} <= names
+    for p in wheels.RECIPE_DIR.iterdir():
+        assert "/private/tmp" not in p.read_text() and "/Users/" not in p.read_text(), p.name
+    r = subprocess.run(["/bin/bash", str(wheels.RECIPE_DIR / "build_ios_wheel.sh"), "pandas"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "usage:" in r.stderr
+    spec = (app_mod.SOURCE_DIR / "project.store.yml").read_text()
+    assert '"wheels/**"' in spec  # Mac-side tooling stays out of the app
+
+
+def test_cli_wheel(home, monkeypatch, capsys):
+    from pocketnode import cli
+    got = []
+    monkeypatch.setattr(wheels, "build_wheel", lambda n, v, house=None: got.append((n, v, house))
+                        or [house / f"{n}-{v}-x.whl"])
+    app_mod.save_config(store_wheelhouse=str(home / "wh"))
+    cli.main(["app", "wheel", "pandas", "3.1.1"])
+    out = capsys.readouterr().out
+    assert got == [("pandas", "3.1.1", home / "wh")]
+    assert str(home / "wh" / "pandas-3.1.1-x.whl") in out and "pandas==3.1.1" in out
+    with pytest.raises(SystemExit, match="usage"):
+        cli.main(["app", "wheel", "pandas"])
+
+
+def test_test_only_binaries_left_out_unless_imported(tmp_path):
+    pk = tmp_path / "pk"
+    files = {
+        "pkg/__init__.py": "",
+        "pkg/_core/_used_tests.cpython-313-iphoneos.so": "x",
+        "pkg/_core/_unused_tests.cpython-313-iphoneos.so": "x",
+        "pkg/_core/_real.cpython-313-iphoneos.so": "x",
+        "pkg/testing/print_tables.py": "from pkg._core._used_tests import f\n",
+        "pkg/conftest.py": "from pkg._core._unused_tests import g\n",  # pytest only: doesn't count
+        "pkg/tests/__init__.py": "",
+        "pkg/tests/test_x.py": "from pkg._core import _unused_tests\n",
+        "pkg/tests/_helper.cpython-313-iphoneos.so": "x",
+        "pkg/testing/tests/_t.cpython-313-iphoneos.so": "x",
+    }
+    for rel, text in files.items():
+        (pk / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pk / rel).write_text(text)
+    keep, drop = wheels.test_binaries(pk)
+    assert keep == {"pkg._core._used_tests": "pkg/testing/print_tables.py"}
+    assert sorted(drop) == ["pkg._core._unused_tests", "pkg.testing.tests._t", "pkg.tests._helper"]
+    wheels._prune(pk)
+    left = sorted(str(p.relative_to(pk)) for p in pk.rglob("*") if p.is_file())
+    assert left == ["pkg/__init__.py", "pkg/_core/_real.cpython-313-iphoneos.so",
+                    "pkg/_core/_used_tests.cpython-313-iphoneos.so", "pkg/conftest.py",
+                    "pkg/testing/print_tables.py"]
+
+
+def test_numpy_keeps_only_the_test_module_numpy_testing_imports(tmp_path):
+    # The Mac's numpy has the iOS wheel's layout: its Python files, and empty stand-ins for its .so files.
+    np_dir = Path(__import__("numpy").__file__).parent
+    for f in np_dir.rglob("*"):
+        if f.suffix in (".py", ".so") and f.is_file():
+            dst = tmp_path / "numpy" / f.relative_to(np_dir)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(f.read_bytes() if f.suffix == ".py" else b"")
+    keep, drop = wheels.test_binaries(tmp_path)
+    if not keep and not drop:
+        pytest.skip("this numpy has no test extension modules")
+    assert set(keep) == {"numpy._core._multiarray_tests"}  # numpy/testing/print_coercion_tables.py imports it
+    assert {"numpy._core._umath_tests", "numpy._core._rational_tests", "numpy._core._struct_ufunc_tests",
+            "numpy._core._operand_flag_tests"} <= set(drop)
 
 
 def test_pocketnode_copy_leaves_out_mac_only_parts(tmp_path):
@@ -427,3 +550,30 @@ def test_validate_store_settings_in_archive(tmp_path):
     assert validate.main(tmp_path / "PocketNode.xcarchive", out=lines.append) == 1
     assert any(line.startswith("FAIL  leftovers: pocketnode_settings.json") for line in lines)
     assert "1 failed" in lines[-1]
+
+
+def test_validate_skips_device_checks_on_a_simulator_build(tmp_path, home):
+    app = synthetic_app(tmp_path)
+    # Turn it into a simulator build with a fat framework, like the simulator's Python.framework.
+    cc(tmp_path, app / "PocketNode", "arm64-apple-ios26.0-simulator", "int main(void){return 0;}\n", "-exe")
+    fw = app / "Frameworks/m._ext.framework/m._ext"
+    arm = cc(tmp_path, tmp_path / "arm.dylib", SIM, STAT)
+    x86 = cc(tmp_path, tmp_path / "x86.dylib", "x86_64-apple-ios17.0-simulator", STAT)
+    subprocess.run(["lipo", "-create", str(arm), str(x86), "-output", str(fw)], check=True)
+    info = plistlib.loads((app / "Info.plist").read_bytes())
+    info.update(DTPlatformName="iphonesimulator", DTSDKName="iphonesimulator27.1",
+                CFBundleSupportedPlatforms=["iPhoneSimulator"])
+    (app / "Info.plist").write_bytes(plistlib.dumps(info))
+    rs = results(app)
+    for name in ("binaries: arm64 only", "binaries: LC_BUILD_VERSION platform iOS",
+                 "binaries: LC_ENCRYPTION_INFO_64 present"):
+        assert rs[name].ok is None and "simulator build" in rs[name].detail, name
+    assert "1 of 2 binaries are fat" in rs["binaries: arm64 only"].detail
+    assert failed(rs) == set(), {n: rs[n].detail for n in failed(rs)}
+    # `pocketnode app validate --sim` finds the store simulator build when there's no archive
+    built = app_mod.product("iphonesimulator", "store")
+    built.parent.mkdir(parents=True)
+    shutil.move(str(app), built)
+    assert validate.default_path("iphonesimulator") == built
+    assert validate.default_path() == built
+    assert validate.default_path("iphoneos") is None

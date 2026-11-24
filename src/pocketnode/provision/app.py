@@ -157,15 +157,17 @@ def _installed(names: list[str]) -> list[str]:
 
 
 def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str | None = None,
-          bundle_id: str | None = None, restage: bool | str = True, flavour: str | None = None) -> Path:
+          bundle_id: str | None = None, restage: bool | str = True, flavour: str = "dev") -> Path:
     """Stage packages, generate the Xcode project and build. Returns the .app path.
 
     restage: True restages everything, "pocketnode" refreshes only pocketnode
     itself (fast while developing), False reuses the existing stage.
-    flavour: "dev" or "store" (default: the configured one). The store
+    flavour: "dev" (the default, whatever the config says: setup, packages and
+    every other dev-only caller get the sideloaded app) or "store". Only
+    `pocketnode app build|install` follows the configured flavour. The store
     flavour's packages come from its package list, not `pkgs`.
     """
-    if (flavour or current_flavour()) == "store":
+    if flavour == "store":
         return build_store(sdk, team=team, bundle=bundle_id, restage=restage)
     pairing_token()
     cfg = config()
@@ -267,6 +269,9 @@ def stage_store(sdk: str, bundle: str, restage: bool | str = True) -> None:
         reqs = wheels.read_requirements(wheels.packages_file(cfg))
         rep = wheels.stage_store(reqs, sdk, out, bundle, wheelhouse=wheels.wheelhouse(cfg))
         print(f"  staged {len(rep.dists)} distributions from iOS wheels ({rep.binaries} binaries)")
+        tb = rep.notes.get("test_binaries", {})
+        if tb.get("dropped"):
+            print(f"  left out {len(tb['dropped'])} test-only extension modules nothing else imports")
 
 
 def build_store(sdk: str = "iphonesimulator", team: str | None = None, bundle: str | None = None,
@@ -304,9 +309,12 @@ def archive(team: str | None = None, restage: bool | str = True) -> tuple[Path, 
     Returns (archive path, signed). Without a team the archive is built with
     code signing off: its structure can be checked (`pocketnode app validate`),
     but exporting it for upload needs the owner's distribution signing.
+    Only a team passed here signs: the team that dev builds save in the config
+    is never used, because signing a new bundle identifier with it would
+    register an app identifier with Apple.
     """
     cfg = config()
-    team = team if team is not None else cfg.get("team", "")
+    team = team or ""
     bundle = store_bundle_id(cfg)
     stage_store("iphoneos", bundle, restage)
     (CONFIG_DIR / "store-settings.json").write_text(json.dumps(store_settings("Release", cfg)))
