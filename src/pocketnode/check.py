@@ -447,8 +447,11 @@ def pandas_accessor(ex, quick):
     rng = np.random.default_rng(3)
     df = pd.DataFrame({"g": rng.integers(0, 20, 3000), "x": rng.normal(size=3000)})
     f, g, n0 = (lambda d: d.x.abs().sum()), (lambda v: v * 3), len(ex.history)
-    _expect(df.pn.groupby("g", executor=ex).apply(f).equals(df.groupby("g").apply(f)), "groupby().apply differs")
-    _expect(df.x.pn.map(g, executor=ex).equals(df.x.map(g)), "Series.pn.map differs")
+    import warnings
+    with warnings.catch_warnings():  # pandas warns that groupby().apply will stop passing the grouping column
+        warnings.simplefilter("ignore")
+        _expect(df.pn.groupby("g", executor=ex).apply(f).equals(df.groupby("g").apply(f)), "groupby().apply differs")
+        _expect(df.x.pn.map(g, executor=ex).equals(df.x.map(g)), "Series.pn.map differs")
     return f"groupby().apply and Series.map equal pandas; {_ran(ex, n0)}"
 
 
