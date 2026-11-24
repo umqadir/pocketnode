@@ -245,10 +245,18 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
 - [M] No on-device signing and no copy of the private key on the phone are needed (LiveContainer's approach), and no debugger.
 - [M] A real package confirmed it: kiwisolver's C++ extension, retagged in place, signed that way, unzipped into `Library/Application Support/pocketnode/site` and imported as a plain `.so`. iOS CPython's import system accepts `.cpython-313-iphoneos.so`, `.abi3.so` and `.so` outside frameworks; wrapping extensions as frameworks is an App Store rule, not a loader requirement.
 - Consequence: adding a compiled package doesn't need a rebuild or a restart. Packages added this way keep their normal layout, so the libraries they bundle keep finding each other.
+- [M] Built and run on the phone (`pocketnode packages add`, and automatically when a task needs a missing package):
+  - duckdb 1.5.0: 38 MB, 9.5 s in total, of which 1.5 s was sending. `select 6*7` then ran on the phone.
+  - matplotlib 3.10.7 with pillow, fonttools and contourpy: 37 MB, 48 s in total (3.2 s sending; the rest was the static check, an AppKit stand-in for the macOS backend, and signing, on a busy Mac).
+  - regex, added automatically: the first six tasks ran on the Mac at once, the package was on the phone 4.3 s later, and 25 of the next 40 tasks ran on the phone.
+  - lxml also loads. Each result matched the Mac's.
+- [M] The app's data container path changed between two installs of the app in this session, and packages added before still imported afterwards, so added files should never record absolute paths.
 
 ### Subinterpreters and PyTorch
 - [M] Creating any subinterpreter makes `PyGILState_Check()` return true for the rest of the process (CPython sets `gilstate.check_enabled = 0`). PyTorch's autograd engine asserts that it is *not* true, so every `backward()` afterwards fails with "The autograd engine was called while holding the GIL".
 - [M] Fix: subinterpreter work runs on its own threads that never do anything else, and the host app turns the check back on (it is accurate on every other thread). torch autograd and subinterpreter tasks then coexist.
+- [M] numpy must never be imported in a subinterpreter. It doesn't refuse with ImportError: it raises `RuntimeError: CPU dispatcher tracer already initlized`, and after that numpy fails to import in the main interpreter too until the app restarts. Subinterpreters now refuse every third-party extension module before its loader runs, and such tasks go to the main interpreter.
+- [M] Tasks in subinterpreters can be cancelled: a watcher thread inside the subinterpreter injects an exception into the task's thread (ctypes works there). Isolated subinterpreters refuse daemon threads, so the watcher is woken and joined at the end of every task.
 - [M] Each new subinterpreter spent about 0.45 s importing pocketnode. The package now imports lazily (0.05 s) and the pool is created ahead of the first task.
 - [M] On the phone (2 performance + 4 efficiency cores), six 20M-iteration pure-Python loops finish in 1.15 s against 0.59 s for one: 3.1× the throughput of a single core.
 
@@ -260,4 +268,28 @@ Device facts read from this Mac: the phone is iPhone19,2 on **iOS 27.2** (24B119
 
 ### Leaving the app
 - [M] Without a background task: the app is reported in the background within 2 s and throughput drops at once (923 → 53 GFLOPS on the same load). After about 33 s it is suspended. When the app comes back to the front, the same tasks continue and the USB connection is still open; nothing has to be re-sent.
+- [M] With a continued-processing task (`BGContinuedProcessingTask`) the app is not suspended: it kept computing for the whole 100 s it was in the background, at 108 GFLOPS against 1,649 in front (about 1/15). The request can be submitted by the app itself with no tap, as long as the app is in front at that moment, so the worker asks when work arrives and gives it back after 30 idle seconds.
 - [M] The handoff's "Keep computing in the background" button crashed the app: it submitted a continued-processing request whose handler had been registered for the wildcard identifier, which iOS never matches (`_handleSubmissionWithoutRegistrationForTaskRequest` throws). Handlers have to be registered for the exact identifier, just before submitting.
+
+### GPU on the phone
+- [M] MLX 0.31.1 works on the phone GPU. Added to the running app (150 MB with the iOS metallib; 139 s in total on a busy Mac, 10 s of it sending). `mx.metal.is_available()` is true, the device is "Apple A20 Pro GPU" (`applegpu_g19p`), recommended working set 8.6 GB. A 256×256 matmul matches numpy (max abs error 1.8e-4 in float32), and a small MLP trained with Adam goes from loss 28.5 to 0.0003. Half-precision matmul: 6.2 TFLOPS at 1024², 10.4 TFLOPS at 4096², so the neural-accelerator matmul kernels are in use.
+- [M] The two macOS-only Metal calls MLX imports (`MTLCopyAllDevicesWithObserver`, `MTLRemoveDeviceObserver`) work through the generated shim on the device.
+- [M] torch MPS works on the phone GPU. Three things were in the way:
+  1. `-[MTLDevice isLowPower]` doesn't exist on iOS (the abort described above), and torch also requires `[device supportsFamily:MTLGPUFamilyMac2]`. The host app answers both for the phone's GPU.
+  2. torch finds its own Metal shaders by walking the loaded images for a path containing `/libtorch_cpu.dylib` and reading that image's `__TEXT,metal_basic` section; if none matches it reads the main executable instead and fails with "Can't find metal library section metal_basic". In the app bundle the library is therefore wrapped as `libtorch_cpu.dylib.framework/libtorch_cpu.dylib`, the one framework whose name isn't derived from its module path.
+  3. That section holds a metallib built for macOS (32.3 MB). The 33 shader files (`aten/src/ATen/native/mps` and `native/sparse/mps` at the matching tag, with `c10/metal`) are compiled for iOS the way torch's own build does (`-std=metal3.1`), linked, and written over the section in place. The section can't grow: other sections follow it in `__TEXT`. Built for iOS 17 the library is 258 KB too big with the current Metal compiler, so it is built for iOS 26 and compressed (`metal-strip --compress-sections=MODULE_LIST`): 30.7 MB, all 5,867 functions.
+  - Before the shaders were replaced, 13 of 15 test cases failed; only cross-entropy and an embedding+LSTM pass, which go through MPSGraph alone, worked.
+  - After: all 15 agree with the phone's CPU, relative error between 0 and 1e-6: elementwise maths, activations, reductions, cross-entropy, indexing and gather, sort/topk/cumsum, Cholesky and inverse, conv + batch norm + pooling, layer norm + multi-head attention, bilinear upsampling and grid_sample, embedding + LSTM, and training with SGD, Adam and AdamW plus a small conv net.
+  - torch's Metal allocator takes its ceiling from the GPU's recommended working set (8.6 GB), above the app's memory allowance (about 6 GB), so the worker sets `PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.5`. The low mark has to be set below it too, or torch refuses to allocate ("invalid low watermark ratio 1.4").
+  - Not measured: speed against the phone's CPU on large models. The test cases are small, where the CPU wins.
+
+### Wi-Fi
+- [M] With the app built with `wifi` on, the phone accepts the Mac at its LAN address: tasks give correct results, 16 MB transferred in 0.7–1.2 s, round trip 20 ms median (USB: about 1 ms). iOS shows its local-network permission prompt the first time.
+
+### Acceptance check and a listener fault
+- [M] `pocketnode check` on the phone with the final build: 29 passed, 0 failed, 0 skipped (libraries against the Mac's results, guards, caching and pinning, placement overrides, verification, GridSearchCV split 10 phone / 4 Mac tasks, pandas accessor, Dask, the `%%phone` magic, torch and MLX on the GPU, two sessions sharing the phone).
+- [M] Once during the session the app was running but refused every connection until it was restarted. The listener loop called `accept()` with no error handling, and a client that connects and resets immediately makes `accept()` fail (the Wi-Fi test had just ended that way), which would end the loop for good. Not reproduced on purpose. The loop now survives accept errors, the app restarts its listener if it ever returns, and the Mac starts the app afresh when two launches haven't made it answer.
+
+### Not done on the device
+- Sustained heat: the 10-minute load run was skipped to free the phone. The scheduler reacts to the reported thermal state, but how quickly the phone throttles is unmeasured.
+- A USB 3 cable. All USB numbers above are from a 480 Mb/s cable.

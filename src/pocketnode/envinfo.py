@@ -226,3 +226,17 @@ def package_module(top: str) -> tuple[dict, bytes | None]:
     with _lock:
         _package_cache[top] = (sig, h, data)
     return {**info, "hash": h}, data
+
+
+@lru_cache(maxsize=1)
+def source_version() -> str:
+    """A fingerprint of pocketnode's own source. The Mac and the phone app each
+    report theirs; when they differ, the app was built from an older checkout."""
+    h = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for f in sorted(root.rglob("*.py")):
+        if "provision" in f.relative_to(root).parts or f.name in ("cli.py", "sources.py"):
+            continue  # Mac-only code: changing it doesn't make the phone's copy stale
+        h.update(f.relative_to(root).as_posix().encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()[:12]

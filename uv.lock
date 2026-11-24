@@ -379,6 +379,7 @@ provision = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "pexpect" },
     { name = "pytest" },
 ]
 
@@ -397,7 +398,10 @@ requires-dist = [
 provides-extras = ["all", "provision"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.2.0" }]
+dev = [
+    { name = "pexpect", specifier = ">=4.9.0" },
+    { name = "pytest", specifier = ">=9.2.0" },
+]
 
 [[package]]
 name = "prompt-toolkit"

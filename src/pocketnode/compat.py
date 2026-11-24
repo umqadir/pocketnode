@@ -23,6 +23,14 @@ def install() -> None:
     # others for cache paths) raises. The app runs as the "mobile" user.
     os.environ.setdefault("USER", "mobile")
     os.environ.setdefault("LOGNAME", "mobile")
+    # torch's Metal allocator sizes its ceiling from the GPU's recommended
+    # working set (8.6 GB on a 12 GB phone), which is more than iOS lets the
+    # whole app use (about 6 GB). Half of it keeps torch raising its own
+    # out-of-memory error instead of the app being killed.
+    # (torch insists the low mark sits below the high one; its default is 1.4.)
+    if "PYTORCH_MPS_HIGH_WATERMARK_RATIO" not in os.environ:
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.5"
+        os.environ.setdefault("PYTORCH_MPS_LOW_WATERMARK_RATIO", "0.4")
     _redirect_ctypes()
     _stub_multiprocessing()
     when_imported("joblib.parallel", _joblib_threads)

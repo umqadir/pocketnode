@@ -187,22 +187,40 @@ def remove(ex, names: list[str], on: str = "phone", timeout: float = 120) -> dic
     ex.packages_changed(node, msg.get("packages", {}), {})
     if msg.get("restart"):
         node.post({"t": "restart"})
-    return {"removed": msg.get("removed", []), "bundled": msg.get("bundled", [])}
+    return {"removed": msg.get("removed", []), "bundled": msg.get("bundled", []),
+            "restart": msg.get("restart", [])}
 
 
-def estimate(names: list[str], bandwidth: float = 30e6) -> dict:
-    """Seconds to add `names`, from sizes and measured history where there is some."""
-    import importlib.metadata as md
+def footprint(d) -> tuple[bool, float]:
+    """(has compiled code, MB) of an installed distribution. Read from its RECORD,
+    which lists every file with its size, instead of statting thousands of files."""
+    import csv
+    text = d.read_text("RECORD")
+    rows = [r for r in csv.reader(text.splitlines()) if r] if text else []
+    sizes = [int(r[2]) for r in rows if len(r) > 2 and r[2].isdigit()]
+    if not sizes:  # no RECORD (or one without sizes): look at the files themselves
+        files = [Path(d.locate_file(f)) for f in d.files or ()]
+        return (any(str(f).endswith((".so", ".dylib")) for f in files),
+                sum(f.stat().st_size for f in files if f.is_file()) / 2**20)
+    return any(r[0].endswith((".so", ".dylib")) for r in rows), sum(sizes) / 2**20
+
+
+def estimate(names: list[str], bandwidth: float = 30e6, have: dict[str, str] | None = None) -> dict:
+    """Seconds to add `names`, from sizes and measured history where there is some.
+    have: what the node already has ({dist: version}); those aren't sent again."""
+    have = {_norm(k): v for k, v in (have or {}).items()}
     mb = 0.0
     for d in stage_mod.closure(names):
-        if any(str(f).endswith((".so", ".dylib")) for f in d.files or ()):
-            mb += sum(Path(d.locate_file(f)).stat().st_size for f in d.files or ()
-                      if Path(d.locate_file(f)).is_file()) / 2**20
+        if have.get(_norm(d.metadata["Name"])) == d.version:
+            continue
+        compiled, size = footprint(d)
+        if compiled:
+            mb += size
     hist = []
     if app_mod.HISTORY.exists():
         hist = [json.loads(l) for l in app_mod.HISTORY.read_text().splitlines() if l.strip()]
     hot = [h for h in hist if h.get("event") == "hot" and h.get("mb")]
     if hot:
         rate = sorted(h["seconds"] / h["mb"] for h in hot)[len(hot) // 2]
-        return {"seconds": round(3 + mb * rate), "mb": round(mb), "measured": True}
-    return {"seconds": round(5 + mb / (bandwidth / 2**20) + mb * 0.05), "mb": round(mb), "measured": False}
+        return {"seconds": round(3 + mb * rate), "mb": round(mb, 1), "measured": True}
+    return {"seconds": round(5 + mb / (bandwidth / 2**20) + mb * 0.05), "mb": round(mb, 1), "measured": False}

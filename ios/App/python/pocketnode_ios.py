@@ -69,7 +69,12 @@ def main() -> None:
     listen = [f"0.0.0.0:{PORT}"] if wifi else [f"127.0.0.1:{PORT}", f"[::1]:{PORT}"]
     note(f"listening on :{PORT}" + (" (USB and Wi-Fi)" if wifi else " (USB)"))
     threading.Thread(target=_keep_computing_loop, daemon=True, name="pn-keepalive").start()
-    worker.serve(listen=listen)
+    while True:  # the app is only useful while it listens
+        try:
+            worker.serve(listen=listen)
+        except Exception as e:  # noqa: BLE001
+            note(f"listener stopped ({type(e).__name__}: {e}); restarting")
+        time.sleep(1.0)
 
 
 _continued = "off"  # off | asking | on | expired | refused

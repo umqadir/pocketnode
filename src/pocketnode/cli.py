@@ -8,6 +8,7 @@
                                       (--bundle: rebuild the app with the change baked in instead)
     pocketnode app build|install      build/install the iOS app (--sim for the simulator)
     pocketnode bench                  link + compute, phone vs Mac
+    pocketnode check [--quick]        release acceptance check: every feature, PASS/FAIL per item
     pocketnode experiments            device experiments that decide design branches
     pocketnode worker ...             run a worker here (what the phone app runs)
 """
@@ -66,7 +67,8 @@ def cmd_app(args):
     sdk = "iphonesimulator" if args.sim else "iphoneos"
     app.save_config(sdk=sdk, **({"team": args.team} if args.team else {}),
                     **({"bundle_id": args.bundle_id} if args.bundle_id else {}),
-                    **({"wifi": args.wifi} if args.wifi is not None else {}))
+                    **({"wifi": args.wifi} if args.wifi is not None else {}),
+                    **({"torch_mps": args.torch_mps} if args.torch_mps is not None else {}))
     if args.action in ("build", "install"):
         p = app.build(sdk, restage=not args.no_stage)
         print(p)
@@ -92,6 +94,15 @@ def cmd_bench(args):
     print(json.dumps(out, indent=1))
     print("saved", bench.save("bench", out))
     ex.shutdown(wait=False)
+
+
+def cmd_check(args):
+    from . import check
+    ex = _connect(args, mac_workers=2)
+    ex.wait_for("mac", 30)
+    code = check.main(ex, quick=args.quick)
+    ex.shutdown(wait=False)
+    raise SystemExit(code)
 
 
 def cmd_experiments(args):
@@ -152,11 +163,18 @@ def main(argv=None) -> None:
     p.add_argument("--no-stage", action="store_true", help="reuse staged packages")
     p.add_argument("--wifi", action=argparse.BooleanOptionalAction, default=None,
                    help="also accept the Mac over the local network (default: USB only)")
+    p.add_argument("--torch-mps", action=argparse.BooleanOptionalAction, default=None,
+                   help="let PyTorch's Metal backend (MPS) use the phone's GPU (default: on)")
     p.set_defaults(fn=cmd_app)
 
     p = sub.add_parser("bench")
     conn(p)
     p.set_defaults(fn=cmd_bench)
+
+    p = sub.add_parser("check")
+    conn(p)
+    p.add_argument("--quick", action="store_true", help="smaller sizes; skip torch and GridSearchCV")
+    p.set_defaults(fn=cmd_check)
 
     p = sub.add_parser("experiments")
     conn(p)

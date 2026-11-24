@@ -64,7 +64,17 @@ def build(sdk: str = "iphonesimulator", pkgs: list[str] | None = None, team: str
         for mod, why in rep.excluded.items():
             print(f"  left out {mod}: {why}")
     t1 = time.time()
-    (CONFIG_DIR / "app-settings.json").write_text(json.dumps({"wifi": bool(cfg.get("wifi")), "torch_mps": bool(cfg.get("torch_mps"))}))
+    # torch's Metal backend is on unless a bundled torch couldn't get its iOS
+    # shaders (then most GPU operations would fail) or the user turned it off.
+    mps = cfg.get("torch_mps")
+    if mps is None:
+        mps = True
+        rep = stage_mod.STAGE_ROOT / sdk / "stage-report.json"
+        if rep.exists():
+            r = json.loads(rep.read_text())
+            if "torch" in r.get("dists", {}) and not r.get("notes", {}).get("torch_metal"):
+                mps = False
+    (CONFIG_DIR / "app-settings.json").write_text(json.dumps({"wifi": bool(cfg.get("wifi")), "torch_mps": bool(mps)}))
     env = {**os.environ, "POCKETNODE_TEAM": team, "POCKETNODE_BUNDLE_ID": bundle_id}
     r = _run(["xcodegen", "generate", "-q"], cwd=IOS_DIR, env=env)
     if r.returncode:

@@ -122,15 +122,14 @@ def phone_packages(executor=None) -> dict[str, str] | None:
 
 
 def table(check: bool = True, executor=None) -> list[Row]:
+    from .hot import footprint
     on_phone = {k.lower(): v for k, v in (phone_packages(executor) or {}).items()}
     rows = []
     for d in sorted(md.distributions(), key=lambda d: (d.metadata["Name"] or "").lower()):
         name = d.metadata["Name"]
         if not name:
             continue
-        files = _dist_files(d)
-        compiled = any(str(f).endswith((".so", ".dylib")) for f in files)
-        size = sum(f.stat().st_size for f in files if f.is_file()) / 2**20
+        compiled, size = footprint(d)
         if not compiled:
             rows.append(Row(name, d.version, "pure", "auto", "-", "imported from the Mac on demand", size))
             continue
@@ -151,8 +150,11 @@ def estimate(names: list[str]) -> dict:
     measured = bool(builds) and bool(installs)
     build_s = sorted(h["build_s"] + h["stage_s"] for h in builds)[len(builds) // 2] if builds else 90.0
     install_s = sorted(h["seconds"] for h in installs)[len(installs) // 2] if installs else 40.0
-    sizes = {r.name.lower(): r.size_mb for r in table(check=False)}
-    extra_mb = sum(sizes.get(n.lower(), 0) for n in names)
+    from .hot import footprint
+    extra_mb = 0.0
+    for n in names:
+        with contextlib.suppress(md.PackageNotFoundError):
+            extra_mb += footprint(md.distribution(n))[1]
     build_s += extra_mb * 0.05  # staging/signing scales with size (~20 MB/s, measured order of magnitude)
     install_s += extra_mb * 0.02
     return {"build_s": round(build_s), "install_s": round(install_s), "measured": measured}
@@ -200,7 +202,8 @@ class Packages:
             from . import hot
             with _live(executor) as ex:
                 if ex is not None:
-                    est = hot.estimate(list(names))
+                    have = next(n.hello.get("packages", {}) for n in ex.nodes.values() if n.kind == "phone")
+                    est = hot.estimate(list(names), have=have)
                     print(f"adding {', '.join(names)}: about {est['seconds']} s, {est['mb']} MB"
                           f"{' (measured)' if est['measured'] else ' (estimate)'}")
                     r = hot.add(ex, list(names), quiet=True)
@@ -233,6 +236,12 @@ class Packages:
                     for b in r["bundled"]:
                         print(f"{b} is part of the app build; `pocketnode packages remove --bundle {b}` "
                               "rebuilds without it")
+                    known = {hot._norm(n) for n in r["removed"] + r["bundled"]}
+                    absent = [n for n in names if hot._norm(n) not in known]
+                    if absent:
+                        print(f"{', '.join(absent)} isn't on the phone")
+                    if r.get("restart"):
+                        print(f"  {', '.join(r['restart'])} was loaded: the app restarts to unload it")
                     return r
             print("no phone reachable; removing it from the app build instead")
         return self._change(remove=list(names), yes=yes, sdk=sdk)
@@ -242,11 +251,11 @@ class Packages:
         app_mod.save_config(always_mac=sorted(set(cfg.get("always_mac", [])) | set(names)))
         print(f"won't offer {', '.join(names)} again; tasks needing them run on the Mac")
 
-    def select(self, sdk: str | None = None, bundle: bool = False):
+    def select(self, sdk: str | None = None, bundle: bool = False, executor=None):
         """Interactive checklist: what's on the phone, what could be, what changing it costs.
         Changes go to the running app; bundle=True rebuilds the app with exactly the ticked set."""
-        rows = [r for r in table(check=True) if r.kind == "compiled"]
-        on_phone = phone_packages()
+        rows = [r for r in table(check=True, executor=executor) if r.kind == "compiled"]
+        on_phone = phone_packages(executor)
         if on_phone is None:  # first use: a sensible scientific stack is pre-checked
             have = {r.name.lower() for r in rows}
             checked = {n for n in map(str.lower, DEFAULT_STACK) if n in have}
@@ -254,7 +263,7 @@ class Packages:
         else:
             checked = {r.name.lower() for r in rows if r.status == "on phone"}
             first = False
-        chosen = _checklist(rows, set(checked), recent_misses(), first)  # a copy: the checklist edits it
+        chosen = _checklist(rows, checked, recent_misses(), first, bundle=bundle)
         if chosen is None:
             print("left as is")
             return
@@ -268,9 +277,9 @@ class Packages:
             print("nothing to change")
             return
         if added:
-            self.add(*added, sdk=sdk)
+            self.add(*added, sdk=sdk, executor=executor)
         if dropped:
-            self.remove(*dropped, sdk=sdk)
+            self.remove(*dropped, sdk=sdk, executor=executor)
 
     def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None, new=None, before=None):
         if new is not None:
@@ -310,12 +319,17 @@ class Packages:
         print("done; the phone reconnects on its own")
 
 
-def _checklist(rows: list[Row], checked: set[str], misses: dict[str, int], first: bool) -> set[str] | None:
-    """Curses checklist. Returns the chosen package names (lowercase), or None if cancelled."""
+def _checklist(rows: list[Row], checked: set[str], misses: dict[str, int], first: bool,
+               bundle: bool = False) -> set[str] | None:
+    """Curses checklist. Returns the chosen package names (lowercase), or None if cancelled.
+    bundle: changes rebuild the app (the footer estimates a build) rather than go to the running app."""
     import curses
 
-    start = set(checked)
+    from . import hot
+
+    start, checked = set(checked), set(checked)
     sizes = {r.name.lower(): r.size_mb for r in rows}
+    have = {r.name: r.version for r in rows if r.status == "on phone"}
     rows = sorted(rows, key=lambda r: (r.name.lower() not in checked and r.name.lower() not in misses,
                                        r.ios == "blocked", r.name.lower()))
 
@@ -342,11 +356,17 @@ def _checklist(rows: list[Row], checked: set[str], misses: dict[str, int], first
                 line = f"{box} {r.name[:26]:26} {r.version[:12]:12} {r.size_mb:6.0f} MB{flag}  {note}"
                 scr.addnstr(2 + i, 0, line, w - 1, curses.A_REVERSE if top + i == pos else 0)
             add, drop = sorted(checked - start), sorted(start - checked)
-            mb = sum(sizes.get(n, 0) for n in add)
-            est = estimate(add) if (add or drop or first) else None
-            foot = ("no changes" if est is None else
-                    f"+{', '.join(add) or '-'}  -{', '.join(drop) or '-'}   about {est['build_s'] + est['install_s']} s"
-                    f"{'' if est['measured'] else ' (first-time estimate)'}, {mb:.0f} MB more; the app restarts")
+            change = f"+{', '.join(add) or '-'}  -{', '.join(drop) or '-'}   "
+            if not (add or drop or first):
+                foot = "no changes"
+            elif bundle:
+                est, mb = estimate(add), sum(sizes.get(n, 0) for n in add)
+                foot = (f"{change}about {est['build_s'] + est['install_s']} s"
+                        f"{'' if est['measured'] else ' (first-time estimate)'}, {mb:.0f} MB more; the app restarts")
+            else:
+                est = hot.estimate(add, have=have) if add else {"seconds": 0, "mb": 0, "measured": True}
+                foot = (f"{change}about {est['seconds']} s{'' if est['measured'] else ' (estimate)'}, "
+                        f"{est['mb']} MB to send; the app keeps running")
             scr.addnstr(h - 2, 0, foot, w - 1, curses.A_BOLD)
             scr.refresh()
             k = scr.getch()

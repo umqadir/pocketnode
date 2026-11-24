@@ -30,7 +30,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from . import compat, device, guards, serialize, subinterp
+from . import compat, device, envinfo, guards, serialize, subinterp
 from .errors import TaskCancelled, Unavailable
 from .importer import RemoteFinder, _local_versions, _norm, install as install_finder
 from .store import BufferStore
@@ -231,6 +231,7 @@ class Worker:
             "state": self.state(),
             "store": self.store.stats(),
             "last_crash": self.last_crash,
+            "source": envinfo.source_version(),
             "simulator": bool(os.environ.get("SIMULATOR_UDID")),
             "site": str(self.site),
             "disk_free": shutil.disk_usage(self.site).free,
@@ -299,9 +300,20 @@ class Worker:
         self._accept_loop(servers[0])
 
     def _accept_loop(self, srv: socket.socket) -> None:
+        # accept() itself can fail (a client that connects and resets at once
+        # gives ECONNABORTED). That must never end the loop: a worker that has
+        # stopped listening looks alive and can't be reached.
         while True:
-            s, _ = srv.accept()
-            threading.Thread(target=self._session, args=(s,), daemon=True, name="pn-session").start()
+            try:
+                s, _ = srv.accept()
+                threading.Thread(target=self._session, args=(s,), daemon=True, name="pn-session").start()
+            except OSError:
+                if srv.fileno() < 0:
+                    return
+                time.sleep(0.05)
+            except Exception:  # noqa: BLE001
+                traceback.print_exc(file=sys.__stderr__)
+                time.sleep(0.05)
 
     def _state_loop(self) -> None:
         last = None

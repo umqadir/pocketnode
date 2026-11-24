@@ -16,7 +16,7 @@
 // unrecognized selector aborts the app). An iPhone has one GPU: it is never
 // headless or removable. Whether it reports "low power" decides whether such
 // code uses it at all, so that follows the app's torch_mps setting.
-static BOOL pn_gpu_enabled = NO;
+static BOOL pn_gpu_enabled = YES;
 static BOOL pn_no(id self, SEL _cmd) { return NO; }
 static BOOL pn_low_power(id self, SEL _cmd) { return !pn_gpu_enabled; }
 
@@ -30,6 +30,19 @@ static void pn_add_macos_metal_selectors(void) {
     for (size_t i = 0; i < sizeof(add) / sizeof(add[0]); i++) {
         SEL sel = sel_registerName(add[i].name);
         if (![device respondsToSelector:sel]) class_addMethod(cls, sel, add[i].imp, "B@:");
+    }
+    if (pn_gpu_enabled) {
+        // PyTorch's Metal backend also insists on the "Mac2" GPU family. With the
+        // torch_mps setting on, the phone's GPU answers yes to that one question.
+        SEL sel = @selector(supportsFamily:);
+        Method m = class_getInstanceMethod(cls, sel);
+        if (m) {
+            BOOL (*orig)(id, SEL, MTLGPUFamily) = (BOOL (*)(id, SEL, MTLGPUFamily))method_getImplementation(m);
+            IMP imp = imp_implementationWithBlock(^BOOL(id self, MTLGPUFamily family) {
+                return family == MTLGPUFamilyMac2 ? YES : orig(self, sel, family);
+            });
+            class_replaceMethod(cls, sel, imp, method_getTypeEncoding(m));
+        }
     }
 }
 

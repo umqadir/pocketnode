@@ -49,6 +49,7 @@ class Report:
     binaries: int = 0
     excluded: dict[str, str] = field(default_factory=dict)  # module -> reason
     warnings: list[str] = field(default_factory=list)
+    notes: dict = field(default_factory=dict)
     seconds: float = 0.0
 
 
@@ -183,6 +184,14 @@ class Stager:
                 self._copy_dist(d)
         for name, src in (extra_paths or {}).items():
             shutil.copytree(src, self.pk / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        if "torch" in self.report.dists and (self.pk / "torch/lib/libtorch_cpu.dylib").exists():
+            from . import torch_metal
+            try:  # before retagging, which thins, re-signs and moves the dylib
+                if torch_metal.install(self.pk, self.report.dists["torch"], self.sdk):
+                    self.report.notes["torch_metal"] = True
+            except Exception as e:
+                self.report.warnings.append(f"torch: no iOS GPU shaders ({e}); torch's Metal backend will be "
+                                            "limited to operations that don't need them")
         self._convert_binaries()
         if "mlx" in self.report.dists and (self.pk / "mlx").exists():
             from . import mlx_metal
@@ -260,6 +269,9 @@ class Stager:
 
     def _framework_name(self, p: Path) -> str:
         rel = p.relative_to(self.pk)
+        if rel.as_posix() == "torch/lib/libtorch_cpu.dylib":
+            # torch finds its Metal shaders in the loaded image whose path contains this.
+            return "libtorch_cpu.dylib"
         stem = rel.name.split(".")[0] if p.suffix == ".so" else rel.name.split(".dylib")[0]
         dotted = ".".join([*(x.lstrip(".") for x in rel.parent.parts), stem])
         return re.sub(r"[^A-Za-z0-9_.]", "_", dotted)
@@ -403,7 +415,7 @@ class Stager:
     def _write_plist(self, dest: Path, fw: str) -> None:
         plist = {
             "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": fw,
-            "CFBundleIdentifier": f"{self.bundle_id}.{fw}".replace("_", "-"),
+            "CFBundleIdentifier": re.sub(r"[^A-Za-z0-9.-]", "-", f"{self.bundle_id}.{fw}"),
             "CFBundleInfoDictionaryVersion": "6.0", "CFBundlePackageType": "FMWK",
             "CFBundleShortVersionString": "1.0", "CFBundleVersion": "1",
             "CFBundleSupportedPlatforms": ["iPhoneSimulator" if self.sdk == "iphonesimulator" else "iPhoneOS"],

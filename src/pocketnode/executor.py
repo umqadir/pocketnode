@@ -575,6 +575,10 @@ class PocketExecutor(Executor):
         if node.kind != "mac":
             self._note(("node", node.name), f"pocketnode: {node.label()} connected "
                        f"({node.slots} slots, Python {'.'.join(map(str, node.hello['python']))})")
+            theirs = node.hello.get("source")
+            if theirs and theirs != envinfo.source_version() and not node.same_env:
+                self._note(("stale", node.id), f"pocketnode: the app on {node.name} was built from a different "
+                           "version of pocketnode than this one; run `pocketnode app install` to update it")
             crash = node.hello.get("last_crash")
             if crash:
                 lines = [l.strip() for l in crash.splitlines() if l.strip()]

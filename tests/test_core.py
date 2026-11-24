@@ -674,3 +674,20 @@ def test_task_that_kills_the_phone_app(ex):
         ex.on("phone").submit(dies_on_phone).result(timeout=90)
     assert ex.wait_for("phone", 30)
     assert ex.on("phone").submit(lambda: 7).result(timeout=30) == 7
+
+
+def test_acceptance_check_runs_against_the_stand_in():
+    if not SIM_PY.exists():
+        pytest.skip("no phone stand-in env (.phone-sim)")
+    from pocketnode import check
+    prev = pn._current
+    e = pn.connect(mac_workers=2, phone=False, simulate_phone=str(SIM_PY), notes=False, auto_add=False)
+    try:
+        assert e.wait_for("phone", 30) and e.wait_for("mac", 30)
+        results = check.run(e, quick=True)
+    finally:
+        e.shutdown(wait=False)
+        pn._current = prev
+    failed = [(name, detail) for name, ok, detail in results if ok is False]
+    assert not failed, failed
+    assert sum(ok is True for _, ok, _ in results) >= 12

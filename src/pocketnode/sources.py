@@ -199,6 +199,7 @@ class PhoneLink(Source):
         self.relaunch = relaunch
         self._stop = False
         self._last_launch = 0.0
+        self._launches = 0
         self.status = "waiting for a phone"
 
     def describe(self) -> str:
@@ -261,7 +262,11 @@ class PhoneLink(Source):
                     self.status = "phone attached, app not answering"
                 if self.relaunch and failures >= 2 and time.monotonic() - self._last_launch > 30:
                     self._last_launch = time.monotonic()
-                    why = launch_app(usb[0].serial)
+                    self._launches += 1
+                    # Launching only brings a running app to the front. If it has
+                    # been launched twice and still doesn't answer, it is running
+                    # but deaf: start it afresh.
+                    why = launch_app(usb[0].serial, restart=self._launches >= 3)
                     if why:
                         # Launching again would only put the same alert on the
                         # phone's screen; this one is waiting for the user.
@@ -271,6 +276,7 @@ class PhoneLink(Source):
                 time.sleep(1.0)
                 continue
             failures = 0
+            self._launches = 0
             self.status = f"connected to {node.name}"
             while node.connected and not self._stop:
                 time.sleep(0.3)
@@ -279,7 +285,7 @@ class PhoneLink(Source):
         self._stop = True
 
 
-def launch_app(udid: str) -> str | None:
+def launch_app(udid: str, restart: bool = False) -> str | None:
     """Start (or foreground) the pocketnode app on the phone over USB.
 
     Returns None if it launched or may launch on a later try, or the reason it
@@ -291,7 +297,8 @@ def launch_app(udid: str) -> str | None:
             bundle_id = json.loads((CONFIG_DIR / "app.json").read_text()).get("bundle_id", BUNDLE_ID)
         except (OSError, ValueError):
             bundle_id = BUNDLE_ID
-        r = subprocess.run(["xcrun", "devicectl", "device", "process", "launch", "--device", udid,
+        r = subprocess.run(["xcrun", "devicectl", "device", "process", "launch",
+                            *(["--terminate-existing"] if restart else []), "--device", udid,
                             bundle_id], capture_output=True, text=True, timeout=60)
         if r.returncode == 0:
             log.info("pocketnode: launched the app on the phone")
