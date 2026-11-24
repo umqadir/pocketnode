@@ -362,5 +362,23 @@ Question: can pocketnode be an app the App Store would accept? Rules were read f
 - The phone lists paired Macs and can forget any of them, shows who is connected and what is running, and has one switch that stops everything and refuses connections.
 - What review will expect, and gets: a connection the person starts, state that is always visible, and a way to stop.
 
+### Interaction model: how much the phone has to ask
+The sideloaded app runs whatever its Mac sends, silently. That is the one thing the store edition can't keep as it is. Four designs were compared against the rule text and the 2026 cases.
+
+- What the text requires. 3.3.1(B) puts no consent or display condition on interpreted code; all four designs meet it equally. 2.5.2's main sentence asks whether the code "introduces or changes features or functionality of the app"; no interaction design changes the answer, it only changes how plainly the app reads as a tool that runs its user's own code. Only the educational exception asks for source that is "completely viewable and editable", and pocketnode isn't an educational app (Expo repositioned Expo Go that way and its updates stayed unapproved).
+- What the cases show. Approved in 2026: Codea runs code pushed from a computer at once, with no prompt per change, and that code is readable in the app; a-Shell and Juno run scripts and downloaded pure-Python packages without prompts, and the files are readable on the device. Not approved: apps that ran software the person couldn't see as code (generated apps in Replit, Vibecode and Anything; Expo Go's bundles). The dividing property is visibility and ownership of the code on the device, not a tap per run.
+
+| Design | Meets the text | Fits the approved cases | Cost to the product |
+|---|---|---|---|
+| Session consent only (pair, running indicator, stop), code not shown | Yes | No: this is Expo Go's shape | None |
+| Session consent, plus everything that runs is shown on the phone with its source | Yes | Yes: Codea's shape, minus editing | None at run time |
+| The same, plus approval of each new piece of the user's own code before it runs | Yes | Yes, with the most margin | One tap per new function; a `%%phone` cell is new code every time it is edited |
+| Source of everything editable on the phone | Yes | Only needed for the educational exception | Editing a function on the phone would make its result differ from the Mac's, which the project forbids |
+| A tap on the phone for every run | Yes | Not asked for by any rule or case | Ends the product: an executor can't ask per task |
+
+- Chosen: session consent with full visibility. Pairing is the consent ("Allow <Mac> to run Python code on this iPhone?"). The phone always shows who is connected and what is running, lists every function a Mac has sent with its source (a disassembly when no source exists), lets the person read every Python file fetched from the Mac, and has one switch that stops everything. The lighter design (no source shown) isn't defensible because nothing would distinguish the app from a loader of unseen code. The heavier ones aren't required by the text or by any approved case.
+- Built in as an option, off by default: "Ask before running new code". With it on, the first task carrying a given piece of the user's own code waits until the person has read it on the phone and tapped Allow. Approval is per code (a hash of the text shown), not per call and not per argument type, so a 200-task map asks once. Code from installed packages is never asked about: scikit-learn submits its own `_fit_and_score`, not the user's function, and packages are either part of the reviewed app or pure-Python files mirrored from the Mac that are readable in the app. Until the person answers, automatically placed work runs on the Mac and work forced onto the phone waits (two minutes, then an error that says why). The build setting `store_review` makes it the default, which is the fallback if review asks for more than visibility.
+- The app also runs code typed on the phone ("Try it on this iPhone"), so it is useful, and reviewable, with no Mac.
+
 ### Version policy
 - The sideloaded phone runs the Mac's own binaries, so versions always match. The store phone has a fixed set, so they often won't. A compiled package is used on the store phone only when the Mac has the same release (major.minor.patch); otherwise the task runs on the Mac and the note says which version would match. The first-result check against the Mac still applies on top.

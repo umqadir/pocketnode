@@ -165,6 +165,42 @@ These are the failures seen while building pocketnode, and the messages it print
 - **"Python 3.x"** at the first setup step: the Mac's Python must be 3.13 to match the phone's. Create a 3.13 environment (`uv venv --python 3.13`) and install pocketnode there.
 - A build that fails for another reason prints xcodebuild's errors and the path of the full log (in `~/.pocketnode/ios/build`).
 
+## Store edition
+
+Everything above describes the sideloaded app, which you build and sign yourself. The same project also builds a second flavour meant for the App Store. It has not been submitted: that needs a paid Apple Developer Program membership. `RESEARCH-NOTES.md` ("App Store edition: feasibility") has the rules it was built to, with sources.
+
+What differs, and why:
+
+| | Sideloaded | Store edition |
+|---|---|---|
+| Compiled packages | the Mac's own, retagged for iOS | a fixed set of real iOS builds inside the app |
+| Adding a compiled package later | seconds, while the app runs | not possible: the rules forbid downloading native code, and it needs your development certificate |
+| PyTorch, and torch or MLX on the GPU | yes | no: neither has an iOS build of its Python package |
+| Pure-Python packages | imported from the Mac on demand | the same |
+| Pairing | a token baked into your build | on the phone: tap Pair a Mac, type the code on the Mac, tap Allow |
+| What the phone shows | a status line | who is connected, what is running, the source of every function a Mac has sent, every Python file fetched from the Mac |
+| Stopping | quit the app | one switch (Accept work) and a Stop button |
+| Background computing | asked for when work arrives | only when you tap "Keep running in the background" |
+| Without a Mac | nothing to do | "Try it on this iPhone" runs Python you type |
+
+Retagged macOS binaries can't ship in it. They lack a load command Apple's linker only writes when it links for iOS, and App Store Connect rejects uploads without it. So the store edition takes compiled packages only from iOS wheels: published ones (numpy, pillow, kiwisolver, markupsafe, contourpy, cffi), and ones cross-compiled here (pandas). The list is `src/pocketnode/ios/Store/packages.txt`; `pocketnode app wheel NAME VERSION` cross-compiles a C or Cython package into the wheelhouse so it can be added. scipy, scikit-learn, polars and pyarrow aren't in it yet: each needs its own cross-build (the notes say what that takes).
+
+Because the set is fixed, the phone is used for a compiled package only when your Mac has the same release of it (`uv pip install numpy==2.5.2 pandas==3.1.1` for the default set). Otherwise those tasks run on the Mac and pocketnode says which version would match. Tasks that need a package the app doesn't have run on the Mac too.
+
+Building and trying it:
+
+```
+pocketnode app wheel pandas 3.1.1          # once: cross-compile pandas for iOS (about 4 minutes)
+pocketnode app install --store --sim       # build it and run it in the simulator (port 7161: add --port 7161)
+pocketnode pair --address 127.0.0.1:7161   # type the code the app shows after you tap Pair a Mac
+pocketnode check --address 127.0.0.1:7161
+pocketnode app archive                     # Release archive for submission (unsigned unless --team is given)
+pocketnode app validate                    # checks the archive the way upload validation would
+pocketnode app build --dev                 # back to the sideloaded flavour
+```
+
+On a real phone, `pocketnode pair` works over the cable with no address. "Ask before running new code" in the app makes each new function of yours wait until you have read it on the phone and tapped Allow; it is off by default, and the `store_review` setting in `~/.pocketnode/app.json` makes it the default for a build. `store_tls: false` leaves Python's `ssl` module out of the app, which removes the export-compliance paperwork for bundled OpenSSL at the price of tasks not being able to use HTTPS on the phone.
+
 ## Layout
 
 - `src/pocketnode/`: Mac side (executor, router, transport, integrations) and the worker that runs on the phone.

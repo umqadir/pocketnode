@@ -30,6 +30,11 @@ REVOKED = "the iPhone no longer has this Mac's pairing: run `pocketnode pair` ag
 OPEN_APP = "open the pocketnode app on the iPhone"
 
 
+def _from_store(e: Refused) -> bool:
+    """Was this refusal from the App Store edition (paused there, say), as its hello shows?"""
+    return (getattr(e, "hello", None) or {}).get("edition") == "store"
+
+
 def app_config() -> dict:
     """The app's build settings (~/.pocketnode/app.json)."""
     import json
@@ -148,6 +153,17 @@ class LocalWorkers(Source):
     def _attach(self, ex, s):
         try:
             attach(ex, s, self, self.token)
+            self.unblock()
+        except NotPaired:
+            self.block(UNPAIRED)
+            s.close()
+        except PairingRevoked:
+            self.block(REVOKED)
+            s.close()
+        except Refused as e:
+            if _from_store(e):
+                self.block(str(e))
+            s.close()
         except Exception as e:
             log.debug("local worker failed handshake: %s", e)
             s.close()
@@ -231,19 +247,24 @@ class Address(Source):
                 s = self._connect()
                 s.settimeout(None)
                 node = attach(ex, s, self, self.token or pairing_token)
+                self.unblock()
                 self.status = f"connected to {node.name}"
                 while node.connected and not self._stop:
                     time.sleep(0.5)
             except Refused as e:
                 self.status = str(e)
+                if _from_store(e):
+                    self.block(str(e))
                 ex._note(("refused", self.addr), f"pocketnode: {self.addr}: {e}")
                 time.sleep(max(self.retry, 5.0))
             except NotPaired:
                 self.status = UNPAIRED
+                self.block(UNPAIRED)
                 ex._note(("unpaired", self.addr), f"pocketnode: {UNPAIRED}")
                 time.sleep(max(self.retry, 3.0))
             except PairingRevoked:
                 self.status = REVOKED
+                self.block(REVOKED)
                 ex._note(("revoked", self.addr), f"pocketnode: {REVOKED}")
                 time.sleep(max(self.retry, 5.0))
             except Exception as e:
@@ -316,18 +337,23 @@ class PhoneLink(Source):
                     s = usbmux.connect(dev.id, self.port)
                     node = attach(ex, s, self, self.token or pairing_token)
                     self.store_seen |= node.hello.get("edition") == "store"
+                    self.unblock()
                     break
                 except Refused as e:
-                    self.store_seen |= (getattr(e, "hello", None) or {}).get("edition") == "store"
+                    self.store_seen |= _from_store(e)
+                    if _from_store(e):
+                        self.block(str(e))
                     self.status = str(e)
                     ex._note(("refused", dev.serial), f"pocketnode: {e}")
                     time.sleep(5)
                 except NotPaired:
                     pairing = self.store_seen = True
+                    self.block(UNPAIRED)
                     self.status = UNPAIRED
                     ex._note(("unpaired", dev.serial), f"pocketnode: {UNPAIRED}")
                 except PairingRevoked:
                     pairing = self.store_seen = True
+                    self.block(REVOKED)
                     self.status = REVOKED
                     ex._note(("revoked", dev.serial), f"pocketnode: {REVOKED}")
                 except PermissionError:

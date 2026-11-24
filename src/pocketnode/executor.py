@@ -41,6 +41,9 @@ THERMAL_SCALE = {"nominal": 1.0, "fair": 1.0, "serious": 0.5, "critical": 0.0}
 BACKGROUND_SLOWDOWN = 15.0
 # A task forced onto a phone that asks before running new code waits this long for Allow.
 APPROVAL_WAIT = 120.0
+# A forced task fails this long after its phone has turned this Mac away (paused, not paired),
+# so a phone that is only reconnecting isn't failed.
+BLOCKED_GRACE = 5.0
 SRC_LIMIT = 32 << 10  # bytes of source (or disassembly) sent to a store phone per function
 
 
@@ -262,6 +265,18 @@ class Source:
     same_env = False
     bandwidth_guess = 30e6
     latency_guess = 0.002
+    # Set while the phone answers but turns this Mac away for a reason only a person can clear
+    # (paused there, not paired, pairing forgotten): the sentence saying so, and since when.
+    blocked: str | None = None
+    blocked_since: float = 0.0
+
+    def block(self, why: str) -> None:
+        if self.blocked is None:
+            self.blocked_since = time.monotonic()
+        self.blocked = why
+
+    def unblock(self) -> None:
+        self.blocked = None
 
     def start(self, ex: "PocketExecutor") -> None:
         raise NotImplementedError
@@ -773,6 +788,8 @@ class PocketExecutor(Executor):
         launched = False
         if self._held:
             self._check_held()
+        if any(s.blocked for s in self.sources):
+            self._fail_blocked()
         # Fastest node kinds first so the Mac fills before the phone gets marginal work.
         nodes = sorted(self.nodes.values(), key=lambda n: (n.kind != "mac", n.name))
         now = time.monotonic()
@@ -1247,6 +1264,22 @@ class PocketExecutor(Executor):
                 self.queue.appendleft(task)
             self._qgen += 1
             self._cv.notify_all()
+
+    def _fail_blocked(self) -> None:
+        """Tasks forced onto a phone that turns this Mac away (paused, not paired, forgotten) fail
+        with the reason, once that has held for BLOCKED_GRACE seconds and no such node is connected.
+        (With no phone at all, as before, they wait for one.) Under self._cv."""
+        now = time.monotonic()
+        why = next((s.blocked for s in self.sources
+                    if s.blocked and now - s.blocked_since >= BLOCKED_GRACE), None)
+        if why is None:
+            return
+        for t in list(self.queue):
+            if t.done or not t.queued or t.placement in ("auto", None, "mac"):
+                continue
+            if any(_matches(n, t.placement) for n in self.nodes.values()):
+                continue
+            self._fail(t, PlacementError(f"{t.fn_label} can't run on the {t.placement}: {why}"))
 
     def _check_held(self) -> None:
         """Forced tasks waiting for approval: release, fail on Don't Allow, or time out. Under self._cv."""

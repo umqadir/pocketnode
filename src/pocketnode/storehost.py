@@ -161,17 +161,52 @@ def note(text: str) -> str:
     return ""
 
 
-def _compiled_packages() -> dict[str, str]:
+_BINARY = (".so", ".dylib", ".fwork")
+
+
+def _is_compiled(d) -> bool:
+    """Does a distribution carry compiled code? In the iOS app each extension module has been
+    moved into Frameworks and a .fwork marker left in its place, and RECORD may still name the
+    original .so, so what is on disk under its top-level packages decides; RECORD is the fallback."""
+    from pathlib import PurePosixPath
+    try:
+        base = Path(d.locate_file(""))
+    except Exception:  # noqa: BLE001
+        base = None
+    files = list(d.files or ())
+    tops = (d.read_text("top_level.txt") or "").split()
+    if not tops:
+        tops = sorted({PurePosixPath(str(f)).parts[0].split(".")[0] for f in files
+                       if PurePosixPath(str(f)).parts
+                       and not PurePosixPath(str(f)).parts[0].endswith((".dist-info", ".data", ".egg-info"))
+                       and PurePosixPath(str(f)).parts[0] not in ("..", "__pycache__")})
+    if base is not None and base.is_dir():
+        for t in tops:
+            p = base / t
+            try:
+                if p.is_dir() and any(f.name.endswith(_BINARY) for f in p.rglob("*")):
+                    return True
+                if any(f.name.endswith(_BINARY) for f in base.glob(f"{t}.*")):  # a top-level module
+                    return True
+            except OSError:
+                continue
+    return any(str(f).endswith(_BINARY) for f in files)
+
+
+def _compiled_packages(dists=None) -> dict[str, str]:
     """Distributions in the app that carry compiled code (fixed at build time, so read once)."""
     global _compiled
-    if _compiled is None:
+    if _compiled is None or dists is not None:
         import importlib.metadata as md
         out = {}
-        for d in md.distributions():
+        for d in (md.distributions() if dists is None else dists):
             n = d.metadata["Name"]
-            if n and n not in out and any(str(f).endswith((".so", ".dylib", ".fwork")) for f in d.files or ()):
+            if n and n not in out and _is_compiled(d):
                 out[n] = d.version
-        _compiled = dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+        found = dict(sorted(out.items(), key=lambda kv: kv[0].lower()))
+        if dists is not None:
+            return found
+        _compiled = found
     return _compiled
 
 

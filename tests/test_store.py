@@ -970,3 +970,141 @@ def test_phonelink_never_launches_a_store_app(monkeypatch, mac_home):
     run(3.5)
     assert launches == ["UDID-1"]
     assert not (mac_home / "token").exists()
+
+
+# ------------------------------------------------------------------ round 3
+
+def _fake_app_site(tmp_path) -> Path:
+    """A site directory laid out as in the iOS app: the extension module moved to Frameworks,
+    a .fwork marker in its place, and RECORD still naming the original .so."""
+    site = tmp_path / "app-site"
+    info = site / "fakebin-1.2.dist-info"
+    pkg = site / "fakebin"
+    info.mkdir(parents=True)
+    (pkg / "sub").mkdir(parents=True)
+    (info / "METADATA").write_text("Metadata-Version: 2.1\nName: fakebin\nVersion: 1.2\n")
+    (info / "top_level.txt").write_text("fakebin\n")
+    (info / "RECORD").write_text("fakebin/__init__.py,,\nfakebin/sub/_core.cpython-313-darwin.so,,\n"
+                                 "fakebin-1.2.dist-info/METADATA,,\n")
+    (pkg / "__init__.py").write_text("")
+    (pkg / "sub" / "_core.cpython-313-iphoneos.fwork").write_text("Frameworks/fakebin.sub._core.framework/x\n")
+    pure = site / "fakepure-0.1.dist-info"
+    pure.mkdir()
+    (pure / "METADATA").write_text("Metadata-Version: 2.1\nName: fakepure\nVersion: 0.1\n")
+    (pure / "RECORD").write_text("fakepure.py,,\nfakepure-0.1.dist-info/METADATA,,\n")
+    (site / "fakepure.py").write_text("")
+    return site
+
+
+def test_compiled_packages_found_by_their_fwork_markers(tmp_path, sw, monkeypatch):
+    import importlib.metadata as md
+
+    from pocketnode import storehost
+    site = _fake_app_site(tmp_path)
+    # RECORD names a .so that isn't on disk; RECORD alone would still say compiled here, so
+    # check the on-disk walk with a RECORD that names nothing binary too.
+    assert storehost._compiled_packages(md.distributions(path=[str(site)])) == {"fakebin": "1.2"}
+    rec = site / "fakebin-1.2.dist-info" / "RECORD"
+    rec.write_text("fakebin/__init__.py,,\nfakebin-1.2.dist-info/METADATA,,\n")
+    (site / "fakebin-1.2.dist-info" / "top_level.txt").unlink()  # top-level names from RECORD then
+    assert storehost._compiled_packages(md.distributions(path=[str(site)])) == {"fakebin": "1.2"}
+    # The hello the Mac routes by lists every distribution with its version, binary or not.
+    monkeypatch.syspath_prepend(str(site))
+    pk = sw.hello()["packages"]
+    assert pk["fakebin"] == "1.2" and pk["fakepure"] == "0.1"
+
+
+def test_simulator_names_the_device_it_plays(monkeypatch):
+    from pocketnode import device
+    monkeypatch.setattr(device, "IS_IOS", True)
+    monkeypatch.setattr(device, "sysctl", lambda name, kind=int: "arm64")
+    monkeypatch.setenv("SIMULATOR_MODEL_IDENTIFIER", "iPhone18,1")
+    assert device.model() == "iPhone18,1 (simulator)"
+    monkeypatch.delenv("SIMULATOR_MODEL_IDENTIFIER")
+    assert device.model() == "arm64"  # a real device reports its own machine
+
+
+def test_wifi_off_says_bye(sw):
+    from pocketnode.storeworker import lan_ip
+    ip = lan_ip()
+    if ip is None:
+        pytest.skip("this Mac has no LAN address")
+    sw.set_wifi(True)
+    ex = pn.PocketExecutor(notes=False)
+    src = sources.Address(f"{ip}:{sw.port}", token="unused", retry=0.3, credentials=_cred(sw))
+    ex.add_source(src)
+    try:
+        assert ex.wait_for("phone", 20), src.status
+        assert any(s["link"] == "wifi" for s in sw.sessions_info())
+        node = next(iter(ex.nodes.values()))
+        sw.set_wifi(False)
+        assert _wait(lambda: not ex.nodes)
+        assert node.bye == "wifi_off" and node.lost_as_crash is False
+    finally:
+        src.stop()
+        ex.shutdown(wait=False)
+        sw.set_wifi(False)
+
+
+@pytest.fixture
+def short_grace(monkeypatch):
+    from pocketnode import executor as ex_mod
+    monkeypatch.setattr(ex_mod, "BLOCKED_GRACE", 1.0)
+
+
+def _forced_fails_promptly(ex, match):
+    t0 = time.monotonic()
+    f = ex.on("phone").submit(labelled_task, 1)  # queued before (or while) the phone turns us away
+    with pytest.raises(PlacementError, match=match):
+        f.result(timeout=30)
+    assert time.monotonic() - t0 < 20
+    # One submitted once the state is known fails too.
+    with pytest.raises(PlacementError, match=match):
+        ex.on("phone").submit(labelled_task, 2).result(timeout=10)
+
+
+def test_forced_task_fails_when_the_phone_is_paused(sw, short_grace):
+    from pocketnode.storeworker import PAUSED
+    sw.set_accepting(False)
+    ex = pn.PocketExecutor(notes=False)
+    src = sources.Address(f"127.0.0.1:{sw.port}", token="unused", retry=0.3, credentials=_cred(sw))
+    ex.add_source(src)
+    try:
+        _forced_fails_promptly(ex, "Accept work is off")
+        assert src.blocked == PAUSED
+    finally:
+        sw.set_accepting(True)
+        src.stop()
+        ex.shutdown(wait=False)
+
+
+@pytest.mark.parametrize("state", ["unpaired", "revoked"])
+def test_forced_task_fails_when_this_mac_isnt_paired(state, short_grace):
+    if not SIM_PY.exists():
+        pytest.skip("no phone stand-in env (.phone-sim)")
+    src = sources.SimulatedPhone(python=str(SIM_PY), edition="store", slots=1)
+    if state == "unpaired":
+        src.credentials = lambda hello: None
+        match, sentence = "isn't paired with this Mac", sources.UNPAIRED
+    else:  # a pair id the phone doesn't know (any more)
+        src.credentials = lambda hello: ("0" * 64, {"pair_id": "forgotten"})
+        match, sentence = "no longer has this Mac's pairing", sources.REVOKED
+    ex = pn.PocketExecutor(notes=False)
+    ex.add_source(src)
+    try:
+        _forced_fails_promptly(ex, match)
+        assert src.blocked == sentence
+    finally:
+        ex.shutdown(wait=False)
+
+
+def test_forced_task_still_waits_for_a_phone_that_isnt_there():
+    """The dev behaviour: with no phone at all, a forced task waits for one."""
+    ex = pn.PocketExecutor(notes=False)
+    try:
+        f = ex.on("phone").submit(labelled_task, 1)
+        time.sleep(1.5)
+        assert not f.done()
+        f.cancel()
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)

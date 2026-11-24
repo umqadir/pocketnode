@@ -49,6 +49,10 @@ def core_layout() -> dict:
 
 def model() -> str:
     if IS_IOS:
+        # The simulator reports the Mac's CPU ("arm64") as its machine; it names the device it plays.
+        sim = os.environ.get("SIMULATOR_MODEL_IDENTIFIER")
+        if sim:
+            return f"{sim} (simulator)"
         return sysctl("hw.machine", str) or platform.machine()
     return sysctl("hw.model", str) or platform.machine()
 

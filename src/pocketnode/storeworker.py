@@ -121,7 +121,7 @@ class StoreWorker(Worker):
         """Close sessions; with `why`, say {"t": "bye"} first so the Mac knows it wasn't a crash."""
         with self._lock:
             targets = [s for s in self.sessions.values() if s.live and which(s)]
-        if why:
+        if why and targets:
             for s in targets:
                 self._send({"t": "bye", "why": why}, sid=s.id)
             self._drain()
@@ -375,7 +375,7 @@ class StoreWorker(Worker):
                 srv, self._wifi_srv = self._wifi_srv, None
                 srv.close()
         if not on:
-            self._close_sessions(lambda s: getattr(s, "link", "usb") == "wifi")
+            self._close_sessions(lambda s: getattr(s, "link", "usb") == "wifi", why="wifi_off")
 
     @property
     def wifi(self) -> bool:
