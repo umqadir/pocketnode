@@ -115,7 +115,8 @@ def phone_packages(executor=None) -> dict[str, str] | None:
         for n in ex.nodes.values():
             if n.kind == "phone":
                 return dict(n.hello.get("packages", {}))
-    rep = Path(app_mod.stage_mod.STAGE_ROOT) / app_mod.config().get("sdk", "iphoneos") / "stage-report.json"
+    cfg = app_mod.config()
+    rep = app_mod.stage_dir(cfg.get("sdk", "iphoneos"), app_mod.current_flavour(cfg)) / "stage-report.json"
     if rep.exists():
         return json.loads(rep.read_text())["dists"]
     return None
@@ -123,7 +124,9 @@ def phone_packages(executor=None) -> dict[str, str] | None:
 
 def table(check: bool = True, executor=None) -> list[Row]:
     from .hot import footprint
+    from ..router import release
     on_phone = {k.lower(): v for k, v in (phone_packages(executor) or {}).items()}
+    store = app_mod.current_flavour() == "store"
     rows = []
     for d in sorted(md.distributions(), key=lambda d: (d.metadata["Name"] or "").lower()):
         name = d.metadata["Name"]
@@ -134,7 +137,9 @@ def table(check: bool = True, executor=None) -> list[Row]:
             rows.append(Row(name, d.version, "pure", "auto", "-", "imported from the Mac on demand", size))
             continue
         have = on_phone.get(name.lower())
-        status = "on phone" if have == d.version else (f"phone has {have}" if have else "not on phone")
+        # The store edition's fixed set is used whenever the release matches (2.5.2.post1 serves 2.5.2).
+        same = have == d.version or (store and have is not None and release(have) == release(d.version))
+        status = "on phone" if same else (f"phone has {have}" if have else "not on phone")
         ios, detail = _check_dist(d) if check else ("?", "")
         rows.append(Row(name, d.version, "compiled", status, ios, detail, size))
     return rows

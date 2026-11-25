@@ -264,7 +264,10 @@ static NSString *PNMachine(void) {
     [rows addObject:[PNRow ident:@"thermal" kind:PNRowValue text:@"Thermal state"
                           detail:thermal.length ? thermal.capitalizedString : @"Unknown"]];
     [rows addObject:[PNRow ident:@"python" kind:PNRowValue text:@"Python" detail:PNString(st[@"python"])]];
-    [rows addObject:[PNRow ident:@"version" kind:PNRowValue text:@"pocketnode" detail:PNString(st[@"version"])]];
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *appVersion = [NSString stringWithFormat:@"%@ (%@)", PNString(info[@"CFBundleShortVersionString"]),
+                                                     PNString(info[@"CFBundleVersion"])];
+    [rows addObject:[PNRow ident:@"version" kind:PNRowValue text:@"pocketnode" detail:appVersion]];
     r = [PNRow ident:@"packages" kind:PNRowValue text:@"Packages in this app"
               detail:[NSString stringWithFormat:@"%lu", (unsigned long)PNDict(st[@"packages"]).count]];
     r.disclosure = YES;

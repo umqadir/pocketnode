@@ -1246,11 +1246,15 @@ class PocketExecutor(Executor):
             if node.held.get(code) != "denied":
                 node.held[code] = "waiting" if waiting else "denied"
             self._cv.notify_all()
+        auto = task.placement in ("auto", None) and not self.strict
         if waiting:
+            then = ("it runs on the Mac until you allow it" if auto else
+                    f"it waits up to {APPROVAL_WAIT:.0f} s for you to allow it" if not self.strict else
+                    "approve it on the iPhone and submit it again")
             self._note(("approval", code, node.id),
                        f"pocketnode: {task.fn_label} is waiting for approval on {node.name} (Ask before running "
-                       "new code is on there); it runs on the Mac until you allow it")
-        if task.placement in ("auto", None) and not self.strict:
+                       f"new code is on there); {then}")
+        if auto:
             self._requeue(task, node, _unavailable_reason(u, node), None, quiet=True)
             return
         if not waiting or self.strict:
