@@ -156,6 +156,7 @@ class PairStore:
             data = {}
         data.setdefault("macs", {})
         self._data = data
+        self.on_replaced = None  # called with the pair ids a re-pairing replaced (after saving)
 
     def _save(self) -> None:
         self.backend.write(json.dumps(self._data, separators=(",", ":")))
@@ -184,14 +185,23 @@ class PairStore:
             m = self._data["macs"].get(str(pair_id)) if pair_id else None
             return m.get("name") if m else None
 
-    def add(self, name: str) -> tuple[str, str]:
+    def add(self, name: str, mac_id: str | None = None) -> tuple[str, str]:
+        """Pair a Mac. A Mac that sends the same mac_id as an existing pairing (the same
+        pocketnode home pairing again) replaces it: the old token stops working."""
         pair_id, token = secrets.token_hex(8), secrets.token_hex(32)
         now = time.time()
         with self._lock:
             self.phone_id  # noqa: B018 - created with the first pairing at the latest
-            self._data["macs"][pair_id] = {"name": str(name)[:200], "token": token, "paired_at": now,
-                                           "last_seen": now}
+            replaced = [pid for pid, m in self._data["macs"].items() if mac_id and m.get("mac_id") == mac_id]
+            for pid in replaced:
+                del self._data["macs"][pid]
+            entry = {"name": str(name)[:200], "token": token, "paired_at": now, "last_seen": now}
+            if mac_id:
+                entry["mac_id"] = mac_id
+            self._data["macs"][pair_id] = entry
             self._save()
+        if replaced and self.on_replaced is not None:
+            self.on_replaced(replaced)
         return pair_id, token
 
     def forget(self, pair_id) -> bool:
@@ -342,8 +352,14 @@ class PairingWindow:
             return "timeout", None
         if not answer:
             return "denied", None
-        pair_id, token = store.add(name)
+        pair_id, token = store.add(name, mac_id=_clean_mac_id(msg.get("mac_id")))
         return None, (code, pair_id, token)
+
+
+def _clean_mac_id(value) -> str | None:
+    """A Mac's id as sent in a pair frame, or None when absent or malformed."""
+    s = str(value or "").strip().lower()
+    return s if 8 <= len(s) <= 64 and all(c in "0123456789abcdef" for c in s) else None
 
 
 # ------------------------------------------------------------ Mac: credentials
@@ -374,6 +390,21 @@ def _write_private(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
+
+
+def mac_id() -> str:
+    """This pocketnode home's id, sent when pairing so pairing again replaces the old pairing
+    on the phone instead of adding a second one. Created once (mode 0600, next to paired.json)."""
+    path = _config_dir() / "mac_id"
+    try:
+        found = _clean_mac_id(path.read_text())
+        if found:
+            return found
+    except OSError:
+        pass
+    new = secrets.token_hex(16)
+    _write_private(path, new + "\n")
+    return new
 
 
 def load() -> dict:
@@ -480,7 +511,8 @@ def pair_over(sock: socket.socket, code: str, name: str, where: str = "the iPhon
             raise PairingFailed("not_store")
         nonce_n = str(hello.get("nonce", ""))
         m = secrets.token_hex(16)
-        conn.send({"t": "pair", "name": name, "nonce": m, "proof": hm(code, f"pair:{nonce_n}:{m}")})
+        conn.send({"t": "pair", "name": name, "nonce": m, "proof": hm(code, f"pair:{nonce_n}:{m}"),
+                   "mac_id": mac_id()})
         conn.sock.settimeout(ANSWER_SECONDS)
         try:
             ans, _ = conn.recv()

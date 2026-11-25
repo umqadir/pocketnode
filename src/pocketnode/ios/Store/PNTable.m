@@ -97,7 +97,7 @@ void PNApprove(NSString *code, BOOL allow, void (^done)(void)) {
 
 @implementation PNTableViewController {
     NSArray<PNSection *> *_pending;
-    NSMutableDictionary<NSString *, NSDate *> *_held;  // switches just flipped: status may lag
+    NSMutableDictionary<NSString *, NSDictionary *> *_held;  // switches just flipped: {on, at}; status may lag
     BOOL _swiping;
 }
 
@@ -210,11 +210,15 @@ static NSString *signature(NSArray<PNSection *> *sections) {
             cell.accessoryView = sw;
         }
         sw.ident = row.ident;
-        NSDate *held = _held[row.ident];
-        if (!held || -held.timeIntervalSinceNow > 2.0) {
-            [_held removeObjectForKey:row.ident];
-            if (sw.on != row.on) [sw setOn:row.on animated:old != nil];
+        // The person's choice shows until status reports it, or for 3 s (then status wins).
+        NSDictionary *held = _held[row.ident];
+        BOOL show = row.on;
+        if (held) {
+            BOOL choice = [held[@"on"] boolValue];
+            if (choice == row.on || -[held[@"at"] timeIntervalSinceNow] > 3.0) [_held removeObjectForKey:row.ident];
+            else show = choice;
         }
+        if (sw.on != show) [sw setOn:show animated:old != nil];
         sw.enabled = row.enabled;
         sw.accessibilityLabel = row.text;
         sw.accessibilityHint = row.hint;
@@ -233,10 +237,14 @@ static NSString *signature(NSArray<PNSection *> *sections) {
     return changed;
 }
 
+- (void)releaseSwitch:(NSString *)ident {
+    [_held removeObjectForKey:ident];
+}
+
 - (void)switched:(PNSwitch *)sw {
     PNRow *row = [self rowWithIdent:sw.ident];
     if (!row.toggled) return;
-    _held[sw.ident] = [NSDate date];
+    _held[sw.ident] = @{@"on": @(sw.on), @"at": [NSDate date]};
     row.on = sw.on;
     row.toggled(sw.on, sw);
 }

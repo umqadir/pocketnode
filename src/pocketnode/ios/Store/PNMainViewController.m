@@ -60,21 +60,53 @@ static NSString *PNMachine(void) {
 - (NSString *)sentence:(NSDictionary *)st {
     if (![st[@"ready"] boolValue]) return @"Starting Python…";
     if (st[@"accepting"] && ![st[@"accepting"] boolValue]) return @"Paused: not accepting work";
+    NSDictionary *labels = [self macLabels:st];
     NSArray *sessions = PNArray(st[@"sessions"]);
     if (sessions.count) {
         NSMutableArray *parts = [NSMutableArray array];
         for (NSDictionary *s in sessions) {
             NSDictionary *d = PNDict(s);
-            NSString *mac = PNString(d[@"mac"]).length ? PNString(d[@"mac"]) : @"a Mac";
+            NSString *mac = labels[PNString(d[@"pair_id"])] ?: (PNString(d[@"mac"]).length ? PNString(d[@"mac"]) : @"a Mac");
             [parts addObject:[NSString stringWithFormat:@"%@ over %@", mac, PNLink(PNString(d[@"link"]))]];
         }
         return [@"Connected to " stringByAppendingString:PNJoin(parts, @"and")];
     }
     NSArray *paired = PNArray(st[@"paired"]);
     if (!paired.count) return @"Not paired with a Mac yet";
+    if (paired.count > 2) return @"Waiting for a paired Mac";
     NSMutableArray *names = [NSMutableArray array];
-    for (NSDictionary *m in paired) [names addObject:PNString(PNDict(m)[@"name"]).length ? PNString(PNDict(m)[@"name"]) : @"a Mac"];
+    for (id m in paired) [names addObject:labels[PNString(PNDict(m)[@"pair_id"])] ?: @"a Mac"];
     return [@"Waiting for " stringByAppendingString:PNJoin(names, @"or")];
+}
+
+// pair_id -> the name to show: the Mac's name, with its pairing date when two paired Macs share a
+// name ("MacBook Air (paired 24 Nov)"), and the time too if they were paired on the same day.
+- (NSDictionary<NSString *, NSString *> *)macLabels:(NSDictionary *)st {
+    NSArray *paired = PNArray(st[@"paired"]);
+    NSCountedSet *names = [NSCountedSet set];
+    for (id m in paired) [names addObject:PNString(PNDict(m)[@"name"]).length ? PNString(PNDict(m)[@"name"]) : @"Mac"];
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    for (NSString *tmpl in @[@"", @"dMMM", @"dMMMjmm"]) {
+        [out removeAllObjects];
+        NSDateFormatter *f = [NSDateFormatter new];
+        if (tmpl.length) f.dateFormat = [NSDateFormatter dateFormatFromTemplate:tmpl options:0 locale:[NSLocale currentLocale]];
+        NSCountedSet *seen = [NSCountedSet set];
+        for (id m in paired) {
+            NSDictionary *mac = PNDict(m);
+            NSString *name = PNString(mac[@"name"]).length ? PNString(mac[@"name"]) : @"Mac";
+            NSString *label = name;
+            id at = mac[@"paired_at"];
+            if (tmpl.length && [names countForObject:name] > 1 && [at isKindOfClass:[NSNumber class]])
+                label = [NSString stringWithFormat:@"%@ (paired %@)", name,
+                         [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:[at doubleValue]]]];
+            out[PNString(mac[@"pair_id"])] = label;
+            [seen addObject:label];
+        }
+        BOOL unique = YES;
+        for (NSString *l in seen) if ([seen countForObject:l] > 1) unique = NO;
+        if (unique) break;
+    }
+    return out;
 }
 
 - (NSDictionary *)sessionFor:(NSString *)pairId status:(NSDictionary *)st {
@@ -165,10 +197,11 @@ static NSString *PNMachine(void) {
 
     // 4. Paired Macs
     rows = [NSMutableArray array];
+    NSDictionary *labels = [self macLabels:st];
     for (id m in PNArray(st[@"paired"])) {
         NSDictionary *mac = PNDict(m);
         NSString *pid = PNString(mac[@"pair_id"]);
-        NSString *name = PNString(mac[@"name"]).length ? PNString(mac[@"name"]) : @"Mac";
+        NSString *name = labels[pid] ?: @"Mac";
         NSDictionary *sess = [self sessionFor:pid status:st];
         NSString *detail;
         if (sess) detail = [NSString stringWithFormat:@"Connected over %@", PNLink(PNString(sess[@"link"]))];
@@ -180,7 +213,9 @@ static NSString *PNMachine(void) {
             [weak.navigationController pushViewController:[[PNMacViewController alloc] initWithPairId:pid] animated:YES];
         };
         r.deleteTitle = @"Forget";
-        r.deleted = ^{ PNConfirmForget(weak, mac, nil); };
+        NSMutableDictionary *named = [mac mutableCopy];
+        named[@"name"] = name;  // the alert names the same Mac the row does
+        r.deleted = ^{ PNConfirmForget(weak, named, nil); };
         [rows addObject:r];
     }
     r = [PNRow ident:@"pair" kind:PNRowButton text:@"Pair a Mac…" detail:nil];
@@ -330,6 +365,7 @@ static NSString *PNStopsMessage(NSInteger n) {
     UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Stop accepting work?"
         message:PNStopsMessage(n) preferredStyle:UIAlertControllerStyleAlert];
     [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:^(UIAlertAction *x) {
+        [self releaseSwitch:@"accepting"];
         [sender setOn:YES animated:YES];
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Stop Accepting" style:UIAlertActionStyleDestructive

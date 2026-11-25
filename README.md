@@ -201,11 +201,20 @@ pocketnode app build --dev                 # back to the sideloaded flavour
 
 On a real phone, `pocketnode pair` works over the cable with no address. "Ask before running new code" in the app makes each new function of yours wait until you have read it on the phone and tapped Allow; it is off by default, and the `store_review` setting in `~/.pocketnode/app.json` makes it the default for a build. `store_tls: false` leaves Python's `ssl` module out of the app, which removes the export-compliance paperwork for bundled OpenSSL at the price of tasks not being able to use HTTPS on the phone.
 
+What has been checked, all on this Mac and in the iOS simulator:
+
+- The Release archive passes all 33 checks of `pocketnode app validate` (bundle structure, load commands, every imported symbol against the iOS SDK, privacy manifests, no leftovers of the sideloaded build). The archive is 92 MB with 126 frameworks. The same checks fail 16 ways on the sideloaded build, as they should.
+- `pocketnode check` against the store app in the simulator: 24 passed, 0 failed, 7 skipped (the skips are packages the app doesn't have). The sideloaded flavour still passes its own run.
+- The test suite passes for both flavours: `uv run pytest` and `POCKETNODE_STANDIN_EDITION=store uv run pytest` (the second runs the phone stand-in as a store-edition worker).
+
+What has not been checked, because each needs a paid developer account or a phone: signing and exporting the archive, Apple's own upload validation, App Review, and the store app on a real iPhone (pairing over the cable, the keychain, background computing).
+
 ## Layout
 
 - `src/pocketnode/`: Mac side (executor, router, transport, integrations) and the worker that runs on the phone.
 - `src/pocketnode/provision/`: environment scan, retagging, shims, app build and install, `pocketnode setup`.
 - `src/pocketnode/ios/`: the thin Objective-C host app that embeds CPython. It ships inside the package; builds copy it to `~/.pocketnode/ios` and generate the Xcode project there.
+- Store edition: `src/pocketnode/pairing.py`, `storeworker.py` and `storehost.py` (pairing, the store worker, what the app's screens call); `provision/wheels.py` and `validate.py` (staging from iOS wheels, checking an archive); `ios/Store/` (the app's screens, assets, privacy manifest, package list and the wheel recipe) and `ios/project.store.yml`.
 - `src/pocketnode/check.py`: the acceptance check behind `pocketnode check`.
 - `tests/`: runs against a local stand-in for the phone (`.phone-sim`, a venv holding only numpy, at the project's version, and cloudpickle). They don't need a phone or an Apple ID:
 

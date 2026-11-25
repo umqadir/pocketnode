@@ -50,11 +50,13 @@ class StoreWorker(Worker):
 
     def __init__(self, pairs: PairStore, **kw):
         self.pairs = pairs
+        pairs.on_replaced = self._drop_pairings  # the same Mac paired again: its old pairing goes
         self.window = PairingWindow()
         self.accepting = True
         self.port: int | None = None
         self.ready = False
         self._task_meta: dict[str, dict] = {}   # task id -> label, fk, code, sid, start
+        self._counting: dict[str, str] = {}     # task id -> code hash, until the task's own result goes out
         self.codes: OrderedDict[str, dict] = OrderedDict()  # code hash -> the code log entry (newest last)
         self.review = False                     # "Ask before running new code"
         self.decisions: dict[str, str] = {}     # "<pair_id>:<code>" -> "allowed" | "denied"
@@ -198,7 +200,7 @@ class StoreWorker(Worker):
                 d = self.decisions.get(f"{pid}:{code}") if origin == "user" else None
                 e["state"] = d or "not needed"
             if refuse is None:
-                e["runs"] += 1
+                self._counting[msg["id"]] = code  # a run counts once it finishes here (_deliver)
                 self._task_meta[msg["id"]] = {"label": label, "fk": fk, "code": code,
                                               "sid": msg.get("_sid"), "start": now}
         if refuse is not None:
@@ -283,10 +285,25 @@ class StoreWorker(Worker):
                     if e["state"] == "waiting":
                         e["state"] = "not needed"
 
+    def _deliver(self, header: dict, bufs, sid: str | None) -> None:
+        # The code log counts a run when the task finishes here with its own result or error;
+        # a cancelled, stopped, refused or unavailable task didn't run.
+        if header.get("t") == "result":
+            with self._lock:
+                code = self._counting.pop(header.get("id"), None)
+                if code is not None and not header.get("unavailable") and not header.get("infra") \
+                        and (header.get("ok") or "error" in header):
+                    e = self.codes.get(code)
+                    if e is not None:
+                        e["runs"] += 1
+        super()._deliver(header, bufs, sid)
+
     def _cleanup(self, tid: str) -> bool:
         cancelled = super()._cleanup(tid)
         with self._lock:
             self._task_meta.pop(tid, None)
+            if cancelled:
+                self._counting.pop(tid, None)
         return cancelled
 
     # ------------------------------------------------------------ tasks
@@ -328,16 +345,22 @@ class StoreWorker(Worker):
     def forget(self, pair_id: str) -> bool:
         """Drop a Mac's pairing (and its approvals); its sessions close and its tasks stop."""
         ok = self.pairs.forget(pair_id)
+        self._drop_pairings([pair_id])
+        return ok
+
+    def _drop_pairings(self, pair_ids) -> None:
+        """A pairing is gone (forgotten, or replaced by the same Mac pairing again): drop its
+        approvals, stop its tasks and close its sessions with a goodbye."""
+        pair_ids = {str(p) for p in pair_ids}
         with self._lock:
-            sids = {s.id for s in self.sessions.values() if getattr(s, "pair_id", None) == pair_id}
+            sids = {s.id for s in self.sessions.values() if getattr(s, "pair_id", None) in pair_ids}
             tids = [t for t, m in self._task_meta.items() if m.get("sid") in sids]
-            self.decisions = {k: v for k, v in self.decisions.items() if not k.startswith(f"{pair_id}:")}
-            self.waiting = {k: v for k, v in self.waiting.items() if k[0] != pair_id}
+            self.decisions = {k: v for k, v in self.decisions.items() if k.split(":", 1)[0] not in pair_ids}
+            self.waiting = {k: v for k, v in self.waiting.items() if k[0] not in pair_ids}
             self._save_decisions()
         for tid in tids:
             self._cancel(tid)
         self._close_sessions(lambda s: s.id in sids, why="forgotten")
-        return ok
 
     # ------------------------------------------------------------ network
 

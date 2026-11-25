@@ -71,6 +71,7 @@ NSDictionary *PNDict(id value) {
 @interface PNStatus ()
 @property (strong) NSTimer *timer;
 @property (assign) BOOL inFlight;
+@property (assign) BOOL again;
 @property (readwrite, nullable) NSDictionary *latest;
 @end
 
@@ -93,7 +94,7 @@ NSDictionary *PNDict(id value) {
 - (void)resume {
     if (self.timer) return;
     __weak PNStatus *weak = self;
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { [weak refreshNow]; }];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { [weak poll]; }];
     self.timer.tolerance = 0.1;
     [self refreshNow];
 }
@@ -103,11 +104,21 @@ NSDictionary *PNDict(id value) {
     self.timer = nil;
 }
 
+- (void)poll {
+    if (!self.inFlight) [self refreshNow];  // the regular tick skips while a poll is out
+}
+
 - (void)refreshNow {
-    if (self.inFlight) return;
+    // A poll already on its way may have been read before an action just taken: poll again after it.
+    if (self.inFlight) { self.again = YES; return; }
     self.inFlight = YES;
     [PNBridge call:@"status_json" arg:nil done:^(NSString *result) {
         self.inFlight = NO;
+        if (self.again) {  // this answer may predate the action: use the next one instead
+            self.again = NO;
+            [self refreshNow];
+            return;
+        }
         NSDictionary *st = [PNBridge json:result ofClass:[NSDictionary class]];
         if (!st) return;
         self.latest = st;

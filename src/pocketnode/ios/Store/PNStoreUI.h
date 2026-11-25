@@ -52,6 +52,7 @@ typedef NS_ENUM(NSInteger, PNRowKind) {
 @interface PNTableViewController : UITableViewController
 @property (strong, nonatomic) NSArray<PNSection *> *sections;
 - (void)statusChanged;  // subclasses rebuild from PNStatus.shared.latest
+- (void)releaseSwitch:(NSString *)ident;  // forget a choice held on screen (e.g. after Cancel)
 @end
 
 @interface PNMainViewController : PNTableViewController

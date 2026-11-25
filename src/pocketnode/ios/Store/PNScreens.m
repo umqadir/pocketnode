@@ -208,7 +208,7 @@
     [super viewWillDisappear:animated];
     if (self.isMovingFromParentViewController) {
         [[NSNotificationCenter defaultCenter] removeObserver:self];
-        if (!_done) [PNBridge call:@"pair_cancel" arg:nil done:nil];
+        if (!_done) [PNBridge call:@"pair_cancel" arg:nil done:^(NSString *r) { [PNStatus.shared refreshNow]; }];
     }
 }
 
@@ -418,12 +418,15 @@ static NSString *PNStateText(NSString *state) {
         NSString *origin = user ? @"Your code"
             : PNString(item[@"dist"]).length ? [NSString stringWithFormat:@"Library: %@", PNString(item[@"dist"])] : @"Library";
         NSInteger runs = [item[@"runs"] integerValue];
-        NSMutableArray *parts = [NSMutableArray arrayWithObjects:origin,
-            runs == 1 ? @"ran once" : [NSString stringWithFormat:@"ran %ld times", (long)runs], nil];
+        // Runs count tasks that finished here; code whose tasks were all stopped or cancelled
+        // (the Mac's copy finished first) was sent but never ran.
+        NSMutableArray *parts = [NSMutableArray arrayWithObject:origin];
+        if (runs > 0) [parts addObject:runs == 1 ? @"ran once" : [NSString stringWithFormat:@"ran %ld times", (long)runs]];
         NSString *state = PNString(item[@"state"]);
         if (review && state.length) [parts addObject:PNStateText(state)];
-        PNRow *r = [PNRow ident:[@"code:" stringByAppendingString:code] kind:PNRowSubtitle text:label
-                         detail:[parts componentsJoinedByString:@", "]];
+        NSString *detail = [parts componentsJoinedByString:@", "];
+        if (runs == 0) detail = [@"Sent, not run yet. " stringByAppendingString:detail];
+        PNRow *r = [PNRow ident:[@"code:" stringByAppendingString:code] kind:PNRowSubtitle text:label detail:detail];
         r.disclosure = YES;
         NSMutableArray *head = [NSMutableArray arrayWithObject:origin];
         if (PNString(item[@"where"]).length) [head addObject:PNString(item[@"where"])];

@@ -245,6 +245,29 @@ def test_a_second_mac_pairs_too(tmp_path, monkeypatch):
     assert len(tokens) == 2
 
 
+def test_pairing_again_replaces_the_old_pairing(tmp_path, mac_home):
+    store = _store(tmp_path)
+    replaced: list = []
+    store.on_replaced = replaced.append
+    tokens = []
+    for _ in range(2):
+        window = PairingWindow()
+        code = window.begin()
+        _answer(window, True)
+        _pair(store, window, code, "Same Mac")
+        tokens.append(pairing.load()[store.phone_id])
+    [entry] = store.list()  # one entry, not "Same Mac" twice
+    assert entry["pair_id"] == tokens[1]["pair_id"] and replaced == [[tokens[0]["pair_id"]]]
+    assert store.token(tokens[0]["pair_id"]) is None, "the old token stops working"
+    assert stat.S_IMODE((mac_home / "mac_id").stat().st_mode) == 0o600
+    assert pairing.mac_id() == (mac_home / "mac_id").read_text().strip()
+    # A pair frame without mac_id (an older Mac) adds a pairing, as before.
+    store.add("Old Mac")
+    store.add("Old Mac")
+    assert sorted(m["name"] for m in store.list()) == ["Old Mac", "Old Mac", "Same Mac"]
+    assert pairing._clean_mac_id("not hex!") is None and pairing._clean_mac_id("AB" * 8) == "ab" * 8
+
+
 def test_dev_handshake_is_unchanged():
     """The sideloaded edition's handshake: same token both sides, no pairing fields."""
     for token, ok in (("t0ken", True), ("other", False)):
@@ -427,6 +450,57 @@ def test_forget_revokes_and_closes(sw, tmp_path):
     finally:
         src.stop()
         ex.shutdown(wait=False)
+
+
+def test_repairing_closes_the_old_pairings_sessions(sw):
+    mid = "c0ffee" * 4
+    pid, tok = sw.pairs.add("Repaired Mac", mac_id=mid)
+    ex = pn.PocketExecutor(notes=False, auto_add=False)
+    src = sources.Address(f"127.0.0.1:{sw.port}", token="unused", retry=0.3, credentials=_cred(sw, pid, tok))
+    ex.add_source(src)
+    new = None
+    try:
+        assert ex.wait_for("phone", 20)
+        new, _ = sw.pairs.add("Repaired Mac", mac_id=mid)
+        assert [m["pair_id"] for m in sw.pairs.list() if m["name"] == "Repaired Mac"] == [new]
+        assert _wait(lambda: not ex.nodes), "the replaced pairing's session was closed"
+        assert _wait(lambda: src.status == sources.REVOKED), src.status
+    finally:
+        src.stop()
+        ex.shutdown(wait=False)
+        if new:
+            sw.forget(new)
+
+
+def counted_ok(x):
+    return x + 1
+
+
+def counted_stopped(seconds):
+    import time
+    for _ in range(int(seconds / 0.05)):
+        time.sleep(0.05)
+
+
+def counted_error(x):
+    raise ValueError(f"no {x}")
+
+
+def test_runs_count_only_finished_tasks(sw, store_ex):
+    def entry(name):
+        return next(e for e in sw.code_list() if name in e["label"])
+
+    f = store_ex.on("phone").submit(counted_stopped, 30)
+    assert _wait(lambda: sw.running)
+    sw.stop_tasks()
+    with pytest.raises(PlacementError):
+        f.result(timeout=10)
+    assert entry("counted_stopped")["runs"] == 0, "a stopped task didn't run"
+    assert store_ex.on("phone").submit(counted_ok, 1).result(timeout=20) == 2
+    with pytest.raises(ValueError):
+        store_ex.on("phone").submit(counted_error, 1).result(timeout=20)
+    assert entry("counted_ok")["runs"] == 1 and entry("counted_error")["runs"] == 1
+    assert not sw._counting, "nothing left waiting to be counted"
 
 
 def test_non_local_peer_cannot_pair(sw, monkeypatch, mac_home):
