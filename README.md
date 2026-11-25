@@ -1,228 +1,244 @@
 # pocketnode
 
-pocketnode turns an iPhone into a compute node for your Mac: you write ordinary Python (NumPy, pandas, scikit-learn, SciPy, PyTorch, polars, your own modules) and it decides where each piece runs, on the Mac's cores or on the phone over USB. A small iOS app embeds CPython, and the phone runs the Mac's own installed packages, so results are the same either way.
+Use your iPhone as a second processor for your Mac. Plug it in and your Python (pandas, scikit-learn, PyTorch, your own functions) runs across both the Mac's cores and the phone's.
 
-## What you need
+```python
+import pocketnode as pn
 
-| | Tested with | Required |
-|---|---|---|
-| Mac | Apple silicon (M4) | Apple silicon. The phone runs the Mac's own arm64 binaries, so Intel Macs can't work. |
-| Xcode | 27.1 | 26 or later (the app targets iOS 26), with the iOS platform installed. |
-| iPhone | iPhone 18 Pro on iOS 27.2 | iOS 26 or later, Developer Mode on, a USB cable. |
-| Python | uv-managed CPython 3.13 | 3.13 exactly: the phone runs Python 3.13 and the Mac's minor version must match. |
-| Apple ID | a free one | Free or paid. Free: the app is signed for 7 days at a time (`pocketnode app install` renews it), iOS asks you once to trust the developer, and you can register 10 app identifiers per 7 days. Paid (Apple Developer Program): signed for a year, and no trust step. |
+with pn.parallel():                                   # scikit-learn's n_jobs now includes the phone
+    GridSearchCV(model, grid, n_jobs=-1).fit(X, y)
 
-All of this has been run on one setup only: the phone, Mac, Xcode and Python above, with a free Apple ID. Other phones, iOS 26, other Xcode versions, conda or Homebrew Pythons and paid accounts are untested. The GPU paths (PyTorch's Metal backend and MLX) work on the phone only: the simulator's GPU has no usable memory budget, so torch's Metal backend is turned off there, and MLX crashes in the simulator.
+df.pn.groupby("customer").apply(features)             # pandas, split across Mac and phone
+```
 
-## Install and set up
+## Overview
 
-Install pocketnode into the Python 3.13 environment you work in, then run `pocketnode setup`:
+| | |
+|---|---|
+| **APIs** | a `concurrent.futures` executor (`submit`, `map`), scikit-learn and joblib (`n_jobs`), pandas (`groupby().apply`, `map`, `apply`), Dask, and a `%%phone` cell in Jupyter |
+| **Libraries** | numpy, pandas, scipy, scikit-learn, PyTorch, MLX, polars, pyarrow, duckdb, matplotlib, and any pure-Python package. Others get added the first time your code needs them. |
+| **Phone hardware** | all six CPU cores, the GPU via PyTorch (`"mps"`) and MLX, and about 6 GB of memory |
+| **Package versions** | the phone runs the same builds installed on your Mac, so there is no second environment to keep in sync |
+| **Correctness** | phone results are checked against the Mac, and tasks the phone can't run fall back to the Mac |
+| **Connection** | USB cable, or Wi-Fi if you turn it on. Code and data stay between your Mac and your phone. |
+
+## Benchmarks
+
+Measured on an iPhone 18 Pro:
+
+| | |
+|---|---|
+| Pure Python | 38 million loop iterations a second per core, on six cores |
+| NumPy matrix multiply | 2,100 GFLOPS in float32, 510 in float64 |
+| PyTorch, small CNN, batch of 64 | 20 ms a training step on the GPU, 70 ms on the CPU |
+| MLX, half-precision matrix multiply | 6 to 10 TFLOPS on the GPU |
+
+## Install
 
 ```
-uv venv --python 3.13 && source .venv/bin/activate     # or use an existing 3.13 environment
 uv pip install "pocketnode[all] @ git+https://github.com/umqadir/pocketnode"
 pocketnode setup
 ```
 
-Use the environment your code runs in, not `uv tool install`: the phone runs that environment's packages. `[all]` adds the libraries the integrations use (joblib, pandas, Dask, IPython) and a scientific stack; plain `pocketnode` works too.
+Install it into the Python 3.13 environment your code runs in, since the phone runs that environment's packages. `pocketnode setup` checks Xcode, builds and signs the app with your Apple ID, installs it, and runs a full check against the phone. When something needs you, it tells you what to tap and waits.
 
-`pocketnode setup` checks one thing per line. When something needs doing it says exactly what, then waits and checks again every few seconds, so you can fix it and watch it continue. Running it again is safe. What to expect:
+Apple makes you do four things once:
 
-- It checks the Mac, Python, Xcode (selected, licence accepted, first launch done) and the iOS platform, and downloads what the build needs into `~/.pocketnode/cache`: XcodeGen (6 MB, if it isn't installed) and BeeWare's embedded Python 3.13 for iOS (35 MB), each a pinned release checked against its checksum.
-- It offers to download Xcode's Metal toolchain (about 840 MB). It's needed only to compile PyTorch's and MLX's GPU shaders for iOS; without it everything else works.
-- Apple requires a few steps that only you can do, once each:
-  1. Sign in to Xcode: Xcode › Settings › Apple Accounts › Sign In, then click the account once so Xcode loads its team.
-  2. Plug the phone in with a cable, unlock it, and tap Trust when it asks whether to trust this computer.
-  3. Turn on Developer Mode: on the phone, Settings › Privacy & Security › Developer Mode, restart when asked, then confirm with your passcode. (The menu appears once the phone has been connected to a Mac with Xcode.)
-  4. With a free Apple ID, after the app is installed: Settings › General › VPN & Device Management, pick your Apple ID under Developer App, tap Trust, then open the pocketnode app. Setup tries to start the app once, tells you this if iOS refuses, and waits for the app to answer.
-- It builds, signs and installs the app. The first build takes several minutes (about 5 on the test Mac, mostly signing a few hundred frameworks); later builds take about a minute, and installing about 30 to 40 seconds.
-- It ends with the quick acceptance check: one PASS, FAIL or SKIP line per feature, run on the phone and compared with the Mac. An item is skipped when a library it needs isn't installed.
+1. Sign in to Xcode: Xcode › Settings › Apple Accounts.
+2. Plug the phone in, unlock it, and tap Trust.
+3. Turn on Developer Mode: Settings › Privacy & Security › Developer Mode.
+4. With a free Apple ID, trust yourself as a developer after the app is installed: Settings › General › VPN & Device Management.
 
-`pocketnode setup --sim` does the same with the iOS simulator instead of a phone (no Apple ID needed).
+The first build takes about five minutes; later updates run from the command line.
 
-The app is built with numpy (when the environment has it). Other compiled packages go onto the phone while it runs, automatically when a task needs one (see Packages).
+| Requirements | |
+|---|---|
+| Mac | Apple silicon |
+| Xcode | 26 or later, with the iOS platform |
+| iPhone | iOS 26 or later, and a cable |
+| Python | 3.13 |
+| Apple ID | free or paid. A free one signs the app for a week at a time; `pocketnode app install` renews it. |
 
-## A first example
+## Usage
+
+Connect once and submit work:
 
 ```python
-import numpy as np
 import pocketnode as pn
 
-ex = pn.connect()                         # Mac cores + the phone over USB
-
-def top_singular_value(seed):
-    a = np.random.default_rng(seed).normal(size=(1500, 1500))
-    return float(np.linalg.svd(a, compute_uv=False)[0])
-
-futs = [ex.submit(top_singular_value, s) for s in range(12)]
-print([round(f.result(), 3) for f in futs])
-print([f.placement.kind for f in futs])  # where each one ran: "phone" or "mac"
-```
-
-More of the interface:
-
-```python
-ex = pn.connect()                       # a concurrent.futures.Executor: Mac cores + phone
+ex = pn.connect()                       # Mac cores + the phone
 fut = ex.submit(fit_model, X, y)        # lambdas, closures and notebook functions all work
 fut.result()
-fut.placement                           # where it ran and why
-
-with pn.parallel():                     # joblib backend: scikit-learn's n_jobs just works
-    GridSearchCV(model, grid, n_jobs=-1).fit(X, y)
-
-df.pn.groupby("user").apply(features)   # pandas, split across nodes, same result as df.groupby(...)
-dask.compute(graph, scheduler=ex)       # Dask
+fut.placement                           # where it ran, and why
 ```
 
-In Jupyter, `%load_ext pocketnode` adds two cell magics. `%%phone` runs a cell on the phone; `%%pocket` runs it wherever fits. The cell's inputs are sent over, the names it assigns come back, and its output prints in the notebook.
+**Slow `.map` over a column.** Cleaning two million addresses with a Python function:
 
-## How it stays correct
+```python
+df["address"] = df["address"].pn.map(clean_address)
+```
 
-- **The phone runs the Mac's own packages.** Compiled packages are not rebuilt or downloaded from somewhere else. pocketnode takes the Mac's installed arm64 binaries and retags them as iOS binaries: it rewrites the platform load command, fixes system framework paths, and signs them with your development certificate. The phone therefore runs exactly the versions the Mac runs.
-  - Checked on an iPhone 18 Pro (iOS 27.2) and in the simulator: numpy, pandas, scipy, scikit-learn, pyarrow, polars, duckdb, lxml, matplotlib and eager PyTorch 2.11 (autograd and optimizers). Results match the Mac.
-- **Only what the phone can run goes to it.** Each task's modules are checked against what the phone reports having. At run time, the phone sends a task back to the Mac if it:
-  - imports a compiled module the phone lacks;
-  - reads or writes a Mac file (for example `/Users/...`, or a relative path);
-  - starts a process.
+**Features per customer.** Any `groupby().apply()`; groups are never split.
 
-  It sends it back even if your code catches the error.
-- **An error from the phone is confirmed on the Mac before you see it.** If the Mac runs the task fine, you get the Mac's result and that function stays on the Mac from then on.
-- **The first result from the phone is checked against the Mac.** The first time a function runs on the phone, the Mac also runs it, ahead of the queue, and the results are compared field by field, with tolerance for floating point.
-  - If they differ, you get the Mac's answer and that function stays on the Mac.
-  - Fields that vary from run to run on the Mac itself (timings, unseeded randomness) are left out of the comparison; everything else still has to match.
-  - A function is identified by its code and the kinds of arguments it gets. A joblib batch or a `map` chunk counts as the function inside it, so one estimator's verdict never applies to another.
-- **Forcing placement raises instead of falling back.** `ex.on("phone")`, `pn.placement("phone")`, `@pn.runs_on("phone")` and `pn.connect(placement=...)` all force where code runs. If the forced node can't run it, you get a clear `PlacementError` rather than a silent fallback. `strict=True` does the same for automatic placement.
-- **The phone can go away at any time.** It can get hot, go to the background, be unplugged, or crash. Its work moves to the Mac (speculative re-execution: the first result wins), and it rejoins when it's back.
-  - A task that crashes the app is re-run on the Mac. The next time the app starts it reports what crashed (`ex.nodes[...].hello["last_crash"]`).
-  - Inputs too big for the phone's free memory are never sent there.
-- **Several sessions can share the phone.** A notebook, a script and `pocketnode status` can be connected at once, as long as they use the same Python environment. Each gets its own results.
+```python
+features = transactions.pn.groupby("customer").apply(customer_features)
+```
 
-## How it's fast
+**One model per store.**
 
-- **Large inputs cross the link once.** Arrays and DataFrames travel as raw buffers (pickle protocol 5) and are cached on the phone by content hash. The phone checks each hash on arrival, so an array you change between two submits is never mistaken for its old self. Data you'll reuse can be kept resident with `ex.pin(X)`.
-- **The scheduler uses measurements.** It measures each function's compute time per node and the link's bandwidth. Memory-bound work stays on the Mac; heavy work spreads out.
-- **Busy nodes get less work.** Thermal state and background state reduce how much work the phone is given.
-- **Leaving the app doesn't stop it.** When work arrives, the app asks iOS for continued processing, so if you switch apps it keeps computing (iOS shows it as a live activity you can cancel). iOS throttles background work to roughly a fifteenth of full speed, so the scheduler sends it little until the app is in front again. If iOS suspends the app anyway, its tasks resume where they were when you come back, and anything urgent has been re-run on the Mac meanwhile.
-- **The phone's GPU runs PyTorch.** `torch.backends.mps.is_available()` is true on the phone, so code that picks `"mps"` on the Mac picks it there too. torch's Metal shaders are compiled for iOS from the sources of the exact torch version on the Mac and swapped into the library when it's staged. On the test phone, 15 cases (elementwise maths, reductions, indexing, linear algebra, convolution with batch norm, attention, an LSTM, and training with SGD, Adam and AdamW) agree with the phone's CPU to about 1e-7. `pocketnode app install --no-torch-mps` turns it off.
-- **The phone's GPU runs MLX.** `pocketnode packages add mlx` puts MLX on the phone with its Metal kernels compiled for iOS; the same `mlx` code then runs on the Mac's GPU or the phone's. On the test phone, results match numpy, a small network trains to convergence, and half-precision matrix multiply reaches 6 to 10 TFLOPS.
-- **Pure-Python work uses all the phone's cores.** iOS has no child processes and no free-threaded Python build. So tasks that touch only the stdlib and pure-Python packages run in per-core subinterpreters, each with its own GIL. Work that releases the GIL (NumPy, scikit-learn, PyTorch) runs on threads.
+```python
+coefficients = sales.pn.groupby("store").apply(fit_store)
+```
+
+**Cross-validation and grid search.** Anything in scikit-learn that takes `n_jobs`.
+
+```python
+with pn.parallel():
+    scores = cross_val_score(model, X, y, cv=10, n_jobs=-1)
+```
+
+**Your own loop.** Fuzzy-matching names or bootstrapping a statistic:
+
+```python
+matches = list(ex.map(best_match, names))
+```
+
+**Training on the phone's GPU.** Code that checks for `"mps"` picks up the phone's GPU too.
+
+```python
+def train(config):
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    ...
+
+results = list(ex.map(train, configs))  # trials run on both GPUs
+```
+
+**MLX.** `pocketnode packages add mlx`, then the same `mlx` code runs on either GPU.
+
+**Dask.** `dask.compute(graph, scheduler=ex)`.
+
+**Jupyter.** `%load_ext pocketnode`, then start a cell with `%%phone`. Variables the cell reads go to the phone, and ones it assigns come back.
+
+Manual placement: `ex.on("phone").submit(...)`, `@pn.runs_on("mac")`, or `with pn.placement("phone"):`.
+
+## Correctness
+
+- **First call is checked.** The Mac runs each function's first task too and compares outputs within floating-point tolerance. If they differ, you get the Mac's answer and that function stays on the Mac.
+- **Errors are confirmed.** Exceptions on the phone are re-run on the Mac before you see them.
+- **Unsupported tasks stay on the Mac.** Tasks that read files on your Mac or start processes run locally, along with anything needing a library the phone can't load.
+- **Disconnects don't drop work.** Unplug the phone, lock it, or let it get hot and its work finishes on the Mac.
+- **Forced placement fails loudly.** `ex.on("phone")` raises `PlacementError` if the phone can't run the task.
+
+## How it works
+
+**The app.** `pocketnode setup` puts a small Python 3.13 app on the phone. Open it and leave it up: it prints a status line on a black screen and keeps the phone awake while in front.
+
+**The cable.** `pn.connect()` finds the phone over USB on its own. Round trips take about a millisecond, and a USB 2 cable moves 34 MB a second. A pairing token built into your copy of the app keeps other Macs out.
+
+**Wi-Fi.** `pocketnode app install --wifi` lets the Mac reach the phone on your local network via `pn.connect("phone-address:7151")`. Round trips take about 20 ms, so use the cable when you can.
+
+**Backgrounding.** Switch to another app and the phone keeps computing, slower, until you come back. If iOS pauses the app (for example, when the phone locks), unfinished work moves to the Mac and the phone picks up again when you return.
+
+**Cable pulled or thermal throttling.** Pull the cable and the phone's tasks finish on the Mac. When the phone reports it's getting hot, it gets less work.
+
+**Data caching.** Arrays and DataFrames ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. `ex.pin(X)` keeps it there.
+
+**Scheduling.** pocketnode measures each function on each device, and the link's speed, then sends tasks where they'll finish soonest. Memory-bound operations like filtering or merging one large table stay on the Mac. Compute-heavy work spreads out.
+
+**Subinterpreters and threads.** iOS blocks child processes, so pure-Python tasks run in one subinterpreter per core, each with its own GIL. NumPy, scikit-learn and PyTorch release the GIL and run on threads.
+
+**Packages.** Your Mac's compiled packages are converted for iOS and signed with your developer certificate, which is why the phone has your exact versions and can add new packages while running.
+
+**Multiple clients.** Notebooks, scripts, and `pocketnode status` can share the phone at the same time.
 
 ## Packages
 
-- **Pure-Python packages need nothing.** The phone imports them from the Mac on demand, at the Mac's version.
-- **Compiled packages are added while the app runs.** No rebuild, no reinstall, no restart. When a task needs one the phone lacks, that task runs on the Mac and pocketnode puts the package on the phone in the background; later tasks use the phone. On the test phone, duckdb (38 MB) took 9.5 s and matplotlib with three dependencies took 48 s, most of it preparing the files on the Mac.
-  - `pn.connect(auto_add=False)` turns the automatic part off; you then get a one-time note with the size and time instead.
-  - Packages over 1.5 GB are never added automatically.
-  - Replacing a package that is already loaded on the phone restarts the app, since a loaded native library can't be swapped.
-- **Each package is checked against the iOS SDK before it ships.**
-  - Functions the phone lacks but whose API defines failure (`OSStatus` returns) get a shim that reports "unimplemented".
-  - Frameworks iOS doesn't have at all (AppKit, for matplotlib's macOS window backend or polars' clipboard support) get stand-ins, so the rest of the package loads.
-  - Anything else is left out and listed with the reason; tasks that need it run on the Mac.
+Pure-Python packages need no setup; the phone imports them from your Mac as needed.
+
+Compiled packages install while the app is running without a rebuild or restart. The first time a task needs one, that task runs on the Mac while the package goes to the phone in the background, and later tasks use the phone. duckdb takes about ten seconds.
 
 ```
-pocketnode packages              # Mac environment vs phone, with an iOS verdict for each compiled package
-pocketnode packages select       # checklist: tick what should be on the phone, see the cost, apply
-pocketnode packages add lightgbm # put it on the phone now (seconds)
-pocketnode packages remove lightgbm
+pocketnode packages              # what's on the phone, and what can be
+pocketnode packages add lightgbm
+pocketnode packages select       # pick from a checklist
 ```
 
-The checklist starts from what the phone has now (a default scientific stack on first use) and marks packages your tasks recently needed and didn't find. `pn.packages.add("lightgbm")` does the same from Python. Adding `--bundle` bakes a package into the app at the next build instead, which is how the default stack ships; app rebuilds sign only the frameworks that changed.
+A few packages depend on libraries iOS doesn't have. `pocketnode packages` lists them, and tasks needing them run on the Mac.
 
-How adding works: iOS loads native code from an app's data folder if it is signed with the app's development certificate and its signing identifier equals the app's bundle ID. So the package is retagged in place, signed that way on the Mac, sent over USB and imported from the phone's own site directory.
+## Commands
 
-## Day to day
-
-- `pocketnode status` shows what's connected; `pocketnode check` runs the full acceptance check (`--quick` for the short one setup runs); `pocketnode bench` measures the link and compute.
-- `pocketnode app install` rebuilds and reinstalls the app; `pocketnode app launch` starts it. Setup uses these too. Options: `--team TEAMID` when Xcode has several teams, `--bundle-id` to choose the app's identifier (by default it's `dev.pocketnode.<your team ID>`, saved at the first build), `--wifi`, `--no-torch-mps`.
-- The app keeps the screen awake (and black) while it's in front, because a locked phone suspends it. If the app isn't running, the Mac can start it over USB, but only while the phone is unlocked.
-- A free Apple ID signs the app for 7 days. pocketnode tells you when that's about to run out; `pocketnode app install` renews it.
-- The app listens on USB only. `pocketnode app install --wifi` also accepts the Mac over the local network (`pn.connect("phone-address:7151")`); the pairing token is required either way. iOS asks once for local-network permission. On the test network Wi-Fi had a 20 ms round trip against 1 ms over USB, so USB is the better link when the cable is in.
-- After updating pocketnode on the Mac, run `pocketnode app install` again; pocketnode tells you when the app on the phone is from a different version.
-- If a task seems stuck on the phone, `ex.stacks("phone")` shows what every thread there is doing.
-- For the simulator, `pn.connect("127.0.0.1:7151")`.
-- pocketnode keeps its settings, pairing token, caches and build folder in `~/.pocketnode` (`POCKETNODE_HOME` moves it).
-
-Not built: ExecuTorch and Core ML (PyTorch itself runs on the phone, CPU and GPU, which covers what they were for). Not measured: behaviour under sustained heat, and speed over a USB 3 cable. `RESEARCH-NOTES.md` has what was measured.
+```
+pocketnode setup        first run: checks, build, install, full check
+pocketnode check        run every feature against the phone, pass or fail per item
+pocketnode status       what's connected
+pocketnode bench        speed of the link and of the phone
+pocketnode app install  rebuild and reinstall (renews a free Apple ID's week)
+```
 
 ## Troubleshooting
 
-These are the failures seen while building pocketnode, and the messages it prints for them.
+<details>
+<summary>Common errors and fixes</summary>
 
-- **"sign in to Xcode"**: Xcode has no Apple ID. Xcode › Settings › Apple Accounts › Sign In; a free Apple ID works.
-- **"Xcode has your Apple ID but hasn't loaded its team yet"**: the team ID only becomes visible to command-line tools after Xcode has shown the account once. Open Xcode › Settings › Apple Accounts and click the account.
-- **"several Apple development teams are available"**: pass the one to sign with, `pocketnode setup --team TEAMID` (the message lists them).
-- **"Your team has no devices"** from xcodebuild: a new free team can only get a provisioning profile once a phone is registered with it, which happens when the build names a connected phone. Plug the phone in, unlock it and build again.
-- **Developer Mode is off**: Settings › Privacy & Security › Developer Mode, restart, confirm with your passcode. The Mac can't turn it on for a phone with a passcode (`devmodectl` refuses). If the menu isn't there, connect the phone to the Mac and open Xcode once.
-- **The app won't open, or "profile has not been explicitly trusted by the user"**: a free Apple ID's apps need trusting once per phone. Settings › General › VPN & Device Management › your Apple ID under Developer App › Trust, then open the pocketnode app.
-- **The phone is locked after a crash**: if the app crashes, the phone locks itself after its usual delay, and the Mac can't start an app on a locked phone. Unlock it and pocketnode relaunches the app by itself. The task that crashed it is re-run on the Mac.
-- **"the phone app's signing has expired"**: with a free Apple ID the app stops launching 7 days after it was built. Run `pocketnode app install` (or `pocketnode setup`).
-- **"the bundle identifier ... is taken"** (xcodebuild: "cannot be registered to your development team because it is not available"): an app identifier belongs to the first team that registers it. pocketnode derives one from your team, so this only happens with a `--bundle-id` someone else has used; pick another, such as `--bundle-id com.yourname.pocketnode`. A free account can register 10 identifiers per 7 days, so reuse one rather than trying many.
-- **"phone attached, app not answering"**: the phone is there but the app isn't listening. Open the app on the phone, or unlock the phone and let pocketnode start it. If the app is running but doesn't answer after two launches, pocketnode restarts it.
-- **"the phone app was built with a different pairing token"**: the app was built under another `~/.pocketnode` (or `POCKETNODE_HOME`). Run `pocketnode app install`.
-- **"the app on ... was built from a different version of pocketnode"**: pocketnode on the Mac was updated or edited since the app was built. Run `pocketnode app install`.
-- **A package can't run on iOS**: some compiled packages link libraries iOS doesn't have (for example pysam and pyBigWig need libcurl, cffi's backend needs libffi). `pocketnode packages` shows a verdict for each compiled package; modules that can't load are left out with the reason, and tasks that need them run on the Mac.
-- **"no iOS GPU shaders" or "no iOS GPU kernels"** while building: the Metal toolchain is missing. `xcodebuild -downloadComponent MetalToolchain`, then `pocketnode app install`.
-- **"Python 3.x"** at the first setup step: the Mac's Python must be 3.13 to match the phone's. Create a 3.13 environment (`uv venv --python 3.13`) and install pocketnode there.
-- A build that fails for another reason prints xcodebuild's errors and the path of the full log (in `~/.pocketnode/ios/build`).
+- **"sign in to Xcode"**: Xcode › Settings › Apple Accounts › Sign In. A free Apple ID works.
+- **"Xcode has your Apple ID but hasn't loaded its team yet"**: open Xcode › Settings › Apple Accounts and click the account once.
+- **"several Apple development teams are available"**: `pocketnode setup --team TEAMID`. The message lists them.
+- **Developer Mode is off**: Settings › Privacy & Security › Developer Mode, restart, confirm with your passcode. If the menu isn't there, connect the phone to the Mac and open Xcode once.
+- **The app won't open, or "profile has not been explicitly trusted"**: Settings › General › VPN & Device Management › your Apple ID › Trust, then open the pocketnode app.
+- **"the phone app's signing has expired"**: a free Apple ID signs for seven days. Run `pocketnode app install`.
+- **"phone attached, app not answering"**: unlock the phone. pocketnode starts the app itself.
+- **"the app on ... was built from a different version of pocketnode"**: you updated pocketnode. Run `pocketnode app install`.
+- **"the bundle identifier ... is taken"**: pick your own with `--bundle-id com.yourname.pocketnode`.
+- **"no iOS GPU shaders"**: `xcodebuild -downloadComponent MetalToolchain`, then `pocketnode app install`.
+- **"Python 3.x" at the first setup step**: create a 3.13 environment (`uv venv --python 3.13`) and install pocketnode there.
+- **A task seems stuck**: `ex.stacks("phone")` shows what the phone is doing.
 
-## Store edition
+</details>
 
-Everything above describes the sideloaded app, which you build and sign yourself. The same project also builds a second flavour meant for the App Store. It has not been submitted: that needs a paid Apple Developer Program membership. `RESEARCH-NOTES.md` ("App Store edition: feasibility") has the rules it was built to, with sources.
+## App Store edition
 
-What differs, and why:
+The app `pocketnode setup` builds is signed by you and runs anything. The project also builds an App Store edition with a fixed set of packages, on-phone pairing, and a screen showing what code is running. [RESEARCH-NOTES.md](RESEARCH-NOTES.md) covers the rules it was built to.
 
-| | Sideloaded | Store edition |
+<details>
+<summary>Differences and build steps</summary>
+
+| | The app you build | App Store edition |
 |---|---|---|
-| Compiled packages | the Mac's own, retagged for iOS | a fixed set of real iOS builds inside the app |
-| Adding a compiled package later | seconds, while the app runs | not possible: the rules forbid downloading native code, and it needs your development certificate |
-| PyTorch, and torch or MLX on the GPU | yes | no: neither has an iOS build of its Python package |
-| Pure-Python packages | imported from the Mac on demand | the same |
-| Pairing | a token baked into your build | on the phone: tap Pair a Mac, type the code on the Mac, tap Allow |
-| What the phone shows | a status line | who is connected, what is running, the source of every function a Mac has sent, every Python file fetched from the Mac |
-| Stopping | quit the app | one switch (Accept work) and a Stop button |
-| Background computing | asked for when work arrives | only when you tap "Keep running in the background" |
-| Without a Mac | nothing to do | "Try it on this iPhone" runs Python you type |
+| Compiled packages | your Mac's own | a fixed set built for iOS: numpy, pandas, pillow and a few more |
+| Adding a compiled package | seconds, while the app runs | not possible |
+| PyTorch and MLX | yes, CPU and GPU | no |
+| Pure-Python packages | imported from the Mac as needed | the same |
+| Pairing | built into your copy of the app | on the phone: tap Pair a Mac, type the code on the Mac, tap Allow |
+| On the phone's screen | a status line | who is connected, what is running, and the source of every function sent |
+| Without a Mac | nothing to do | a Python console on the phone |
 
-Retagged macOS binaries can't ship in it. They lack a load command Apple's linker only writes when it links for iOS, and App Store Connect rejects uploads without it. So the store edition takes compiled packages only from iOS wheels: published ones (numpy, pillow, kiwisolver, markupsafe, contourpy, cffi), and ones cross-compiled here (pandas). The list is `src/pocketnode/ios/Store/packages.txt`; `pocketnode app wheel NAME VERSION` cross-compiles a C or Cython package into the wheelhouse so it can be added. scipy, scikit-learn, polars and pyarrow aren't in it yet: each needs its own cross-build (the notes say what that takes).
-
-Because the set is fixed, the phone is used for a compiled package only when your Mac has the same release of it (`uv pip install numpy==2.5.2 pandas==3.1.1` for the default set). Otherwise those tasks run on the Mac and pocketnode says which version would match. Tasks that need a package the app doesn't have run on the Mac too.
-
-Building and trying it:
+The phone runs a compiled package when your Mac has the same release (`uv pip install numpy==2.5.2 pandas==3.1.1` for the default set). Other tasks run on the Mac.
 
 ```
-pocketnode app wheel pandas 3.1.1          # once: cross-compile pandas for iOS (about 4 minutes)
-pocketnode app install --store --sim       # build it and run it in the simulator (port 7161: add --port 7161)
-pocketnode pair --address 127.0.0.1:7161   # type the code the app shows after you tap Pair a Mac
+pocketnode app wheel pandas 3.1.1          # once: build pandas for iOS, about 4 minutes
+pocketnode app install --store --sim       # run it in the simulator (port 7161)
+pocketnode pair --address 127.0.0.1:7161   # type the code the app shows
 pocketnode check --address 127.0.0.1:7161
-pocketnode app archive                     # Release archive for submission (unsigned unless --team is given)
-pocketnode app validate                    # checks the archive the way upload validation would
-pocketnode app build --dev                 # back to the sideloaded flavour
+pocketnode app archive                     # archive for submission
+pocketnode app validate                    # the checks Apple's upload runs
+pocketnode app build --dev                 # back to the app you sign yourself
 ```
 
-On a real phone, `pocketnode pair` works over the cable with no address. "Ask before running new code" in the app makes each new function of yours wait until you have read it on the phone and tapped Allow; it is off by default, and the `store_review` setting in `~/.pocketnode/app.json` makes it the default for a build. `store_tls: false` leaves Python's `ssl` module out of the app, which removes the export-compliance paperwork for bundled OpenSSL at the price of tasks not being able to use HTTPS on the phone.
+On a phone, `pocketnode pair` works over the cable. "Ask before running new code" in the app holds each new function until you read it and tap Allow.
 
-What has been checked, all on this Mac and in the iOS simulator:
+</details>
 
-- The Release archive passes all 33 checks of `pocketnode app validate` (bundle structure, load commands, every imported symbol against the iOS SDK, privacy manifests, no leftovers of the sideloaded build). The archive is 92 MB with 126 frameworks. The same checks fail 16 ways on the sideloaded build, as they should.
-- `pocketnode check` against the store app in the simulator: 24 passed, 0 failed, 7 skipped (the skips are packages the app doesn't have). The sideloaded flavour still passes its own run.
-- The test suite passes for both flavours: `uv run pytest` and `POCKETNODE_STANDIN_EDITION=store uv run pytest` (the second runs the phone stand-in as a store-edition worker).
+## Development
 
-What has not been checked, because each needs a paid developer account or a phone: signing and exporting the archive, Apple's own upload validation, App Review, and the store app on a real iPhone (pairing over the cable, the keychain, background computing).
+To work on pocketnode itself:
 
-## Layout
+```
+uv sync
+uv venv --python 3.13 .phone-sim
+uv pip install --python .phone-sim/bin/python cloudpickle "numpy==$(uv run python -c 'import numpy; print(numpy.__version__)')"
+uv run pytest
+```
 
-- `src/pocketnode/`: Mac side (executor, router, transport, integrations) and the worker that runs on the phone.
-- `src/pocketnode/provision/`: environment scan, retagging, shims, app build and install, `pocketnode setup`.
-- `src/pocketnode/ios/`: the thin Objective-C host app that embeds CPython. It ships inside the package; builds copy it to `~/.pocketnode/ios` and generate the Xcode project there.
-- Store edition: `src/pocketnode/pairing.py`, `storeworker.py` and `storehost.py` (pairing, the store worker, what the app's screens call); `provision/wheels.py` and `validate.py` (staging from iOS wheels, checking an archive); `ios/Store/` (the app's screens, assets, privacy manifest, package list and the wheel recipe) and `ios/project.store.yml`.
-- `src/pocketnode/check.py`: the acceptance check behind `pocketnode check`.
-- `tests/`: runs against a local stand-in for the phone (`.phone-sim`, a venv holding only numpy, at the project's version, and cloudpickle). They don't need a phone or an Apple ID:
+Tests run against a local stand-in for the phone, so you don't need a phone or Apple ID. [RESEARCH-NOTES.md](RESEARCH-NOTES.md) has the design details and measurements.
 
-  ```
-  uv sync
-  uv venv --python 3.13 .phone-sim
-  uv pip install --python .phone-sim/bin/python cloudpickle "numpy==$(uv run python -c 'import numpy; print(numpy.__version__)')"
-  uv run pytest
-  ```
-
-`HANDOFF.md` is the original design brief. `RESEARCH-NOTES.md` holds sourced findings and measured results.
+Licensed under the AGPL-3.0.
