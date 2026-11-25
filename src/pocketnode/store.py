@@ -357,6 +357,8 @@ class BufferStore:
                 self._evicted.append(h)
 
     def stats(self) -> dict:
+        # (Not the disk budget: it comes from the volume's free space, which the App Store's
+        # rules for that API (reason E174.1) don't let leave the phone.)
         with self._lock:
             return {"n": len(self._bufs), "bytes": self.size, "budget": self.budget, "pinned": len(self._pins),
-                    "disk_n": len(self._disk), "disk_bytes": self.disk_size, "disk_budget": self.disk_budget}
+                    "disk_n": len(self._disk), "disk_bytes": self.disk_size}
