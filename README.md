@@ -241,4 +241,4 @@ uv run pytest
 
 Tests run against a local stand-in for the phone, so you don't need a phone or Apple ID. [RESEARCH-NOTES.md](RESEARCH-NOTES.md) has the design details and measurements.
 
-Licensed under the AGPL-3.0.
+MIT licensed.

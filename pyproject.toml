@@ -9,7 +9,7 @@ authors = [
 # The phone runs CPython 3.13 (BeeWare's Python-Apple-support), and the Mac's
 # Python must be the same minor version: bytecode and extensions are shared.
 requires-python = ">=3.13,<3.14"
-license = "AGPL-3.0-or-later"
+license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "cloudpickle>=3.1.2",
