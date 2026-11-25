@@ -26,7 +26,14 @@ class PlacementError(PocketnodeError):
 
 
 class NodeLost(PocketnodeError):
-    pass
+    """The node holding an object (ex.create) or running a stream went away mid-work.
+
+    `node` is the node's name and `obj` the object's label, when there is one."""
+
+    def __init__(self, msg: str = "", node: str | None = None, obj: str | None = None):
+        super().__init__(msg)
+        self.node = node
+        self.obj = obj
 
 
 class TaskCancelled(BaseException):

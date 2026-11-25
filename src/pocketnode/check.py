@@ -375,6 +375,45 @@ def pin_unpin(ex, quick):
     return f"task on pinned data sent {sent / 1024:.0f} KB of {x.nbytes / 2**20:.0f} MB"
 
 
+class _Tally:
+    """Kept on the phone between calls."""
+
+    def __init__(self, start):
+        self.n = start
+
+    def add(self, k):
+        self.n += k
+        return self.n
+
+
+def object_on_phone(ex, quick):
+    obj = ex.on("phone").create(_Tally, 10)
+    try:
+        _expect(obj.kind == "phone", f"kept on the {obj.kind}")
+        got = [obj.add(i).result(timeout=T) for i in range(1, 6)]
+        _expect(got == [11, 13, 16, 20, 25], f"calls returned {got}")
+    finally:
+        obj.close()
+    return f"5 calls on one object kept on {obj.node}; its state carried over"
+
+
+def _t_ticks(n, pause):
+    for i in range(n):
+        yield i
+        time.sleep(pause)
+
+
+def stream_from_phone(ex, quick):
+    t0, first, got = time.perf_counter(), None, []
+    for x in ex.on("phone").stream(_t_ticks, 5, 0.2):
+        first = time.perf_counter() - t0 if first is None else first
+        got.append(x)
+    total = time.perf_counter() - t0
+    _expect(got == list(range(5)), f"got {got}")
+    _expect(first < total / 2, f"the first item came after {first:.2f} s of {total:.2f} s")
+    return f"first item after {first:.2f} s, all 5 after {total:.2f} s"
+
+
 # ---------------------------------------------------------------- executor
 
 def map_equals_builtin(ex, quick):
@@ -610,6 +649,8 @@ CHECKS = [
     ("C-level relative write", c_level_write),
     ("large array crosses once", large_array_once),
     ("pin / unpin", pin_unpin),
+    ("object kept on the phone", object_on_phone),
+    ("streaming from the phone", stream_from_phone),
     ("map equals builtin map", map_equals_builtin),
     ("placement overrides", placement_overrides),
     ("auto placement, 40 tasks", auto_placement),

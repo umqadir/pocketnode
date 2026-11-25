@@ -96,7 +96,7 @@ class StoreWorker(Worker):
     def _handshake(self, conn: Connection) -> dict:
         local = self._peer_is_local(conn.sock)
         return server_handshake(
-            conn, "", self.hello(), admit=self._admit,
+            conn, "", self.hello(), admit=self._admit, after_auth=self._after_auth,
             token_for=lambda msg: self.pairs.token(msg.get("pair_id")),
             on_pair=lambda c, msg, nonce: self.window.handle(c, msg, nonce, self.pairs, local, phone_name=self.name))
 
@@ -184,8 +184,9 @@ class StoreWorker(Worker):
             while len(self.codes) > CODE_LOG_SIZE:
                 self.codes.popitem(last=False)
             refuse = None
+            parent = msg.get("parent")  # a method call: allowing its object's class allows its methods
             if origin == "user" and self.review:
-                d = self.decisions.get(f"{pid}:{code}")
+                d = self.decisions.get(f"{pid}:{code}") or (parent and self.decisions.get(f"{pid}:{parent}"))
                 if d == "denied":
                     e["state"] = "denied"
                     refuse = ("denied", f"{label} was declined on {self.name}")

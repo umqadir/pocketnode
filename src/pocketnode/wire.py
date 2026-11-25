@@ -193,7 +193,7 @@ def _mac(token: str, nonce: str, role: str) -> str:
 
 
 def server_handshake(conn: Connection, token: str, hello: dict, admit=None, *,
-                     token_for=None, on_pair=None) -> dict:
+                     token_for=None, on_pair=None, after_auth=None) -> dict:
     """Worker side. Sends hello (with a challenge), checks the client's proof.
 
     admit(msg) may return a reason to turn a correctly paired client away
@@ -202,6 +202,9 @@ def server_handshake(conn: Connection, token: str, hello: dict, admit=None, *,
     App Store edition only: token_for(msg) looks the token up by the client's
     pair_id (None: not paired), and on_pair(conn, msg, nonce) answers a
     {"t": "pair"} request, after which the connection ends.
+
+    after_auth() may return fields only a paired client should see (what the worker
+    holds in its cache, say); they go with auth_ok and the client adds them to the hello.
     """
     conn.sock.settimeout(HANDSHAKE_TIMEOUT)
     nonce = os.urandom(16).hex()
@@ -231,7 +234,10 @@ def server_handshake(conn: Connection, token: str, hello: dict, admit=None, *,
         conn.send({"t": "refused", "proof": proof, "reason": why})
         conn.close()
         raise Refused(why)
-    conn.send({"t": "auth_ok", "proof": proof})
+    ok = {"t": "auth_ok", "proof": proof}
+    if after_auth is not None:
+        ok["info"] = after_auth()
+    conn.send(ok)
     conn.authenticated = True
     conn.sock.settimeout(None)
     return msg
@@ -282,6 +288,8 @@ def client_handshake(conn: Connection, token: str, info: dict, credentials=None)
         raise PermissionError(f"{conn.name} rejected the pairing token (or failed to prove it)")
     conn.authenticated = True
     conn.sock.settimeout(None)
+    if isinstance(ok.get("info"), dict):  # sent only once both sides were verified
+        hello = {**hello, **ok["info"]}
     return hello
 
 

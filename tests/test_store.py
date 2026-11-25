@@ -796,6 +796,37 @@ def review_off(x):
     return x + 500
 
 
+class ReviewedTally:
+    """An object kept on the phone (ex.create): its class and methods are shown like functions."""
+
+    def __init__(self, start):
+        self.n = start
+
+    def bump(self):
+        self.n += 1
+        return self.n
+
+
+def test_kept_object_source_and_approval(reviewing, store_ex):
+    sw = reviewing
+    done = {}
+    t = threading.Thread(target=lambda: done.setdefault("obj", store_ex.on("phone").create(ReviewedTally, 5)))
+    t.start()
+    assert _wait(lambda: any("ReviewedTally" in w["label"] for w in sw.waiting_info()))
+    assert not done, "creating an object of a new class waits for Allow"
+    code = next(w["code"] for w in sw.waiting_info() if "ReviewedTally" in w["label"])
+    assert sw.code_source(code).startswith("class ReviewedTally")
+    sw.approve(code, True)
+    t.join(20)
+    obj = done["obj"]
+    # Allowing the class allowed its methods: no second request.
+    assert obj.bump().result(timeout=20) == 6 and obj.bump().result(timeout=20) == 7
+    assert not sw.waiting_info()
+    [m] = [e for e in sw.code_list() if e["label"] == "ReviewedTally.bump"]
+    assert sw.code_source(m["code"]).startswith("def bump") and m["runs"] >= 2 and m["state"] == "allowed"
+    obj.close()
+
+
 def test_code_info_for_functions_lambdas_and_libraries():
     import functools
 
@@ -861,7 +892,7 @@ def test_review_holds_user_code_until_allowed(reviewing, tmp_path, monkeypatch):
         f = ex.on("phone").submit(review_forced, 1)
         assert _wait(lambda: any("review_forced" in w["label"] for w in sw.waiting_info()))
         code = next(w["code"] for w in sw.waiting_info() if "review_forced" in w["label"])
-        assert phone_node.held.get(code) == "waiting"
+        assert _wait(lambda: phone_node.held.get(code) == "waiting")  # (its answer is on the way to the Mac)
         assert any("is waiting for approval on Test iPhone (Ask before running new code is on there)" in t
                    for t in said)
         assert not f.done(), "a forced task waits for the answer"

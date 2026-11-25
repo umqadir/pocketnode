@@ -26,6 +26,7 @@ class Packed:
     buffers: list[memoryview] = field(default_factory=list)
     hashes: list[str] = field(default_factory=list)
     modules: set[str] = field(default_factory=set)
+    pins: dict = field(default_factory=dict)  # key -> the pinned object's record, for objects sent by reference
 
     @property
     def nbytes(self) -> int:
@@ -123,7 +124,43 @@ class _ScanPickler(cloudpickle.Pickler):
         return super().reducer_override(obj)
 
 
-def dumps(obj, memo: HashMemo | None = None, scan: bool = True) -> Packed:
+PIN = "pn-pin"
+
+
+class _PinPickler(_ScanPickler):
+    """Sends objects pinned with ex.pin() as a reference to the copy kept on the node.
+
+    `pins(obj)` returns the pin record for an object that IS pinned (by identity), or None.
+    The record says which modules loading the object needs, so routing still sees them.
+    Only used while something is pinned: persistent_id runs for every object pickled.
+    """
+
+    def __init__(self, file, mods: set, pins, used: dict, **kw):
+        super().__init__(file, mods, **kw)
+        self._pin_of = pins
+        self._used = used
+
+    def persistent_id(self, obj):
+        rec = self._pin_of(obj)
+        if rec is None:
+            return None
+        self._used[rec.key] = rec
+        self._mods |= rec.modules
+        return (PIN, rec.key)
+
+
+class _PinUnpickler(pickle.Unpickler):
+    def __init__(self, file, kept, **kw):
+        super().__init__(file, **kw)
+        self._kept = kept
+
+    def persistent_load(self, pid):
+        if isinstance(pid, tuple) and len(pid) == 2 and pid[0] == PIN:
+            return self._kept(pid[1])
+        raise pickle.UnpicklingError(f"unknown reference {pid!r}")
+
+
+def dumps(obj, memo: HashMemo | None = None, scan: bool = True, pins=None) -> Packed:
     bufs: list[memoryview] = []
 
     def cb(pb: pickle.PickleBuffer):
@@ -134,20 +171,27 @@ def dumps(obj, memo: HashMemo | None = None, scan: bool = True) -> Packed:
         return False
 
     mods: set[str] = set()
+    used: dict = {}
     if scan:
         f = io.BytesIO()
-        _ScanPickler(f, mods, protocol=5, buffer_callback=cb).dump(obj)
+        if pins is not None:
+            _PinPickler(f, mods, pins, used, protocol=5, buffer_callback=cb).dump(obj)
+        else:
+            _ScanPickler(f, mods, protocol=5, buffer_callback=cb).dump(obj)
         data = f.getvalue()
         mods |= code_imports(obj)
         mods.discard("")
     else:
         data = cloudpickle.dumps(obj, protocol=5, buffer_callback=cb)
     hashes = [memo.get(b) if memo else digest(b) for b in bufs]
-    return Packed(data, bufs, hashes, mods)
+    return Packed(data, bufs, hashes, mods, used)
 
 
-def loads(data, buffers=()):
-    return pickle.loads(data, buffers=buffers)
+def loads(data, buffers=(), kept=None):
+    """kept(key) returns the node's copy of a pinned object a task refers to."""
+    if kept is None:
+        return pickle.loads(data, buffers=buffers)
+    return _PinUnpickler(io.BytesIO(data), kept, buffers=buffers).load()
 
 
 def dumps_plain(obj) -> Packed:
