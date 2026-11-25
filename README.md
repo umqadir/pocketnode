@@ -18,6 +18,7 @@ df.pn.groupby("customer").apply(features)             # pandas, split across Mac
 | **APIs** | a `concurrent.futures` executor (`submit`, `map`), scikit-learn and joblib (`n_jobs`), pandas (`groupby().apply`, `map`, `apply`), Dask, and a `%%phone` cell in Jupyter |
 | **Libraries** | numpy, pandas, scipy, scikit-learn, PyTorch, MLX, polars, pyarrow, duckdb, matplotlib, and any pure-Python package. Others get added the first time your code needs them. |
 | **Phone hardware** | all six CPU cores, the GPU via PyTorch (`"mps"`) and MLX, and about 6 GB of memory |
+| **Models and state** | weights cross the cable once and stay cached on the phone. Pin a model so every task reuses the loaded copy, keep an object on the phone between calls, and stream results back as they're produced. |
 | **Package versions** | the phone runs the same builds installed on your Mac, so there is no second environment to keep in sync |
 | **Correctness** | phone results are checked against the Mac, and tasks the phone can't run fall back to the Mac |
 | **Connection** | USB cable, or Wi-Fi if you turn it on. Code and data stay between your Mac and your phone. |
@@ -103,7 +104,7 @@ with pn.parallel():
 matches = list(ex.map(best_match, names))
 ```
 
-**A model used by many tasks.** `ex.pin` keeps the object itself loaded on each node, so tasks that use it don't rebuild it. The kept copy is a snapshot that tasks share and shouldn't change; pin it again after changing it on the Mac (PyTorch models are re-pinned by themselves when their weights change).
+**Load a model once.** A model's weights are cached on the phone by content, so they cross the cable the first time a task uses them and not again. `ex.pin(model)` also keeps the model loaded on each device, and every task that uses it gets that copy.
 
 ```python
 ex.pin(model)
@@ -111,7 +112,9 @@ preds = list(ex.map(lambda batch: model(batch), batches))
 ex.unpin(model)
 ```
 
-**A model kept on the phone.** `ex.on("phone").create(...)` builds an object on the phone and keeps it there with its state; each method call returns a future. Calls on one object run one at a time, in order. If the app restarts, the next call rebuilds the object from the same arguments.
+Tasks share the pinned copy and shouldn't modify it. After changing the model on the Mac, pin it again. PyTorch models re-pin themselves when their weights change.
+
+**Keep a model on the phone's GPU.** `ex.on("phone").create(...)` builds an object on the phone and keeps it there, state included. Each method call returns a future, and calls on one object run in order. If the app restarts, the next call rebuilds the object from the same arguments.
 
 ```python
 class Server:
@@ -127,7 +130,7 @@ y = server.predict(x).result()
 server.close()
 ```
 
-**Streaming.** `.stream(...)` runs a generator on the phone and yields its items on the Mac as they are produced: tokens as a model generates them, or metrics after each epoch. Breaking out of the loop stops the generator on the phone.
+**Stream results.** `.stream(...)` runs a generator on the phone and yields each item on the Mac as it's produced: tokens from a model, or metrics after each epoch. Break out of the loop and the generator stops on the phone.
 
 ```python
 for token in chat.generate.stream(prompt):       # a method of a kept object that yields
@@ -161,6 +164,7 @@ Manual placement: `ex.on("phone").submit(...)`, `@pn.runs_on("mac")`, or `with p
 - **Unsupported tasks stay on the Mac.** Tasks that read files on your Mac or start processes run locally, along with anything needing a library the phone can't load.
 - **Disconnects don't drop work.** Unplug the phone, lock it, or let it get hot and its work finishes on the Mac.
 - **Forced placement fails loudly.** `ex.on("phone")` raises `PlacementError` if the phone can't run the task.
+- **Kept objects and streams run in one place.** They aren't checked against the Mac or moved. If the phone goes away their calls raise `NodeLost`, and the next call rebuilds the object.
 
 ## How it works
 
@@ -174,9 +178,7 @@ Manual placement: `ex.on("phone").submit(...)`, `@pn.runs_on("mac")`, or `with p
 
 **Cable pulled or thermal throttling.** Pull the cable and the phone's tasks finish on the Mac. When the phone reports it's getting hot, it gets less work.
 
-**Data caching.** Arrays and DataFrames ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. `ex.pin(X)` keeps it there, already unpickled, and tasks that use `X` get that copy.
-
-**Disk caching.** Inputs of 8 MB or more, and anything pinned, are also kept on the phone's disk by content, so model weights and large tables survive an app restart and aren't sent again. The disk cache uses up to a fifth of the phone's free space (at most 50 GB) and drops the least recently used first. A file iOS cleared or that no longer matches its content is sent again.
+**Caching.** Arrays, DataFrames and PyTorch weights ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. Anything 8 MB or larger is also kept on the phone's disk, so model weights and big tables survive an app restart. The disk cache uses up to a fifth of the phone's free space, capped at 50 GB, and drops the least recently used first.
 
 **Scheduling.** pocketnode measures each function on each device, and the link's speed, then sends tasks where they'll finish soonest. Memory-bound operations like filtering or merging one large table stay on the Mac. Compute-heavy work spreads out.
 

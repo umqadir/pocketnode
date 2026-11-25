@@ -207,6 +207,56 @@ def torch_gpu(ex, quick):
     return "training on the phone's GPU matches its CPU"
 
 
+def _t_forward(model, x):
+    import torch
+    with torch.no_grad():
+        return model(x)
+
+
+class _TorchServer:
+    """A model kept on the phone, on its GPU when it has one."""
+
+    def __init__(self, model):
+        import torch
+        self.dev = "mps" if torch.backends.mps.is_available() else "cpu"
+        self.model = model.to(self.dev).eval()
+
+    def where(self):
+        return self.dev
+
+    def predict(self, x):
+        import torch
+        with torch.no_grad():
+            return self.model(x.to(self.dev)).cpu()
+
+
+def torch_model_once(ex, quick):
+    _need(ex, "torch")
+    import torch
+    model = torch.nn.Sequential(torch.nn.Linear(1024, 1024), torch.nn.ReLU(), torch.nn.Linear(1024, 1024)).eval()
+    x = torch.randn(32, 1024)  # (fresh weights each run: never cached before)
+    with torch.no_grad():
+        want = model(x)
+    size = sum(p.numel() * 4 for p in model.parameters())
+    ph, node = ex.on("phone"), _phone(ex)
+    b0 = node.bytes_sent
+    y1 = ph.submit(_t_forward, model, x).result(timeout=T)
+    b1 = node.bytes_sent
+    y2 = ph.submit(_t_forward, model, x).result(timeout=T)
+    b2 = node.bytes_sent
+    _expect(torch.allclose(y1, want, atol=1e-4) and torch.allclose(y2, want, atol=1e-4), "wrong result")
+    _expect(b2 - b1 < size / 20, f"the second task sent {(b2 - b1) / 2**20:.1f} MB of weights again")
+    with ph.create(_TorchServer, model) as server:
+        dev = server.where().result(timeout=T)
+        b3 = node.bytes_sent
+        ys = [server.predict(x).result(timeout=T) for _ in range(3)]
+        b4 = node.bytes_sent
+    _expect(all(torch.allclose(y, want, atol=1e-3) for y in ys), f"the model kept on the phone's {dev} differs")
+    _expect(b4 - b3 < size / 20, f"calls on the kept model sent {(b4 - b3) / 2**20:.1f} MB")
+    return (f"{size / 2**20:.0f} MB of weights: first task sent {(b1 - b0) / 2**20:.1f} MB, the second "
+            f"{(b2 - b1) / 1024:.0f} KB; kept on the phone's {dev}, 3 calls match")
+
+
 def _t_mlx(seed):
     import mlx.core as mx
     import numpy as np
@@ -643,6 +693,7 @@ CHECKS = [
     ("numpy via __import__", indirect_numpy),
     ("torch training (after pure)", _library("torch", _t_torch, tol=1e-4)),
     ("torch on the phone's GPU", torch_gpu),
+    ("PyTorch model crosses once, kept on the GPU", torch_model_once),
     ("MLX on the phone's GPU", mlx_gpu),
     ("Mac file guard", mac_file_guard),
     ("process guard", process_guard),

@@ -98,7 +98,49 @@ def register_user_modules() -> None:
         _user_modules_registered.add(name)
 
 
-class _ScanPickler(cloudpickle.Pickler):
+def _torch_reduce(obj):
+    """A CPU tensor's storage as an out-of-band buffer, or None to leave it to PyTorch.
+
+    PyTorch's own pickling copies the bytes into the pickle, where they can't be cached by
+    content: a model's weights would cross the link with every task that uses it.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None or type(obj) is not torch.storage.TypedStorage:
+        return None
+    try:
+        raw = obj._untyped_storage
+        if raw.device.type != "cpu" or raw.nbytes() < OOB_MIN:
+            return None
+        view = torch.empty(0, dtype=torch.uint8).set_(raw).numpy()
+    except Exception:  # noqa: BLE001 - a storage kind this doesn't know: PyTorch's way still works
+        return None
+    return _torch_storage, (pickle.PickleBuffer(view), obj.dtype)
+
+
+def _torch_storage(buf, dtype):
+    """Rebuild a storage sent by _torch_reduce around the buffer it arrived in."""
+    import torch
+    m = memoryview(buf)
+    if m.readonly:
+        # Shared with the cache or with other tasks, and PyTorch writes through a buffer
+        # whatever its flags say: this storage gets bytes of its own.
+        m = memoryview(bytearray(m))
+    t = torch.frombuffer(m, dtype=torch.uint8)
+    return torch.storage.TypedStorage(wrap_storage=t.untyped_storage(), dtype=dtype, _internal=True)
+
+
+class _Pickler(cloudpickle.Pickler):
+    """cloudpickle, with PyTorch tensors' bytes out-of-band like NumPy's."""
+
+    def reducer_override(self, obj):
+        if type(obj).__module__ == "torch.storage":
+            r = _torch_reduce(obj)
+            if r is not None:
+                return r
+        return super().reducer_override(obj)
+
+
+class _ScanPickler(_Pickler):
     """cloudpickle, noting the module of every non-builtin object as it goes by.
 
     That is the set of modules loading the pickle will import. Collecting it
@@ -182,7 +224,9 @@ def dumps(obj, memo: HashMemo | None = None, scan: bool = True, pins=None) -> Pa
         mods |= code_imports(obj)
         mods.discard("")
     else:
-        data = cloudpickle.dumps(obj, protocol=5, buffer_callback=cb)
+        f = io.BytesIO()
+        _Pickler(f, protocol=5, buffer_callback=cb).dump(obj)
+        data = f.getvalue()
     hashes = [memo.get(b) if memo else digest(b) for b in bufs]
     return Packed(data, bufs, hashes, mods, used)
 
@@ -205,7 +249,9 @@ def dumps_plain(obj) -> Packed:
         bufs.append(view)
         return False
 
-    return Packed(cloudpickle.dumps(obj, protocol=5, buffer_callback=cb), bufs)
+    f = io.BytesIO()
+    _Pickler(f, protocol=5, buffer_callback=cb).dump(obj)
+    return Packed(f.getvalue(), bufs)
 
 
 # ------------------------------------------------------------ module discovery
