@@ -119,7 +119,7 @@ def _env_key(manifest) -> str | None:
 class Worker:
     uses_site = True  # packages added at run time are imported from self.site
     # What this worker understands beyond plain tasks; a Mac checks before using one.
-    features = ("disk-cache", "pinned-objects")
+    features = ("disk-cache", "pinned-objects", "objects")
 
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
@@ -156,6 +156,9 @@ class Worker:
         self._sub_cancels: dict[str, Callable[[], None]] = {}  # task id -> interrupts its subinterpreter run
         self._reserved: dict[str, list[str]] = {}  # task id -> buffer hashes it holds in the store
         self.kept: dict[str, dict] = {}  # key -> an object pinned from a Mac (ex.pin), built on first use
+        # Objects a Mac built here (ex.create), by the id it chose. They live in the main
+        # interpreter; their method calls run on the task threads, one at a time per object.
+        self.objects: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._tl = threading.local()
         self._pending_imports: dict[str, tuple[threading.Event, list]] = {}
@@ -369,6 +372,8 @@ class Worker:
             for k in gone:
                 del self.sessions[k]
             keys = [k for k, e in self.kept.items() if e["sid"] in gone]
+            for k in [k for k, o in self.objects.items() if o["sid"] in gone]:
+                del self.objects[k]
         for k in keys:
             self._unkeep(k)
 
@@ -454,9 +459,12 @@ class Worker:
     def _dispatch(self, sess: _Session, msg: dict, bufs: list[bytearray]) -> None:
         t = msg["t"]
         sid = sess.id
-        if t == "task":
+        if t in ("task", "create", "call"):
             msg["_sid"] = sid
             self._accept_task(msg, bufs)
+        elif t == "drop":
+            with self._lock:
+                self.objects.pop(str(msg.get("obj")), None)
         elif t == "put":
             self._on_put(msg["hashes"], bufs)
         elif t == "module":
@@ -480,7 +488,8 @@ class Worker:
         elif t == "inventory":  # diagnostics: what this session has kept here
             with self._lock:
                 kept = [k for k, e in self.kept.items() if e["sid"] == sid]
-            self._send({"t": "inventory", "req": msg.get("req"), "kept": kept}, sid=sid)
+                objects = [k for k, o in self.objects.items() if o["sid"] == sid]
+            self._send({"t": "inventory", "req": msg.get("req"), "kept": kept, "objects": objects}, sid=sid)
         elif t == "ping":
             self._send({"t": "pong", "ts": msg.get("ts"), "state": self.state(), "store": self.store.stats()},
                        sid=sid)
@@ -807,6 +816,9 @@ class Worker:
             result = ({"t": "result", "id": tid, "node": self.id, "ok": False, "infra": True,
                        "error": _format_exc(exc), "exc_type": type(exc).__name__}, [])
         cancelled = self._cleanup(tid)
+        if msg.get("t") == "create" and (result is None or cancelled or not result[0].get("ok")):
+            with self._lock:  # built, then refused (a guard tripped late) or cancelled: nobody holds it
+                self.objects.pop(str(msg.get("obj")), None)
         if result is None or cancelled:
             return
         header, out_bufs = result
@@ -845,7 +857,7 @@ class Worker:
                 done = self._run_sub(msg, payload, views, header, t0, t1)
                 if done is not None:
                     return header, done
-            fn, args, kwargs = serialize.loads(payload, views, kept=self._kept_object if msg.get("pins") else None)
+            fn, args, kwargs = self._callable(msg, payload, views)
             t2 = time.perf_counter()
             guards.begin_task()
             with _captured() as (o, e):
@@ -898,6 +910,42 @@ class Worker:
             if missing:
                 header["unavailable"] = {"kind": missing.kind, "detail": missing.detail, "module": missing.module}
         return header, out_bufs
+
+    def _callable(self, msg: dict, payload, views) -> tuple:
+        """(fn, args, kwargs) for a message: a task's own, or building / calling a kept object."""
+        kept = self._kept_object if msg.get("pins") else None
+        t = msg.get("t", "task")
+        if t == "task":
+            return serialize.loads(payload, views, kept=kept)
+        oid, label = str(msg.get("obj")), str(msg.get("label") or "object")
+        if t == "create":
+            factory, args, kwargs = serialize.loads(payload, views, kept=kept)
+            sid = msg.get("_sid")
+
+            def create(*a, **k):
+                value = factory(*a, **k)
+                with self._lock:
+                    self.objects[oid] = {"value": value, "sid": sid, "label": label, "lock": threading.Lock()}
+
+            return create, args, kwargs
+        args, kwargs = serialize.loads(payload, views, kept=kept)
+        with self._lock:
+            o = self.objects.get(oid)
+        if o is None:
+            raise Unavailable("object", f"{label.rsplit('.', 1)[0]} isn't on {self.name} (the app restarted, "
+                                        "or it was dropped)")
+        name = str(msg["method"])
+
+        def call(*a, **k):
+            lock = o["lock"]
+            while not lock.acquire(timeout=0.05):  # (a timeout, so a cancel can land while it waits)
+                pass
+            try:
+                return getattr(o["value"], name)(*a, **k)
+            finally:
+                lock.release()
+
+        return call, args, kwargs
 
     def _prefetch(self, mods) -> None:
         """Fetch pure-Python modules a task names, so subinterpreters (which have

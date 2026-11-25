@@ -100,6 +100,16 @@ class Task:
     reason: str = ""
     suggestion: str | None = None
     fn: Any = None  # the function doing the work (for its source text, shown on store phones)
+    # An object kept on a node (ex.create): "create" builds it there, "call" runs a method on it.
+    kind: str = "task"
+    obj: Any = None  # the RemoteObject handle
+    method: str | None = None
+    # Runs only where it was placed: if that node goes away it fails with NodeLost instead of
+    # running again elsewhere (it may have changed state there, or already sent part of its output).
+    sticky: bool = False
+    fallback: str | None = None  # placed automatically on a phone that then couldn't: go here instead
+    node: Any = None  # the node it finished on
+    gen: int = 0  # (calls) the object's loss count when it was made
 
     @property
     def done(self) -> bool:
@@ -233,11 +243,17 @@ class Node:
                 specs.append({"h": h, "i": 1})
                 inline.append(b)
                 self.known.add(h)
-        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key, "label": t.fn_label}
+        header = {"t": t.kind, "id": att.id, "bufs": specs, "fk": t.fn_key, "label": t.fn_label}
+        if t.obj is not None:
+            header["obj"] = t.obj._id
+        if t.method:
+            header["method"] = t.method
         if self.hello.get("edition") == "store":
             # The App Store edition shows the person what runs; the text travels once per code.
             ci = self.ex._code_of(t)
             header["code"], header["origin"] = ci["code"], ci["origin"]
+            if t.kind == "call":  # allowing the class (or factory) allows its methods
+                header["parent"] = self.ex._code_for(t.obj._key, t.obj._factory, t.obj._label)["code"]
             for k in ("dist", "where"):
                 if ci.get(k):
                     header[k] = ci[k]
@@ -383,6 +399,7 @@ class PocketExecutor(Executor):
         self._noted: set[tuple] = set()
         self._buf_by_hash: dict[str, tuple[memoryview, int]] = {}
         self._kept: dict[int, _Pin] = {}  # id(obj) -> its pin, for objects kept on nodes by pin()
+        self._objects: dict[str, Any] = {}  # object id -> RemoteObject (ex.create), until closed
         self._replies: dict[str, tuple] = {}
         self._qgen = 0  # bumped whenever a task becomes available to pick
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
@@ -419,18 +436,32 @@ class PocketExecutor(Executor):
         task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro,
                     pure=router.is_pure(packed.modules) and not packed.pins,
                     weight=weight, shadow=shadow, fn=fn)
+        self._admit(task)
+        return fut
+
+    def _admit(self, task: Task) -> None:
+        """Put a task in the queue (once per task) and free what it holds when it is done."""
         with self._cv:
-            for b, h in zip(packed.buffers, packed.hashes):
+            for b, h in zip(task.packed.buffers, task.packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)
             self.tasks[task.id] = task
-            if shadow:  # someone's result is waiting on this: it goes first
+            if task.shadow:  # someone's result is waiting on this: it goes first
                 self.queue.appendleft(task)
             else:
                 self.queue.append(task)
             self._qgen += 1
             self._cv.notify_all()
-        fut.add_done_callback(lambda f, t=task: self._release(t))
-        return fut
+        task.future.add_done_callback(lambda f, t=task: self._release(t))
+
+    def _requeue_task(self, task: Task) -> None:
+        """Queue an admitted task that isn't running anywhere again (where task.placement says)."""
+        with self._cv:
+            if not task.done and not task.queued and not any(a.id in self.attempts for a in task.attempts.values()):
+                task.queued = True
+                task.eligible.clear()
+                self.queue.appendleft(task)
+                self._qgen += 1
+            self._cv.notify_all()
 
     def map(self, fn, *iterables, timeout=None, chunksize=1, placement=None, buffersize=None):
         memo = serialize.HashMemo()
@@ -445,6 +476,47 @@ class PocketExecutor(Executor):
     def _max_workers(self) -> int:
         """Concurrent slots right now (dask reads this to size its thread pool)."""
         return max(1, sum(n.effective_slots() for n in self.nodes.values()))
+
+    def create(self, factory: Callable, /, *args, recreate: bool = True, **kwargs) -> "RemoteObject":
+        """Build `factory(*args, **kwargs)` on one node and keep it there; returns a handle.
+
+        `handle.method(...)` runs that method on the kept object and returns a future. Calls
+        on one object run one at a time, in the order made; different objects run at once.
+        The node is the first phone able to run it (its modules there, its inputs fitting in
+        memory), else a Mac worker; `ex.on("phone").create(...)` insists. Blocks until the
+        object is built and raises what the constructor raised.
+
+        Calls run only where the object is, with no checking against the Mac. If that node
+        goes away, calls in flight raise NodeLost; the next call rebuilds the object from the
+        same arguments once a node of that kind is back (its state starts over), unless
+        recreate=False, which makes later calls raise NodeLost instead.
+        """
+        return self._create(factory, args, kwargs, None, recreate)
+
+    def _create(self, factory, args, kwargs, placement, recreate) -> "RemoteObject":
+        if self._shutdown:
+            raise RuntimeError("cannot create objects after shutdown")
+        from .remote import RemoteObject
+        serialize.register_user_modules()
+        obj = RemoteObject(self, factory, args, kwargs, placement or self.default_placement, recreate)
+        obj._start()
+        return obj
+
+    def _place_once(self, task: Task) -> None:
+        """Automatic placement decided at submission, for work that stays where it starts:
+        the first phone that can run it, else a Mac worker."""
+        with self._cv:
+            task.placement = "auto"
+            phones = sorted((n for n in self.nodes.values() if n.kind != "mac" and n.connected),
+                            key=lambda n: n.name)
+            for n in phones:
+                ok, _ = self._eligible(task, n)
+                if task.done:
+                    return
+                if ok:
+                    task.placement, task.fallback = n.id, "mac"
+                    return
+            task.placement = "mac"
 
     def on(self, placement: str) -> "PlacedExecutor":
         """A view of this executor that forces placement: `ex.on("phone").submit(f, x)`."""
@@ -611,6 +683,15 @@ class PocketExecutor(Executor):
         for s in self.sources:
             s.stop()
         self._kept.clear()
+        for o in list(self._objects.values()):  # objects kept on nodes go with the executor too
+            o._closed = True
+            n = o._node
+            if n is not None and self.nodes.get(n.id) is n:
+                try:
+                    n.conn.send({"t": "drop", "obj": o._id})
+                except (ConnectionClosed, OSError):
+                    pass
+        self._objects.clear()
         for n in list(self.nodes.values()):
             for key in list(n.kept):  # pinned objects go with the executor
                 try:
@@ -737,6 +818,15 @@ class PocketExecutor(Executor):
                 self._gone[node.id] = node
             for a in list(node.running.values()):
                 t = a.task
+                if t.sticky and not t.done:
+                    if t.fallback and t.kind == "create":  # placed there automatically: build it elsewhere
+                        node.running.pop(a.id, None)
+                        self.attempts.pop(a.id, None)
+                        t.attempts.pop(a.id, None)
+                        self._retarget(t, f"lost {node.label()} while building it")
+                    else:
+                        self._fail(t, _lost_error(t, node))
+                    continue
                 if crashed and t.placement not in ("auto", None) and not t.done:
                     # Told to run there, and it takes the app down: once more in
                     # case it was a coincidence, then say so instead of looping.
@@ -758,6 +848,11 @@ class PocketExecutor(Executor):
                     t.queued = True
                     self.queue.appendleft(t)
                     self._qgen += 1
+            for t in list(self.queue):  # waiting to run on this node, which is gone
+                if t.sticky and t.queued and not t.done and t.placement == node.id:
+                    self._fail(t, _lost_error(t, node))
+            for o in list(self._objects.values()):
+                o._lost(node)
             self._cv.notify_all()
         if node.kind != "mac" and not self._shutdown:
             self._note(None, f"pocketnode: lost {node.label()}; its tasks are being re-run on other nodes")
@@ -785,10 +880,11 @@ class PocketExecutor(Executor):
             return False, self.mac_only[task.fn_key][0]
         if task.eligible.get(node.id):
             return True, ""
-        if task.packed.pins and _lacks(node, "pinned-objects"):
+        feature = _feature_for(task)
+        if feature and _lacks(node, feature):
             why = OLDER_APP.format(node.name)
             if p not in ("auto", None) or self.strict:
-                self._fail(task, PlacementError(f"{task.fn_label} uses a pinned object, and {why}"))
+                self._fail(task, PlacementError(f"{task.fn_label} can't run on {node.label()}: {why}"))
             else:
                 task.excluded[node.kind] = why
             return False, why
@@ -1079,6 +1175,17 @@ class PocketExecutor(Executor):
             return
         if msg.get("unavailable"):
             u = msg["unavailable"]
+            if u.get("kind") == "object" and task.obj is not None:  # the node doesn't have it (any more)
+                task.obj._missing(task, node)
+                return
+            if task.fallback and u.get("kind") not in ("cache", "pin"):
+                if u.get("kind") in ("approval", "denied"):
+                    code = str(u.get("code") or self._code_of(task)["code"])
+                    with self._cv:
+                        if node.held.get(code) != "denied":
+                            node.held[code] = "waiting" if u.get("kind") == "approval" else "denied"
+                self._retarget(task, _unavailable_reason(u, node))
+                return
             if u.get("kind") in ("cache", "pin") and task.cache_retries < 2:
                 # Its inputs were evicted between arriving and running, or a pinned object it
                 # uses isn't on the node (any more): send them again.
@@ -1223,6 +1330,17 @@ class PocketExecutor(Executor):
             else:
                 self._requeue(t, n, reason, None, quiet=True)
 
+    def _retarget(self, task: Task, reason: str) -> None:
+        """A task placed automatically on a phone that couldn't take it after all: its fallback."""
+        with self._cv:
+            task.placement, task.fallback, task.reason = task.fallback, None, reason
+            task.eligible.clear()
+            if not task.done and not task.queued:
+                task.queued = True
+                self.queue.appendleft(task)
+                self._qgen += 1
+            self._cv.notify_all()
+
     def _requeue(self, task: Task, node: Node, reason: str, suggestion: str | None, quiet=False) -> None:
         with self._cv:
             task.excluded[node.kind] = reason
@@ -1241,6 +1359,7 @@ class PocketExecutor(Executor):
     def _finish(self, task: Task, node: Node, att: Attempt, value=None, exc=None) -> None:
         p = task.future.placement
         p.node, p.kind = node.name, node.kind
+        task.node = node
         p.attempts = [f"{a.node.label()}{' (speculative)' if a.speculative else ''}" for a in task.attempts.values()]
         p.seconds = time.monotonic() - task.submitted
         if att.speculative:
@@ -1338,10 +1457,12 @@ class PocketExecutor(Executor):
 
     def _code_of(self, task: Task) -> dict:
         """What a store phone is told about a task's function: code hash, origin, text (cached)."""
-        key = task.fn_key
+        return self._code_for(task.fn_key, task.fn, task.fn_label)
+
+    def _code_for(self, key: str, fn, label: str) -> dict:
         info = self._src_cache.get(key)
         if info is None:
-            info = self._src_cache[key] = _code_info(task.fn, task.fn_label)
+            info = self._src_cache[key] = _code_info(fn, label)
         return info
 
     def _on_held(self, task: Task, node: Node, u: dict) -> None:
@@ -1427,7 +1548,7 @@ def _code_info(fn, label: str = "") -> dict:
     import io
     import textwrap
     f = fn
-    for _ in range(6):  # as in _fn_identity: look through partials, bound methods, decorators
+    for _ in range(0 if isinstance(f, type) else 6):  # as in _fn_identity: partials, bound methods, decorators
         inner = (getattr(f, "func", None) or getattr(f, "__func__", None) or getattr(f, "function", None)
                  or getattr(f, "__wrapped__", None))
         if inner is None or not callable(inner):
@@ -1483,12 +1604,31 @@ class PlacedExecutor:
     def map(self, fn, *iterables, timeout=None, chunksize=1):
         return self._ex.map(fn, *iterables, timeout=timeout, chunksize=chunksize, placement=self._p)
 
+    def create(self, factory, /, *args, recreate: bool = True, **kwargs):
+        """Like ex.create, on this placement; PlacementError if no node there can hold it."""
+        return self._ex._create(factory, args, kwargs, self._p, recreate)
+
 
 def _matches(node: Node, placement: str) -> bool:
     return placement in (node.kind, node.name, node.id)
 
 
 OLDER_APP = "the app on {} is older than this pocketnode; run `pocketnode app install`"
+
+
+def _lost_error(t: Task, node: Node) -> NodeLost:
+    what = f"; {t.obj._label} was kept there" if t.obj is not None else ""
+    return NodeLost(f"lost {node.label()} while {t.fn_label} was running there{what}", node=node.name,
+                    obj=t.obj._label if t.obj is not None else None)
+
+
+def _feature_for(task: Task) -> str | None:
+    """What a worker must understand to run this task (beyond plain tasks)."""
+    if task.kind != "task":
+        return "objects"
+    if task.packed.pins:
+        return "pinned-objects"
+    return None
 
 
 def _lacks(node: Node, feature: str) -> bool:

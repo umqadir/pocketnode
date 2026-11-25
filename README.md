@@ -111,6 +111,22 @@ preds = list(ex.map(lambda batch: model(batch), batches))
 ex.unpin(model)
 ```
 
+**A model kept on the phone.** `ex.on("phone").create(...)` builds an object on the phone and keeps it there with its state; each method call returns a future. Calls on one object run one at a time, in order. If the app restarts, the next call rebuilds the object from the same arguments.
+
+```python
+class Server:
+    def __init__(self, model):
+        self.model = model.to("mps").eval()
+
+    def predict(self, x):
+        with torch.no_grad():
+            return self.model(x.to("mps")).cpu()
+
+server = ex.on("phone").create(Server, model)   # the weights cross the cable once
+y = server.predict(x).result()
+server.close()
+```
+
 **Training on the phone's GPU.** Code that checks for `"mps"` picks up the phone's GPU too.
 
 ```python

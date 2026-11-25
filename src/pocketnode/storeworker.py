@@ -184,8 +184,9 @@ class StoreWorker(Worker):
             while len(self.codes) > CODE_LOG_SIZE:
                 self.codes.popitem(last=False)
             refuse = None
+            parent = msg.get("parent")  # a method call: allowing its object's class allows its methods
             if origin == "user" and self.review:
-                d = self.decisions.get(f"{pid}:{code}")
+                d = self.decisions.get(f"{pid}:{code}") or (parent and self.decisions.get(f"{pid}:{parent}"))
                 if d == "denied":
                     e["state"] = "denied"
                     refuse = ("denied", f"{label} was declined on {self.name}")

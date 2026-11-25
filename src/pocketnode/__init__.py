@@ -21,14 +21,14 @@ import logging
 import os
 
 __all__ = ["connect", "current", "parallel", "placement", "runs_on", "packages", "PocketExecutor",
-           "PocketFuture", "Placement", "PlacementError", "Unavailable", "NodeLost"]
+           "PocketFuture", "Placement", "PlacementError", "Unavailable", "NodeLost", "RemoteObject"]
 
 # Loaded on first use, so `import pocketnode` stays cheap: workers and the
 # phone's subinterpreters import the package without needing the Mac side.
 _LAZY = {
     "PocketExecutor": "executor", "PocketFuture": "executor", "Placement": "executor",
     "placement": "executor", "runs_on": "executor",
-    "PlacementError": "errors", "Unavailable": "errors", "NodeLost": "errors",
+    "PlacementError": "errors", "Unavailable": "errors", "NodeLost": "errors", "RemoteObject": "remote",
 }
 
 
