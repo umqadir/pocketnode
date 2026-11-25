@@ -51,8 +51,26 @@ def _fault_log() -> str | None:
     return last
 
 
+def _store() -> bool:
+    """The App Store edition: pocketnode.storehost runs the show."""
+    return _settings().get("edition") == "store"
+
+
+def __getattr__(name):
+    # The store edition's host app calls further functions by name (pair_begin,
+    # status_json, run_local, ...); they live in pocketnode.storehost.
+    if not name.startswith("__") and _store():
+        from pocketnode import storehost
+        return getattr(storehost, name)
+    raise AttributeError(f"module 'pocketnode_ios' has no attribute {name!r}")
+
+
 def main() -> None:
     global worker
+    if _store():
+        from pocketnode import storehost
+        storehost.main()
+        return
     from pocketnode import device
     from pocketnode.worker import Worker
 
@@ -83,6 +101,9 @@ _refused_at = 0.0
 
 def continued(state: str) -> str:
     """The host reports what became of a request to keep computing in the background."""
+    if _store():
+        from pocketnode import storehost
+        return storehost.continued(state)
     global _continued, _refused_at
     _continued = state.split(":")[0]
     if _continued == "refused":
@@ -119,6 +140,9 @@ def _keep_computing_loop() -> None:
 
 
 def lifecycle(state: str) -> str:
+    if _store():
+        from pocketnode import storehost
+        return storehost.lifecycle(state)
     if worker is not None:
         worker.notify(state)
     note(f"lifecycle: {state}")
@@ -126,6 +150,10 @@ def lifecycle(state: str) -> str:
 
 
 def memory_warning() -> None:
+    if _store():
+        from pocketnode import storehost
+        storehost.memory_warning()
+        return
     if worker is not None:
         worker.store.clear()
         worker.notify()
@@ -137,10 +165,16 @@ def note(text: str) -> None:
 
 
 def tasks_done() -> int:
+    if _store():
+        from pocketnode import storehost
+        return int(storehost.tasks_done())
     return worker.tasks_done if worker else 0
 
 
 def status() -> str:
+    if _store():
+        from pocketnode import storehost
+        return storehost.status_json()
     if worker is None:
         return "starting…"
     from pocketnode import device

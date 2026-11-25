@@ -115,7 +115,8 @@ def phone_packages(executor=None) -> dict[str, str] | None:
         for n in ex.nodes.values():
             if n.kind == "phone":
                 return dict(n.hello.get("packages", {}))
-    rep = Path(app_mod.stage_mod.STAGE_ROOT) / app_mod.config().get("sdk", "iphoneos") / "stage-report.json"
+    cfg = app_mod.config()
+    rep = app_mod.stage_dir(cfg.get("sdk", "iphoneos"), app_mod.current_flavour(cfg)) / "stage-report.json"
     if rep.exists():
         return json.loads(rep.read_text())["dists"]
     return None
@@ -123,7 +124,9 @@ def phone_packages(executor=None) -> dict[str, str] | None:
 
 def table(check: bool = True, executor=None) -> list[Row]:
     from .hot import footprint
+    from ..router import release
     on_phone = {k.lower(): v for k, v in (phone_packages(executor) or {}).items()}
+    store = app_mod.current_flavour() == "store"
     rows = []
     for d in sorted(md.distributions(), key=lambda d: (d.metadata["Name"] or "").lower()):
         name = d.metadata["Name"]
@@ -134,7 +137,9 @@ def table(check: bool = True, executor=None) -> list[Row]:
             rows.append(Row(name, d.version, "pure", "auto", "-", "imported from the Mac on demand", size))
             continue
         have = on_phone.get(name.lower())
-        status = "on phone" if have == d.version else (f"phone has {have}" if have else "not on phone")
+        # The store edition's fixed set is used whenever the release matches (2.5.2.post1 serves 2.5.2).
+        same = have == d.version or (store and have is not None and release(have) == release(d.version))
+        status = "on phone" if same else (f"phone has {have}" if have else "not on phone")
         ios, detail = _check_dist(d) if check else ("?", "")
         rows.append(Row(name, d.version, "compiled", status, ios, detail, size))
     return rows
@@ -180,6 +185,33 @@ def _live(executor=None):
             temp.shutdown(wait=False)
 
 
+def _fixed_phone(executor=None):
+    """The connected phone if it runs the App Store edition (its package set is fixed), else None."""
+    ex = executor
+    if ex is None:
+        from .. import _current
+        ex = _current
+    for n in list(ex.nodes.values()) if ex is not None else ():
+        if n.kind == "phone" and n.hello.get("fixed_packages"):
+            return n
+    return None
+
+
+def _refuse_fixed(ex) -> None:
+    node = _fixed_phone(ex)
+    if node is not None:
+        from .hot import CantAdd, fixed_message
+        raise CantAdd(fixed_message(node))
+
+
+def _refuse_store_flavour() -> None:
+    """This Mac builds the App Store edition: there is no app here to rebuild with other packages."""
+    if app_mod.current_flavour() == "store":
+        from .hot import CantAdd
+        from ..storeworker import FIXED
+        raise CantAdd(FIXED)
+
+
 class Packages:
     """`pn.packages` — call it for the table; methods change what's on the phone."""
 
@@ -202,6 +234,7 @@ class Packages:
             from . import hot
             with _live(executor) as ex:
                 if ex is not None:
+                    _refuse_fixed(ex)
                     have = next(n.hello.get("packages", {}) for n in ex.nodes.values() if n.kind == "phone")
                     est = hot.estimate(list(names), have=have)
                     print(f"adding {', '.join(names)}: about {est['seconds']} s, {est['mb']} MB"
@@ -220,6 +253,7 @@ class Packages:
                     if r.get("restart"):
                         print("  an older version was already loaded: the app restarts to switch")
                     return r
+            _refuse_store_flavour()
             print("no phone reachable; adding it to the app build instead")
         return self._change(add=list(names), yes=yes, when_idle=when_idle, sdk=sdk)
 
@@ -230,6 +264,7 @@ class Packages:
             from . import hot
             with _live(executor) as ex:
                 if ex is not None:
+                    _refuse_fixed(ex)
                     r = hot.remove(ex, list(names))
                     if r["removed"]:
                         print(f"removed {', '.join(r['removed'])}")
@@ -243,6 +278,7 @@ class Packages:
                     if r.get("restart"):
                         print(f"  {', '.join(r['restart'])} was loaded: the app restarts to unload it")
                     return r
+            _refuse_store_flavour()
             print("no phone reachable; removing it from the app build instead")
         return self._change(remove=list(names), yes=yes, sdk=sdk)
 
@@ -254,6 +290,15 @@ class Packages:
     def select(self, sdk: str | None = None, bundle: bool = False, executor=None):
         """Interactive checklist: what's on the phone, what could be, what changing it costs.
         Changes go to the running app; bundle=True rebuilds the app with exactly the ticked set."""
+        node = _fixed_phone(executor)
+        if node is not None:
+            from .hot import fixed_message
+            print(fixed_message(node))
+            return
+        if app_mod.current_flavour() == "store":
+            from ..storeworker import FIXED
+            print(FIXED)
+            return
         rows = [r for r in table(check=True, executor=executor) if r.kind == "compiled"]
         on_phone = phone_packages(executor)
         if on_phone is None:  # first use: a sensible scientific stack is pre-checked
@@ -282,6 +327,7 @@ class Packages:
             self.remove(*dropped, sdk=sdk, executor=executor)
 
     def _change(self, add=(), remove=(), yes=False, when_idle=False, sdk=None, new=None, before=None):
+        _refuse_store_flavour()  # rebuilding here would build the sideloaded app
         if new is not None:
             # From the selector: `new` is everything ticked, `before` what the phone
             # had (which includes dependencies of the packages named in the config).

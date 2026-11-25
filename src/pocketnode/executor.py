@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import inspect
 import queue
 import itertools
 import logging
@@ -26,7 +27,7 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from . import envinfo, router, serialize
+from . import envinfo, pairing, router, serialize
 from .errors import NodeLost, PlacementError, RemoteTraceback
 from .wire import Connection, ConnectionClosed, client_handshake
 
@@ -38,6 +39,12 @@ THERMAL_SCALE = {"nominal": 1.0, "fair": 1.0, "serious": 0.5, "critical": 0.0}
 # With the app in the background under iOS continued processing, the phone keeps
 # computing at roughly 1/15 of its foreground speed (measured: 108 vs 1,649 GFLOPS).
 BACKGROUND_SLOWDOWN = 15.0
+# A task forced onto a phone that asks before running new code waits this long for Allow.
+APPROVAL_WAIT = 120.0
+# A forced task fails this long after its phone has turned this Mac away (paused, not paired),
+# so a phone that is only reconnecting isn't failed.
+BLOCKED_GRACE = 5.0
+SRC_LIMIT = 32 << 10  # bytes of source (or disassembly) sent to a store phone per function
 
 
 # ------------------------------------------------------------------ records
@@ -92,6 +99,7 @@ class Task:
     queued: bool = True
     reason: str = ""
     suggestion: str | None = None
+    fn: Any = None  # the function doing the work (for its source text, shown on store phones)
 
     @property
     def done(self) -> bool:
@@ -151,6 +159,9 @@ class Node:
         self.bytes_sent = 0
         self.lost_as_crash = False
         self.scanned = (-1, 0.0)  # (queue generation, when) of the last scan that found nothing to run
+        self.src_sent: set[str] = set()  # code hashes whose text this node has been sent (store edition)
+        self.held: dict[str, str] = {}  # code hash -> "waiting" | "denied" (store phone reviewing new code)
+        self.bye: str | None = None  # why the phone said it was closing the connection
         self.outbox: queue.Queue = queue.Queue()
         threading.Thread(target=self._sender, daemon=True, name=f"pn-send-{self.name}").start()
 
@@ -213,7 +224,17 @@ class Node:
                 specs.append({"h": h, "i": 1})
                 inline.append(b)
                 self.known.add(h)
-        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key}
+        header = {"t": "task", "id": att.id, "bufs": specs, "fk": t.fn_key, "label": t.fn_label}
+        if self.hello.get("edition") == "store":
+            # The App Store edition shows the person what runs; the text travels once per code.
+            ci = self.ex._code_of(t)
+            header["code"], header["origin"] = ci["code"], ci["origin"]
+            for k in ("dist", "where"):
+                if ci.get(k):
+                    header[k] = ci[k]
+            if ci["code"] not in self.src_sent:
+                self.src_sent.add(ci["code"])
+                header["src"], header["srckind"] = ci["src"], ci["srckind"]
         if t.pure:
             header["pure"] = 1
             header["mods"] = sorted(t.packed.modules - router.IGNORE)
@@ -245,6 +266,18 @@ class Source:
     same_env = False
     bandwidth_guess = 30e6
     latency_guess = 0.002
+    # Set while the phone answers but turns this Mac away for a reason only a person can clear
+    # (paused there, not paired, pairing forgotten): the sentence saying so, and since when.
+    blocked: str | None = None
+    blocked_since: float = 0.0
+
+    def block(self, why: str) -> None:
+        if self.blocked is None:
+            self.blocked_since = time.monotonic()
+        self.blocked = why
+
+    def unblock(self) -> None:
+        self.blocked = None
 
     def start(self, ex: "PocketExecutor") -> None:
         raise NotImplementedError
@@ -261,7 +294,7 @@ def attach(ex: "PocketExecutor", sock, source: Source, token: str) -> Node | Non
     hello = client_handshake(conn, token, {
         "session": ex.session,
         "manifest": None if source.same_env else envinfo.manifest(),
-    })
+    }, credentials=getattr(source, "credentials", None) or pairing.credentials_for)
     node = Node(ex, conn, hello, source)
     ex._add_node(node)
     threading.Thread(target=node.reader, daemon=True, name=f"pn-read-{node.name}").start()
@@ -307,7 +340,7 @@ def _fn_identity(fn, args=()) -> tuple[str, str]:
 
 
 class PocketExecutor(Executor):
-    def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str = "minor",
+    def __init__(self, *, placement: str = "auto", strict: bool = False, version_policy: str | None = None,
                  speculate: bool = True, confirm_errors: bool = True, notes: bool = True,
                  verify: bool = True, auto_add: bool = True):
         self.session = uuid.uuid4().hex
@@ -342,6 +375,8 @@ class PocketExecutor(Executor):
         self._replies: dict[str, tuple] = {}
         self._qgen = 0  # bumped whenever a task becomes available to pick
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
+        self._src_cache: dict[str, dict] = {}  # fn_key -> what a store phone is shown (_code_info)
+        self._held: dict[str, tuple] = {}  # task id -> (task, node id, code, deadline): waiting for approval
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
         serialize.register_user_modules()
@@ -365,12 +400,12 @@ class PocketExecutor(Executor):
         packed = serialize.dumps((fn, args, kwargs), memo=memo)
         inner, weight, inner_args = _unwrap(fn, args)
         key, label = _fn_identity(inner, inner_args)
-        return self._enqueue(packed, key, label, where, ro, weight=weight)
+        return self._enqueue(packed, key, label, where, ro, weight=weight, fn=inner)
 
-    def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False) -> PocketFuture:
+    def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False, fn=None) -> PocketFuture:
         fut = PocketFuture()
         task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules),
-                    weight=weight, shadow=shadow)
+                    weight=weight, shadow=shadow, fn=fn)
         with self._cv:
             for b, h in zip(packed.buffers, packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)
@@ -562,6 +597,7 @@ class PocketExecutor(Executor):
                 # The same worker process reconnecting: its cache and in-flight
                 # attempts survived, so those tasks are running, not lost.
                 node.known = o.known
+                node.held = o.held
                 node.running = {k: a for k, a in o.running.items() if k in self.attempts}
                 for a in node.running.values():
                     a.node = node
@@ -604,7 +640,9 @@ class PocketExecutor(Executor):
             # If the app went away while active (not backgrounded), the task may
             # have crashed it: run that task on the Mac, and keep a function that
             # does it twice off the phone for good.
-            crashed = node.kind != "mac" and node.state.get("lifecycle", "active") == "active"
+            # A phone that said goodbye first (paused, or this Mac was forgotten) didn't crash.
+            crashed = node.kind != "mac" and node.state.get("lifecycle", "active") == "active" \
+                and not node.bye
             node.lost_as_crash = crashed
             if node.kind != "mac":
                 self._gone[node.id] = node
@@ -639,6 +677,19 @@ class PocketExecutor(Executor):
         p = task.placement
         if p not in ("auto", None) and not _matches(node, p):
             return False, ""
+        if node.held:
+            code = self._code_of(task)["code"]
+            state = node.held.get(code)
+            if state is not None:
+                if p not in ("auto", None):
+                    if state == "denied":
+                        self._fail(task, PlacementError(
+                            f"{task.fn_label} was declined on {node.name} (Don't Allow), so it can't run there"))
+                    else:  # held until the person answers (see _check_held)
+                        self._held.setdefault(task.id, (task, node.id, code, time.monotonic() + APPROVAL_WAIT))
+                    return False, ""
+                verb = "is waiting for approval" if state == "waiting" else "was declined"
+                return False, f"{task.fn_label} {verb} on {node.name}"
         if node.kind in task.excluded or node.name in task.excluded:
             return False, task.excluded.get(node.kind) or task.excluded[node.name]
         if node.kind != "mac" and task.fn_key in self.mac_only and p in ("auto", None):
@@ -671,7 +722,7 @@ class PocketExecutor(Executor):
             else:
                 task.excluded[node.kind] = v.reason
                 if v.missing:
-                    self._missing(v.missing, task)
+                    self._missing(v.missing, task, node)
                 task.suggestion = v.suggestion
             return False, v.reason
         task.eligible[node.id] = True
@@ -736,6 +787,10 @@ class PocketExecutor(Executor):
 
     def _dispatch_some(self) -> bool:
         launched = False
+        if self._held:
+            self._check_held()
+        if any(s.blocked for s in self.sources):
+            self._fail_blocked()
         # Fastest node kinds first so the Mac fills before the phone gets marginal work.
         nodes = sorted(self.nodes.values(), key=lambda n: (n.kind != "mac", n.name))
         now = time.monotonic()
@@ -809,7 +864,7 @@ class PocketExecutor(Executor):
                 if v is None:
                     v = n.verdicts[mods] = router.check(task.packed.modules, n, self.version_policy)
                 if not v.ok and v.missing:
-                    self._missing(v.missing, task)
+                    self._missing(v.missing, task, n)
 
     def _send_failed(self, att: Attempt) -> None:
         with self._cv:
@@ -851,7 +906,19 @@ class PocketExecutor(Executor):
                 self._cv.notify_all()
         elif t == "pong":
             node.state = msg.get("state", node.state)
-        elif t in ("stacks", "installed"):
+        elif t == "approved":
+            with self._cv:
+                node.held.pop(str(msg.get("code")), None)
+                self._qgen += 1
+                self._cv.notify_all()
+        elif t == "denied":
+            with self._cv:
+                node.held[str(msg.get("code"))] = "denied"
+                self._qgen += 1
+                self._cv.notify_all()
+        elif t == "bye":
+            node.bye = str(msg.get("why") or "closing")
+        elif t in ("stacks", "installed", "code_log"):
             ev = self._replies.get(msg.get("req"))
             if ev and not ev[0].is_set():
                 ev[1].append(msg)
@@ -923,16 +990,21 @@ class PocketExecutor(Executor):
                         self._qgen += 1
                     self._cv.notify_all()
                 return
+            if u.get("kind") in ("approval", "denied"):
+                self._on_held(task, node, u)
+                return
             reason = _unavailable_reason(u, node)
-            suggestion = _unavailable_suggestion(u)
+            suggestion = None if node.hello.get("fixed_packages") and u.get("kind") == "module" \
+                else _unavailable_suggestion(u)
             if u.get("module"):
                 node.mac_only_modules.setdefault(u["module"], reason)
                 node.verdicts.clear()
-                self._missing(u["module"], task)
+                self._missing(u["module"], task, node)
             if task.placement not in ("auto", None) or self.strict:
                 return self._fail(task, PlacementError(f"{task.fn_label}: {reason}"
                                                        + (f". {suggestion}" if suggestion else "")))
-            if u.get("kind") not in ("memory", "cache"):  # those depend on the inputs, not the function
+            # Memory and cache depend on the inputs, not the function; "stopped" was the phone's owner.
+            if u.get("kind") not in ("memory", "cache", "stopped"):
                 self.mac_only[task.fn_key] = (reason, suggestion)
                 if u.get("module"):  # undone when the module is added to the node
                     self._mac_only_mod[task.fn_key] = u["module"]
@@ -1101,10 +1173,19 @@ class PocketExecutor(Executor):
         if wire > 0 and moved > 4 << 20:
             node.bandwidth = 0.7 * node.bandwidth + 0.3 * (moved / wire)
 
-    def _missing(self, package: str, task: Task) -> None:
+    def _missing(self, package: str, task: Task, node: Node | None = None) -> None:
         """A compiled package kept a task off the phone: add it in the background (or offer to), once."""
         info = envinfo.manifest().get(package)  # a module name, or already a distribution
         dist = info["dist"] if info else package
+        if node is not None and node.hello.get("fixed_packages"):
+            # The App Store edition's package set is fixed when the app is built: nothing to add.
+            with self._cv:
+                self.missing_packages[dist] += 1
+            if router._norm(dist) not in node.packages:
+                self._note(("fixed", dist),
+                           f"pocketnode: {dist} isn't in {node.name}'s package set (App Store edition: the set "
+                           "is fixed when the app is built), so tasks that need it run on the Mac")
+            return
         with self._cv:
             self.missing_packages[dist] += 1
             if dist in self._adding:
@@ -1150,6 +1231,80 @@ class PocketExecutor(Executor):
         except Exception:  # noqa: BLE001 - advisory: the task already runs on the Mac
             log.debug("pocketnode: couldn't add %s", dist, exc_info=True)
 
+    def _code_of(self, task: Task) -> dict:
+        """What a store phone is told about a task's function: code hash, origin, text (cached)."""
+        key = task.fn_key
+        info = self._src_cache.get(key)
+        if info is None:
+            info = self._src_cache[key] = _code_info(task.fn, task.fn_label)
+        return info
+
+    def _on_held(self, task: Task, node: Node, u: dict) -> None:
+        """A store phone that asks before running new code held this task back (or it was declined)."""
+        code = str(u.get("code") or self._code_of(task)["code"])
+        waiting = u.get("kind") == "approval"
+        with self._cv:
+            if node.held.get(code) != "denied":
+                node.held[code] = "waiting" if waiting else "denied"
+            self._cv.notify_all()
+        auto = task.placement in ("auto", None) and not self.strict
+        if waiting:
+            then = ("it runs on the Mac until you allow it" if auto else
+                    f"it waits up to {APPROVAL_WAIT:.0f} s for you to allow it" if not self.strict else
+                    "approve it on the iPhone and submit it again")
+            self._note(("approval", code, node.id),
+                       f"pocketnode: {task.fn_label} is waiting for approval on {node.name} (Ask before running "
+                       f"new code is on there); {then}")
+        if auto:
+            self._requeue(task, node, _unavailable_reason(u, node), None, quiet=True)
+            return
+        if not waiting or self.strict:
+            self._fail(task, PlacementError(f"{task.fn_label} can't run on {node.label()}: {u.get('detail')}"))
+            return
+        # Forced there: hold it until the person answers (or APPROVAL_WAIT passes), then send it again.
+        with self._cv:
+            self._held[task.id] = (task, node.id, code, time.monotonic() + APPROVAL_WAIT)
+            if not task.done and not task.queued:
+                task.queued = True
+                self.queue.appendleft(task)
+            self._qgen += 1
+            self._cv.notify_all()
+
+    def _fail_blocked(self) -> None:
+        """Tasks forced onto a phone that turns this Mac away (paused, not paired, forgotten) fail
+        with the reason, once that has held for BLOCKED_GRACE seconds and no such node is connected.
+        (With no phone at all, as before, they wait for one.) Under self._cv."""
+        now = time.monotonic()
+        why = next((s.blocked for s in self.sources
+                    if s.blocked and now - s.blocked_since >= BLOCKED_GRACE), None)
+        if why is None:
+            return
+        for t in list(self.queue):
+            if t.done or not t.queued or t.placement in ("auto", None, "mac"):
+                continue
+            if any(_matches(n, t.placement) for n in self.nodes.values()):
+                continue
+            self._fail(t, PlacementError(f"{t.fn_label} can't run on the {t.placement}: {why}"))
+
+    def _check_held(self) -> None:
+        """Forced tasks waiting for approval: release, fail on Don't Allow, or time out. Under self._cv."""
+        now = time.monotonic()
+        for tid, (task, nid, code, deadline) in list(self._held.items()):
+            node = self.nodes.get(nid) or self._gone.get(nid)
+            state = node.held.get(code) if node is not None else "waiting"
+            if task.done or state is None:  # finished another way, or allowed: it runs normally now
+                del self._held[tid]
+            elif state == "denied":
+                del self._held[tid]
+                self._fail(task, PlacementError(
+                    f"{task.fn_label} was declined on {node.name if node else 'the phone'} (Don't Allow), "
+                    "so it can't run there"))
+            elif now > deadline:
+                del self._held[tid]
+                self._fail(task, PlacementError(
+                    f"{task.fn_label} wasn't approved on {node.name if node else 'the phone'} within "
+                    f"{APPROVAL_WAIT:.0f} s; approve it on the iPhone and submit it again"))
+
     def _note(self, key, text: str) -> None:
         if not self.notes:
             return
@@ -1158,6 +1313,45 @@ class PocketExecutor(Executor):
                 return
             self._noted.add(key)
         log.info(text)
+
+
+def _code_info(fn, label: str = "") -> dict:
+    """What a store phone shows for a function: its source (or, when Python has none, its
+    disassembly), a hash of that text, where it comes from, and whether it is the user's own."""
+    import dis
+    import io
+    import textwrap
+    f = fn
+    for _ in range(6):  # as in _fn_identity: look through partials, bound methods, decorators
+        inner = (getattr(f, "func", None) or getattr(f, "__func__", None) or getattr(f, "function", None)
+                 or getattr(f, "__wrapped__", None))
+        if inner is None or not callable(inner):
+            break
+        f = inner
+    try:
+        src, kind = textwrap.dedent(inspect.getsource(f)), "source"
+    except (OSError, TypeError, IndentationError, SyntaxError):
+        buf = io.StringIO()
+        try:
+            dis.dis(f, file=buf)
+        except Exception:  # noqa: BLE001 - a builtin or a C callable: nothing to disassemble
+            pass
+        src, kind = buf.getvalue(), "bytecode"
+        if not src.strip():
+            src = f"{label or getattr(f, '__qualname__', type(f).__name__)}: no source or bytecode available\n"
+    data = src.encode()
+    if len(data) > SRC_LIMIT:
+        src = data[:SRC_LIMIT].decode("utf-8", "ignore")
+    mod = getattr(f, "__module__", None) or getattr(type(f), "__module__", None) or ""
+    info = envinfo.manifest().get(str(mod).split(".")[0]) if mod else None
+    co = getattr(f, "__code__", None)
+    return {
+        "code": hashlib.sha256(src.encode()).hexdigest()[:16],
+        "origin": "library" if info else "user",
+        "dist": f"{info['dist']} {info['version']}" if info else None,
+        "where": f"{os.path.basename(co.co_filename)}:{co.co_firstlineno}" if co is not None else None,
+        "src": src, "srckind": kind,
+    }
 
 
 def _mark_running(fut: Future) -> bool:
@@ -1195,7 +1389,7 @@ def _unavailable_reason(u: dict, node: Node) -> str:
         return f"needs {u.get('module')} (compiled), which isn't installed on {node.name}"
     if kind == "mac-file":
         return u["detail"]
-    if kind in ("process", "memory"):
+    if kind in ("process", "memory", "stopped", "approval", "denied"):
         return u["detail"]
     return f"{kind}: {u.get('detail')}"
 

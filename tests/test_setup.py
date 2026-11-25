@@ -305,7 +305,7 @@ def test_device_build_uses_and_saves_the_team_bundle_id(home, monkeypatch):
 
 def test_build_warns_only_when_cold(home, monkeypatch):
     """The build directory, not the history, says whether a build starts from nothing."""
-    monkeypatch.setattr(app_mod, "build", lambda sdk: app_mod.product(sdk))
+    monkeypatch.setattr(app_mod, "build", lambda sdk, **kw: app_mod.product(sdk))
     monkeypatch.setattr(app_mod, "install_sim", lambda p: None)
     app_mod._record({"event": "build", "sdk": "iphonesimulator", "stage_s": 1, "build_s": 1})
     out = []

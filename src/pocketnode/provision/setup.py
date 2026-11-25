@@ -418,7 +418,7 @@ class Setup:
         cold = not app_mod.product(sdk).exists()
         self.say("building the app" + (": the first build takes several minutes" if cold else ""))
         try:
-            p = app_mod.build(sdk)
+            p = app_mod.build(sdk, flavour="dev")  # setup is for the sideloaded app, whatever `app --store` saved
         except (RuntimeError, LookupError) as e:
             self.say(f"  the build failed: {e}")
             raise Stop("fix that and run `pocketnode setup` again") from None

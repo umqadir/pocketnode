@@ -5,10 +5,16 @@
 #import "AppDelegate.h"
 #import <BackgroundTasks/BackgroundTasks.h>
 #import <Python/Python.h>
+#if POCKETNODE_STORE
+#import "PNBridge.h"
+#import "PNStoreUI.h"
+#else
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#endif
 #include <pthread.h>
 
+#if !POCKETNODE_STORE
 #pragma mark - macOS Metal selectors
 
 // Packages built for macOS ask the GPU questions that only exist there
@@ -47,6 +53,7 @@ static void pn_add_macos_metal_selectors(void) {
         }
     }
 }
+#endif
 
 static NSString *const kTaskPrefix = @"compute";
 
@@ -70,6 +77,10 @@ static NSString *const kTaskPrefix = @"compute";
 // processing, 0 gives it back.
 __attribute__((visibility("default"), used))
 void pocketnode_keep_computing(int on) {
+#if POCKETNODE_STORE
+    // The store edition starts background computing only from the person's tap.
+    if (on) return;
+#endif
     dispatch_async(dispatch_get_main_queue(), ^{
         AppDelegate *app = (AppDelegate *)[UIApplication sharedApplication].delegate;
         if (on) [app keepComputing]; else [app stopComputing];
@@ -102,14 +113,25 @@ static NSString *py_call(const char *func, const char *arg) {
     return out;
 }
 
+#if POCKETNODE_STORE
+// The store UI's calls (PNBridge), once the bootstrap has put the app's modules on sys.path.
+static volatile BOOL pn_store_ready = NO;
+
+BOOL pn_store_python_ready(void) { return pn_store_ready; }
+
+NSString *pn_store_py_call(const char *func, const char *arg) { return py_call(func, arg); }
+#endif
+
 static void *python_main(void *ctx) {
     NSString *resources = [[NSBundle mainBundle] resourcePath];
+#if !POCKETNODE_STORE
     NSData *settings = [NSData dataWithContentsOfFile:[resources stringByAppendingPathComponent:@"pocketnode_settings.json"]];
     if (settings) {
         NSDictionary *s = [NSJSONSerialization JSONObjectWithData:settings options:0 error:nil];
         if ([s isKindOfClass:[NSDictionary class]]) pn_gpu_enabled = [s[@"torch_mps"] boolValue];
     }
     pn_add_macos_metal_selectors();
+#endif
     PyPreConfig pre;
     PyConfig config;
     PyPreConfig_InitIsolatedConfig(&pre);
@@ -142,6 +164,9 @@ static void *python_main(void *ctx) {
         [NSString stringWithFormat:@"r'''%@/app_packages'''", resources],
         [NSString stringWithFormat:@"r'''%@/app'''", resources]];
     if (PyRun_SimpleString([boot UTF8String]) != 0) { NSLog(@"pocketnode: bootstrap failed"); }
+#if POCKETNODE_STORE
+    pn_store_ready = YES;
+#endif
     AppDelegate *app = (__bridge AppDelegate *)ctx;
     dispatch_async(dispatch_get_main_queue(), ^{ app.pythonReady = YES; });
     // Runs the worker server forever, releasing the GIL whenever it blocks.
@@ -154,7 +179,12 @@ static void *python_main(void *ctx) {
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.graceTask = UIBackgroundTaskInvalid;
+#if POCKETNODE_STORE
+    // The store UI keeps the screen on only while its setting is on and a Mac is connected (PNStatus).
+    [UIApplication sharedApplication].idleTimerDisabled = NO;
+#else
     [UIApplication sharedApplication].idleTimerDisabled = YES;  // screen-lock suspends us otherwise
+#endif
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -178,6 +208,12 @@ static void *python_main(void *ctx) {
 
 - (UIWindow *)buildUIInScene:(UIWindowScene *)scene {
     self.window = [[UIWindow alloc] initWithWindowScene:scene];
+#if POCKETNODE_STORE
+    self.window.rootViewController = PNMakeStoreRootViewController();
+    [self.window makeKeyAndVisible];
+    [PNStatus.shared start];
+    return self.window;
+#else
     UIViewController *vc = [UIViewController new];
     // The screen stays on while the app is in front (locking would suspend it),
     // so keep it black: on an OLED panel black pixels are off.
@@ -213,14 +249,17 @@ static void *python_main(void *ctx) {
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
     return self.window;
+#endif
 }
 
 - (void)refresh {
     if (!self.pythonReady) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+#if !POCKETNODE_STORE  // the store UI polls status_json itself (PNStatus)
         NSString *s = py_call("status", NULL);
         if (!s) return;
         dispatch_async(dispatch_get_main_queue(), ^{ self.statusLabel.text = s; });
+#endif
         BGContinuedProcessingTask *t = self.bgTask;
         if (t) {
             // Continued-processing tasks must show progress or they're expired as stalled.
@@ -287,6 +326,9 @@ static void *python_main(void *ctx) {
         req.strategy = BGContinuedProcessingTaskRequestSubmissionStrategyFail;
         NSError *err = nil;
         self.bgPending = YES;
+#if POCKETNODE_STORE
+        py_call("continued", "asking");  // the dev edition's Python says so itself before asking
+#endif
         if (![[BGTaskScheduler sharedScheduler] submitTaskRequest:req error:&err]) {
             self.bgPending = NO;
             NSLog(@"pocketnode: continued processing refused: %@", err);

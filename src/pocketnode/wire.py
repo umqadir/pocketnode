@@ -192,16 +192,33 @@ def _mac(token: str, nonce: str, role: str) -> str:
     return hmac.new(token.encode(), f"{role}:{nonce}".encode(), "sha256").hexdigest()
 
 
-def server_handshake(conn: Connection, token: str, hello: dict, admit=None) -> dict:
+def server_handshake(conn: Connection, token: str, hello: dict, admit=None, *,
+                     token_for=None, on_pair=None) -> dict:
     """Worker side. Sends hello (with a challenge), checks the client's proof.
 
     admit(msg) may return a reason to turn a correctly paired client away
     (the phone is serving a different Python environment, say).
+
+    App Store edition only: token_for(msg) looks the token up by the client's
+    pair_id (None: not paired), and on_pair(conn, msg, nonce) answers a
+    {"t": "pair"} request, after which the connection ends.
     """
     conn.sock.settimeout(HANDSHAKE_TIMEOUT)
     nonce = os.urandom(16).hex()
     conn.send({"t": "hello", "nonce": nonce, **hello})
     msg, _ = conn.recv()
+    if on_pair is not None and msg.get("t") == "pair":
+        try:
+            on_pair(conn, msg, nonce)
+        finally:
+            conn.close()
+        raise ConnectionClosed("pairing request answered")
+    if token_for is not None:
+        token = token_for(msg) if msg.get("t") == "auth" else None
+        if token is None:
+            conn.send({"t": "auth_fail", "why": "unpaired"})
+            conn.close()
+            raise PermissionError("client isn't paired with this phone")
     if msg.get("t") != "auth" or not hmac.compare_digest(
         str(msg.get("proof", "")), _mac(token, nonce, "client")
     ):
@@ -220,23 +237,46 @@ def server_handshake(conn: Connection, token: str, hello: dict, admit=None) -> d
     return msg
 
 
-def client_handshake(conn: Connection, token: str, info: dict) -> dict:
-    """Mac side. Returns the worker's hello once both sides are verified."""
+def client_handshake(conn: Connection, token: str, info: dict, credentials=None) -> dict:
+    """Mac side. Returns the worker's hello once both sides are verified.
+
+    A phone running the App Store edition says so in its hello (pairing:
+    "runtime"); then credentials(hello) supplies (token, extra auth fields),
+    pairing.credentials_for by default, and `token` is not used.
+    """
     conn.sock.settimeout(HANDSHAKE_TIMEOUT)
+    runtime = False
     try:
         hello, _ = conn.recv()
         if hello.get("t") != "hello":
             raise ConnectionClosed(f"unexpected greeting from {conn.name}: {hello.get('t')}")
+        if hello.get("pairing") == "runtime":
+            from . import pairing
+            runtime = True
+            cred = (credentials or pairing.credentials_for)(hello)
+            if cred is None:
+                conn.close()
+                raise pairing.NotPaired(f"this Mac isn't paired with {hello.get('name', conn.name)}")
+            token, extra = cred
+            info = {**info, **extra}
+        elif callable(token):  # the dev token, only made when a phone actually needs it
+            token = token()
         nonce = os.urandom(16).hex()
         conn.send({"t": "auth", "proof": _mac(token, str(hello.get("nonce", "")), "client"), "nonce": nonce, **info})
         ok, _ = conn.recv()
     except TimeoutError as e:
         conn.close()
         raise ConnectionClosed(f"{conn.name} didn't answer the handshake") from e
+    if runtime and ok.get("t") == "auth_fail" and ok.get("why") == "unpaired":
+        from . import pairing
+        conn.close()
+        raise pairing.PairingRevoked(f"{hello.get('name', conn.name)} no longer has this Mac's pairing")
     proved = hmac.compare_digest(str(ok.get("proof", "")), _mac(token, nonce, "server"))
     if ok.get("t") == "refused" and proved:
         conn.close()
-        raise Refused(ok.get("reason", "the worker refused this session"))
+        e = Refused(ok.get("reason", "the worker refused this session"))
+        e.hello = hello  # which phone refused (the App Store edition says so in its hello)
+        raise e
     if ok.get("t") != "auth_ok" or not proved:
         conn.close()
         raise PermissionError(f"{conn.name} rejected the pairing token (or failed to prove it)")
