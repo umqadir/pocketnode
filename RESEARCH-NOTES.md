@@ -394,3 +394,23 @@ The sideloaded app runs whatever its Mac sends, silently. That is the one thing 
 - [M] dask's scheduler function stays on the Mac for either flavour unless PyYAML's compiled build is on the phone: dask imports yaml, and the Mac's PyYAML is a compiled wheel.
 - [I] From the pandas build: scipy 1.18 needs its experimental no-Fortran option, Accelerate's newer LAPACK interface (a deployment target of iOS 16.4 or later, so a different wheel tag) and pythran turned off; one to three days with real risk. scikit-learn compiles against scipy's Cython BLAS and LAPACK declarations and would be built without OpenMP; half a day to a day after scipy.
 - Not verified, because each needs a paid account or a phone: signing and export of the archive, App Store Connect's own upload validation, App Review, the store app on a device (cable pairing through usbmuxd, the keychain on a device, background computing, memory limits).
+
+## Models and state on the phone — Nov 25, 2026 (iPhone 18 Pro, iOS 27.2.1)
+
+[M] = measured on the phone over USB. The Mac was busy with other jobs again (load average near 200), so per-call times are upper bounds and don't separate one mode from another.
+
+### What was built
+- Disk tier for the buffer cache. Buffers of 8 MB or more, and pinned ones, are written to the app's cache directory under their content hash by a writer thread. Memory and disk are evicted separately, least recently used first. The disk budget is a fifth of free space plus what the cache already holds, capped at 50 GB. After authentication the phone reports the hashes it has on disk, so the Mac doesn't resend them after an app restart. The budget stays off the wire because free disk space is a required-reason API.
+- PyTorch tensors travel like NumPy arrays. torch pickles storages in band, so a model's weights were resent with every task and never cached. A CPU storage of 64 KB or more now goes out of band as a raw buffer and is rebuilt on the phone with `torch.frombuffer`. A read-only buffer is copied first, because torch writes through read-only memory and that would corrupt the cache. MPS tensors on the Mac keep torch's own pickling.
+- `ex.pin(obj)` keeps the unpickled object on each node, so tasks that use it don't rebuild it. A change is picked up from torch's version counters, or from a content mismatch when a node asks for a buffer; either way every node gets the object as it is now.
+- `ex.on("phone").create(Class, ...)` keeps an object on one node. Its public methods return futures, calls run one at a time in order, and after the node is lost the next call rebuilds the object from its constructor arguments (state built up since is gone, and a note says so).
+- `ex.stream(fn, ...)` and `handle.method.stream(...)` return generator items as they are produced, 32 items ahead of the reader at most.
+- Tasks that use pinned or kept objects run in the main interpreter, never in a subinterpreter.
+
+### Measured
+- [M] `pocketnode check`: 32 passed, 0 failed, 2 skipped (the two App Store edition items).
+- [M] An 8 MB model: the first task sent 8.1 MB and the second 11 KB. Kept on the phone's GPU (`mps`), three calls matched the Mac.
+- [M] A 98 MB model (six 2048×2048 linear layers) with a 256×2048 batch. The first task sent 98 MB and took 3.5 s; each later task sent 50 KB. Pinned, tasks sent under 1 KB. Kept on `mps`, the object was built in 0.44 s and calls sent nothing new; the largest difference from the Mac's CPU result was 1.4e-7. Per-call times were 0.07–0.56 s in all three modes.
+- [M] Streaming from the kept object: 40 items in order, the first after 0.23 s and the last after 0.37 s. A 100,000-step stream abandoned after its sixth item was closed in 0.04 s.
+- [M] App restart: a 64 MB array sent once (2.5 s) was on disk afterwards. The restarted app reported 9 cached buffers, and the same task then sent nothing and answered in 0.12 s. The kept object was rebuilt on the first call after the restart and answered in 1.4 s, with its call counter back at 1.
+- [M] One device-only failure, fixed. A task whose only reference to torch is `__import__("torch")` looks pure and starts in a subinterpreter. torch loads `libtorch_global_deps` with ctypes before it imports its first extension module, the path redirect for that load exists only in the main interpreter, and the task failed with an `OSError` where an extension import would have moved it to the main interpreter. A ctypes load of a library outside the system directories now moves the task there too. After the fix the same task returned torch 2.11.0, and a pure task still ran in a subinterpreter.

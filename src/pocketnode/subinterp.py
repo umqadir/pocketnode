@@ -182,6 +182,20 @@ def _watch(cls):
 for _n in ("ExtensionFileLoader", "AppleFrameworkLoader"):
     if hasattr(_mach, _n):
         _watch(getattr(_mach, _n))
+# The same goes for a native library a package loads by path with ctypes
+# (torch does, before it imports its first extension module).
+try:
+    import ctypes as _ct
+except ImportError:
+    _ct = None
+if _ct is not None:
+    def _cdll(self, name, *a, _real=_ct.CDLL.__init__, _os=os, _b=builtins, **k):
+        p = _os.fspath(name) if isinstance(name, (str, _os.PathLike)) else ""
+        if _os.path.isabs(p) and not p.startswith(("/usr/lib/", "/System/")):
+            _b._pn_ext_fail = _os.path.basename(p)
+            raise ImportError(f"{_b._pn_ext_fail} is a native library; it runs in the main interpreter")
+        _real(self, name, *a, **k)
+    _ct.CDLL.__init__ = _cdll
 """
 
 

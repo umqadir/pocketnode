@@ -457,6 +457,28 @@ def test_cancelled_duplicates_leave_every_phone_slot_working(ex):
     assert time.time() - t0 < 4.0, "all phone slots ran at once"
 
 
+def test_native_library_loaded_by_path_runs_in_the_main_interpreter(ex):
+    # torch loads a library with ctypes before its first extension module; a task
+    # that only reaches it through __import__("torch") starts in a subinterpreter.
+    def load():
+        import _interpreters
+        import ctypes
+        import glob
+        import os
+        import sys
+        libs = (glob.glob(os.path.join(sys.base_prefix, "lib", "libpython*.dylib"))
+                or glob.glob(os.path.join(sys.base_prefix, "lib", "python3*", "lib-dynload", "*.so")))
+        if not libs:
+            return None
+        ctypes.CDLL(libs[0])
+        return _interpreters.get_current()[0] == _interpreters.get_main()[0]
+
+    got = ex.on("phone").submit(load).result(timeout=30)
+    if got is None:
+        pytest.skip("no native library to load by path in the stand-in's Python")
+    assert got is True
+
+
 def test_cancelling_a_subinterpreter_task_frees_its_slot(ex):
     # Pure-Python tasks run in subinterpreters on the phone; a cancel must stop
     # them there too, not leave them spinning in a slot the Mac thinks is free.
