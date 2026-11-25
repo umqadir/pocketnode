@@ -412,6 +412,7 @@ class PocketExecutor(Executor):
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
         self._src_cache: dict[str, dict] = {}  # fn_key -> what a store phone is shown (_code_info)
         self._held: dict[str, tuple] = {}  # task id -> (task, node id, code, deadline): waiting for approval
+        self._later: list[tuple[Task, bool]] = []  # see _enqueue_task
         self._sched = threading.Thread(target=self._loop, daemon=True, name="pn-scheduler")
         self._sched.start()
         serialize.register_user_modules()
@@ -452,13 +453,21 @@ class PocketExecutor(Executor):
             for b, h in zip(task.packed.buffers, task.packed.hashes):
                 self._buf_by_hash[h] = (b, self._buf_by_hash.get(h, (b, 0))[1] + 1)
             self.tasks[task.id] = task
-            if task.shadow:  # someone's result is waiting on this: it goes first
-                self.queue.appendleft(task)
-            else:
-                self.queue.append(task)
-            self._qgen += 1
+            self._enqueue_task(task, left=task.shadow)  # a shadow's phone result waits on it: first
             self._cv.notify_all()
         task.future.add_done_callback(lambda f, t=task: self._release(t))
+
+    def _enqueue_task(self, task: Task, left: bool) -> None:
+        """Add to the queue (under self._cv). The scheduler can get here from inside its own walk
+        over the queue (a task it fails lets an object's next call in): then it waits for the
+        next round, since the queue can't change while that walk is going through it."""
+        if threading.current_thread() is self._sched:
+            self._later.append((task, left))
+        elif left:
+            self.queue.appendleft(task)
+        else:
+            self.queue.append(task)
+        self._qgen += 1
 
     def _requeue_task(self, task: Task) -> None:
         """Queue an admitted task that isn't running anywhere again (where task.placement says)."""
@@ -466,8 +475,7 @@ class PocketExecutor(Executor):
             if not task.done and not task.queued and not any(a.id in self.attempts for a in task.attempts.values()):
                 task.queued = True
                 task.eligible.clear()
-                self.queue.appendleft(task)
-                self._qgen += 1
+                self._enqueue_task(task, left=True)
             self._cv.notify_all()
 
     def map(self, fn, *iterables, timeout=None, chunksize=1, placement=None, buffersize=None):
@@ -1016,6 +1024,10 @@ class PocketExecutor(Executor):
 
     def _dispatch_some(self) -> bool:
         launched = False
+        while self._later:  # queued by the scheduler itself, while it was going through the queue
+            task, left = self._later.pop(0)
+            self.queue.appendleft(task) if left else self.queue.append(task)
+            self._qgen += 1
         if self._held:
             self._check_held()
         if any(s.blocked for s in self.sources):

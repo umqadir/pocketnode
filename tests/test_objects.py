@@ -159,6 +159,17 @@ def test_guards_apply_inside_methods(ex, tmp_path):
         os.unlink(p)
 
 
+def test_a_call_refused_before_it_runs_lets_the_next_one_go(ex):
+    pd = pytest.importorskip("pandas")
+    c = ex.on("phone").create(Counter)
+    bad = c.read(pd.Series([1.0]), 0)  # pandas (compiled) isn't on the stand-in phone
+    good = c.bump()
+    with pytest.raises(PlacementError, match="pandas"):
+        bad.result(timeout=30)
+    assert good.result(timeout=30) == 1
+    c.close()
+
+
 def test_large_argument_crosses_once(ex):
     c = ex.on("phone").create(Counter)
     x = np.random.default_rng().random(2_000_000)  # 16 MB
