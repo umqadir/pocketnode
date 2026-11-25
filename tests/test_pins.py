@@ -143,6 +143,20 @@ def test_detected_changes_repin_by_themselves(ex, monkeypatch):
         ex.unpin(model)
 
 
+def test_array_changed_in_place_reaches_a_node_that_never_had_it(ex):
+    x = np.arange(200_000.0)
+    ex.pin(x)  # the phone gets it now; a Mac worker would get it with its first task
+    try:
+        total = lambda: float(x.sum())  # noqa: E731
+        assert ex.on("phone").submit(total).result(timeout=30) == float(x.sum())
+        x += 1  # in place, and not pinned again: the bytes no longer match what was pinned
+        want = float(x.sum())
+        assert ex.on("mac").submit(total).result(timeout=30) == want
+        assert ex.on("phone").submit(total).result(timeout=30) == want, "every node has it as it is now"
+    finally:
+        ex.unpin(x)
+
+
 def test_kept_arrays_are_read_only(ex):
     x = np.arange(200_000.0)
     ex.pin(x)

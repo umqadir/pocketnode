@@ -627,12 +627,35 @@ class PocketExecutor(Executor):
         with self._cv:
             n.known.difference_update(missing)
             p = next((p for p in self._kept.values() if p.key == key), None)
+        if p is not None and any(wire.digest(b) != h for h, b in zip(p.packed.hashes, p.packed.buffers)
+                                 if h in missing):
+            return self._refresh(p)  # (hashed outside the lock: a large array takes a moment)
+        with self._cv:
             if p is None or p.retries.get(n.id, 0) >= 2:
                 n.kept.discard(key)  # a task that needs it asks again ("pin" unavailable)
                 return
             p.retries[n.id] = p.retries.get(n.id, 0) + 1
         for header, bufs in self._keep_frames(n, p):
             n.post(header, bufs)
+
+    def _refresh(self, p: "_Pin") -> None:
+        """A pinned object's arrays were changed in place on the Mac, so the bytes no longer
+        match what was pinned: every node gets the object as it is now, under the same key
+        (tasks already made refer to it by that key)."""
+        packed = serialize.dumps(p.obj)
+        with self._cv:
+            p.packed, p.modules, p.sig = packed, set(packed.modules), _versions(p.obj)
+            p.nbytes = sum(b.nbytes for b in packed.buffers)
+            p.retries.clear()
+            nodes = [m for m in self.nodes.values() if p.key in m.kept or _matches(m, p.on)]
+            for m in nodes:
+                m.kept.discard(p.key)
+        for m in nodes:
+            if not _lacks(m, "pinned-objects"):
+                for header, bufs in self._keep_frames(m, p):
+                    m.post(header, bufs)
+        self._note(("pin-changed", p.key), f"pocketnode: a pinned {p.label} was changed after ex.pin(); the copies "
+                   "kept on the nodes were replaced with it as it is now. Call ex.pin(obj) again after changing it.")
 
     def _retire(self, p: "_Pin") -> None:
         p.closed = True
