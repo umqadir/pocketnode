@@ -38,6 +38,7 @@ from .wire import Connection, ConnectionClosed, digest, server_handshake
 
 PROTOCOL = 1
 DEFAULT_PORT = 7151
+STALE = 1800  # seconds a Mac session may stay away before what it left here is freed
 SHIMS = "_pocketnode_shims"  # shared by every added package: merged, never replaced
 
 
@@ -118,7 +119,7 @@ def _env_key(manifest) -> str | None:
 class Worker:
     uses_site = True  # packages added at run time are imported from self.site
     # What this worker understands beyond plain tasks; a Mac checks before using one.
-    features = ("disk-cache",)
+    features = ("disk-cache", "pinned-objects")
 
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
@@ -154,6 +155,7 @@ class Worker:
         self.cancelled: set[str] = set()
         self._sub_cancels: dict[str, Callable[[], None]] = {}  # task id -> interrupts its subinterpreter run
         self._reserved: dict[str, list[str]] = {}  # task id -> buffer hashes it holds in the store
+        self.kept: dict[str, dict] = {}  # key -> an object pinned from a Mac (ex.pin), built on first use
         self._lock = threading.RLock()
         self._tl = threading.local()
         self._pending_imports: dict[str, tuple[threading.Event, list]] = {}
@@ -327,6 +329,7 @@ class Worker:
         last = None
         while True:
             time.sleep(2.0)
+            self._sweep()
             st = self.state()
             key = (st["thermal"], st["lifecycle"], st["low_power"])
             if key != last:
@@ -358,6 +361,17 @@ class Worker:
     def _session_started(self, sess: _Session, conn: Connection, info: dict) -> None:
         """Hook: a Mac session has authenticated on `conn` (its peer is conn.sock)."""
 
+    def _sweep(self, keep: str | None = None) -> None:
+        """Forget sessions gone for more than STALE seconds, and what they left here."""
+        now = time.monotonic()
+        with self._lock:
+            gone = {k for k, s in self.sessions.items() if not s.live and k != keep and now - s.seen > STALE}
+            for k in gone:
+                del self.sessions[k]
+            keys = [k for k, e in self.kept.items() if e["sid"] in gone]
+        for k in keys:
+            self._unkeep(k)
+
     def _session(self, sock: socket.socket) -> None:
         conn = Connection(sock, "mac")
         try:
@@ -367,11 +381,9 @@ class Worker:
             return
         sid = str(info.get("session") or uuid.uuid4().hex)
         env = _env_key(info.get("manifest"))
+        self._sweep(keep=sid)
         with self._lock:
             now = time.monotonic()
-            for k, s in list(self.sessions.items()):  # sessions that never came back
-                if not s.live and k != sid and now - s.seen > 1800:
-                    del self.sessions[k]
             sess = self.sessions.setdefault(sid, _Session(sid))
             old, sess.conn, sess.env, sess.seen = sess.conn, conn, env, now
             new_env = env is not None and env != self.env
@@ -461,6 +473,14 @@ class Worker:
         elif t == "unpin":
             for h in msg["hashes"]:
                 self.store.unpin(h)
+        elif t == "keep":
+            self._on_keep(sid, msg, bufs)
+        elif t == "unkeep":
+            self._unkeep(str(msg.get("key")))
+        elif t == "inventory":  # diagnostics: what this session has kept here
+            with self._lock:
+                kept = [k for k, e in self.kept.items() if e["sid"] == sid]
+            self._send({"t": "inventory", "req": msg.get("req"), "kept": kept}, sid=sid)
         elif t == "ping":
             self._send({"t": "pong", "ts": msg.get("ts"), "state": self.state(), "store": self.store.stats()},
                        sid=sid)
@@ -681,6 +701,49 @@ class Worker:
         for msg, payload in ready:
             self.pool.submit(self._run_safe, msg, payload)
 
+    # ------------------------------------------------------ pinned objects
+
+    def _on_keep(self, sid: str, msg: dict, bufs: list[bytearray]) -> None:
+        """A Mac pinned an object: hold its buffers, and build it when a task first uses it."""
+        key = str(msg["key"])
+        hashes = list(msg.get("hashes", ()))
+        self._unkeep(key)  # sent again (some buffers were missing): replaces the old entry
+        pinned = [h for h in hashes if self.store.pin(h)]
+        with self._lock:
+            self.kept[key] = {"data": bufs[0] if bufs else b"", "hashes": hashes, "pinned": pinned, "sid": sid,
+                              "label": str(msg.get("label") or "object"), "lock": threading.Lock()}
+        if len(pinned) < len(hashes):  # its file was gone: the Mac sends those again
+            self._send({"t": "pinned", "key": key, "hashes": pinned,
+                        "missing": [h for h in hashes if h not in pinned]}, sid=sid)
+
+    def _unkeep(self, key: str) -> None:
+        with self._lock:
+            e = self.kept.pop(key, None)
+        if e is None:
+            return
+        for h in e["pinned"]:
+            self.store.unpin(h)
+        if e.get("held"):
+            self.store.release(e["held"])
+
+    def _kept_object(self, key: str):
+        """A task refers to a pinned object: the copy kept here (built the first time)."""
+        with self._lock:
+            e = self.kept.get(key)
+        if e is None:
+            raise Unavailable("pin", f"an object pinned on the Mac isn't kept on {self.name}")
+        with e["lock"]:
+            if "obj" not in e:
+                bufs = self.store.acquire(e["hashes"])
+                if bufs is None:
+                    self._unkeep(key)
+                    raise Unavailable("pin", f"the pinned {e['label']}'s data isn't on {self.name} any more")
+                e["held"] = e["hashes"]
+                # Shared by every task here and backed by the cache's own bytes: read-only.
+                e["obj"] = serialize.loads(e["data"], [memoryview(b).toreadonly() for b in bufs])
+                e["data"] = b""
+        return e["obj"]
+
     # ---------------------------------------------------------- cancelling
 
     def _cancel(self, tid: str) -> None:
@@ -782,7 +845,7 @@ class Worker:
                 done = self._run_sub(msg, payload, views, header, t0, t1)
                 if done is not None:
                     return header, done
-            fn, args, kwargs = serialize.loads(payload, views)
+            fn, args, kwargs = serialize.loads(payload, views, kept=self._kept_object if msg.get("pins") else None)
             t2 = time.perf_counter()
             guards.begin_task()
             with _captured() as (o, e):

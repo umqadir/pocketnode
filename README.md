@@ -103,6 +103,14 @@ with pn.parallel():
 matches = list(ex.map(best_match, names))
 ```
 
+**A model used by many tasks.** `ex.pin` keeps the object itself loaded on each node, so tasks that use it don't rebuild it. The kept copy is a snapshot that tasks share and shouldn't change; pin it again after changing it on the Mac (PyTorch models are re-pinned by themselves when their weights change).
+
+```python
+ex.pin(model)
+preds = list(ex.map(lambda batch: model(batch), batches))
+ex.unpin(model)
+```
+
 **Training on the phone's GPU.** Code that checks for `"mps"` picks up the phone's GPU too.
 
 ```python
@@ -141,7 +149,7 @@ Manual placement: `ex.on("phone").submit(...)`, `@pn.runs_on("mac")`, or `with p
 
 **Cable pulled or thermal throttling.** Pull the cable and the phone's tasks finish on the Mac. When the phone reports it's getting hot, it gets less work.
 
-**Data caching.** Arrays and DataFrames ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. `ex.pin(X)` keeps it there.
+**Data caching.** Arrays and DataFrames ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. `ex.pin(X)` keeps it there, already unpickled, and tasks that use `X` get that copy.
 
 **Disk caching.** Inputs of 8 MB or more, and anything pinned, are also kept on the phone's disk by content, so model weights and large tables survive an app restart and aren't sent again. The disk cache uses up to a fifth of the phone's free space (at most 50 GB) and drops the least recently used first. A file iOS cleared or that no longer matches its content is sent again.
 

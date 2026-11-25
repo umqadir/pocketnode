@@ -27,7 +27,7 @@ from concurrent.futures import Executor, Future
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
-from . import envinfo, pairing, router, serialize
+from . import envinfo, pairing, router, serialize, wire
 from .errors import NodeLost, PlacementError, RemoteTraceback
 from .wire import Connection, ConnectionClosed, client_handshake
 
@@ -151,6 +151,7 @@ class Node:
         # Buffers the node holds. Seeded with what is on its disk (sent after the handshake),
         # so inputs that survived an app restart aren't sent again; a "need" covers any miss.
         self.known: set[str] = set(hello.get("cached") or ())
+        self.kept: set[str] = set()  # keys of pinned objects sent to this node (ex.pin)
         self.running: dict[str, Attempt] = {}
         self.connected = True
         self.mac_only_modules: dict[str, str] = {}
@@ -218,6 +219,12 @@ class Node:
 
     def send_task(self, att: Attempt) -> int:
         t = att.task
+        sent = 0
+        for key, p in t.packed.pins.items():  # pinned objects it uses that this node hasn't got yet
+            if key not in self.kept:
+                for header, bufs in self.ex._keep_frames(self, p):
+                    self.conn.send(header, bufs)
+                    sent += sum(wire.as_bytes_view(b).nbytes for b in bufs)
         specs, inline = [], []
         for b, h in zip(t.packed.buffers, t.packed.hashes):
             if h in self.known:
@@ -242,8 +249,10 @@ class Node:
             header["mods"] = sorted(t.packed.modules - router.IGNORE)
         if t.ro is not None:
             header["ro"] = t.ro
+        if t.packed.pins:
+            header["pins"] = list(t.packed.pins)
         self.conn.send(header, [t.packed.data, *inline])
-        n = len(t.packed.data) + sum(b.nbytes for b in inline)
+        n = sent + len(t.packed.data) + sum(b.nbytes for b in inline)
         self.bytes_sent += n
         return n
 
@@ -373,7 +382,7 @@ class PocketExecutor(Executor):
         self._shutdown = False
         self._noted: set[tuple] = set()
         self._buf_by_hash: dict[str, tuple[memoryview, int]] = {}
-        self._pins: dict[tuple, tuple] = {}
+        self._kept: dict[int, _Pin] = {}  # id(obj) -> its pin, for objects kept on nodes by pin()
         self._replies: dict[str, tuple] = {}
         self._qgen = 0  # bumped whenever a task becomes available to pick
         self.history: deque[tuple[str, str, str, str]] = deque(maxlen=5000)
@@ -399,14 +408,16 @@ class PocketExecutor(Executor):
         serialize.register_user_modules()
         where = (placement or getattr(fn, "__pocketnode_placement__", None)
                  or _placement_ctx.get() or self.default_placement)
-        packed = serialize.dumps((fn, args, kwargs), memo=memo)
+        packed = serialize.dumps((fn, args, kwargs), memo=memo, pins=self._pin_of if self._kept else None)
         inner, weight, inner_args = _unwrap(fn, args)
         key, label = _fn_identity(inner, inner_args)
         return self._enqueue(packed, key, label, where, ro, weight=weight, fn=inner)
 
     def _enqueue(self, packed, key, label, where, ro=None, weight=1, shadow=False, fn=None) -> PocketFuture:
         fut = PocketFuture()
-        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro, pure=router.is_pure(packed.modules),
+        # (A task that uses a pinned object runs where that object is kept: the main interpreter.)
+        task = Task(uuid.uuid4().hex, key, label, packed, fut, where, ro=ro,
+                    pure=router.is_pure(packed.modules) and not packed.pins,
                     weight=weight, shadow=shadow, fn=fn)
         with self._cv:
             for b, h in zip(packed.buffers, packed.hashes):
@@ -440,42 +451,91 @@ class PocketExecutor(Executor):
         return PlacedExecutor(self, placement)
 
     def pin(self, obj, on: str = "phone"):
-        """Keep obj's buffers resident on matching nodes; tasks using obj then prefer them.
+        """Keep obj loaded on the nodes matching `on`; tasks that use obj then use that copy.
+
+        Every later task that refers to this same object (as an argument, inside a container,
+        or through a closure or global) gets the copy kept on the node it runs on instead of
+        rebuilding it from bytes. Matching nodes get it now; any other node (a Mac worker,
+        say) gets it the first time a task using it runs there. Each node builds it once.
+
+        A pinned object is a shared, read-mostly snapshot: tasks on a node all see the same
+        copy, as threads on the Mac would, so tasks shouldn't change it (its large arrays are
+        read-only there). Changing it on the Mac doesn't change the kept copies until you call
+        ex.pin(obj) again, which sends only what changed. PyTorch tensors and modules are
+        checked for in-place changes (their version counters) whenever a task using them is
+        sent, and re-pinned by themselves. ex.unpin(obj) frees the copies; shutdown does too.
 
         Returns obj unchanged, so you keep using it as usual.
         """
-        packed = serialize.dumps(obj, scan=False)
         targets = [n for n in self.nodes.values() if _matches(n, on)]
         if not targets:
             raise PlacementError(f"no connected node matches {on!r}")
-        self._pins[tuple(packed.hashes)] = (packed, on)
-        for n in targets:
-            self._pin_on(n, packed)
+        self._keep(obj, on, eager=True)
         return obj
 
-    def _pin_on(self, n: Node, packed) -> None:
-        new = [(h, b) for h, b in zip(packed.hashes, packed.buffers) if h not in n.known]
-        if new:
-            n.post({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new])
-            n.known.update(h for h, _ in new)
-        n.post({"t": "pin", "hashes": packed.hashes})
+    def _keep(self, obj, on: str, eager: bool) -> "_Pin":
+        p = _Pin(obj, serialize.dumps(obj), on)
+        with self._cv:
+            old = self._kept.get(id(obj))
+            self._kept[id(obj)] = p
+            targets = [n for n in self.nodes.values() if _matches(n, on)] if eager else []
+        for n in targets:
+            if not _lacks(n, "pinned-objects"):
+                for header, bufs in self._keep_frames(n, p):
+                    n.post(header, bufs)
+        if old is not None and old.obj is obj:
+            self._retire(old)
+        return p
 
-    def _repin(self, n: Node, missing: set) -> None:
-        """A node couldn't pin what it was thought to hold (its file was gone): send it again."""
+    def _pin_of(self, obj) -> "_Pin | None":
+        """The pin record of obj if obj itself is pinned (called for every object a task pickles)."""
+        p = self._kept.get(id(obj))
+        if p is None or p.obj is not obj:
+            return None
+        if p.sig is not None and _versions(obj) != p.sig:  # changed in place since it was pinned
+            p = self._keep(obj, p.on, eager=False)
+        return p
+
+    def _keep_frames(self, n: Node, p: "_Pin") -> list:
+        """What a node needs to hold p: the buffers it lacks, then the object's pickle."""
+        new = [(h, b) for h, b in zip(p.packed.hashes, p.packed.buffers) if h not in n.known]
+        frames = []
+        if new:
+            frames.append(({"t": "put", "hashes": [h for h, _ in new]}, [b for _, b in new]))
+            n.known.update(h for h, _ in new)
+        frames.append(({"t": "keep", "key": p.key, "hashes": p.packed.hashes, "label": p.label},
+                       [p.packed.data]))
+        n.kept.add(p.key)
+        return frames
+
+    def _rekeep(self, n: Node, key: str, missing: list) -> None:
+        """A node couldn't find some of a kept object's buffers (its file was gone): send them again."""
         with self._cv:
             n.known.difference_update(missing)
-            items = {h: b for packed, _ in self._pins.values()
-                     for h, b in zip(packed.hashes, packed.buffers) if h in missing}
-        if items:
-            n.post({"t": "put", "hashes": list(items)}, list(items.values()))
-            n.known.update(items)
-            n.post({"t": "pin", "hashes": list(items)})
+            p = next((p for p in self._kept.values() if p.key == key), None)
+            if p is None or p.retries.get(n.id, 0) >= 2:
+                n.kept.discard(key)  # a task that needs it asks again ("pin" unavailable)
+                return
+            p.retries[n.id] = p.retries.get(n.id, 0) + 1
+        for header, bufs in self._keep_frames(n, p):
+            n.post(header, bufs)
+
+    def _retire(self, p: "_Pin") -> None:
+        p.closed = True
+        with self._cv:
+            if self._kept.get(id(p.obj)) is p:
+                del self._kept[id(p.obj)]
+            busy = any(p.key in t.packed.pins for t in self.tasks.values())
+            nodes = [n for n in self.nodes.values() if p.key in n.kept] if not busy else []
+        for n in nodes:  # (if a task still uses it, the copy goes when that task finishes)
+            n.kept.discard(p.key)
+            n.post({"t": "unkeep", "key": p.key})
 
     def unpin(self, obj) -> None:
-        packed = serialize.dumps(obj, scan=False)
-        self._pins.pop(tuple(packed.hashes), None)
-        for n in self.nodes.values():
-            n.post({"t": "unpin", "hashes": packed.hashes})
+        """Free the copies of obj kept by ex.pin(obj) on every node."""
+        p = self._kept.get(id(obj))
+        if p is not None and p.obj is obj:
+            self._retire(p)
 
     def stacks(self, what: str = "phone", timeout: float = 10.0) -> str:
         """What every thread on a node is doing right now (for a task that seems stuck)."""
@@ -550,7 +610,14 @@ class PocketExecutor(Executor):
                     pass
         for s in self.sources:
             s.stop()
+        self._kept.clear()
         for n in list(self.nodes.values()):
+            for key in list(n.kept):  # pinned objects go with the executor
+                try:
+                    n.conn.send({"t": "unkeep", "key": key})
+                except (ConnectionClosed, OSError):
+                    break
+            n.kept.clear()
             n.conn.close()
 
     # ----------------------------------------------------------- reports
@@ -600,6 +667,12 @@ class PocketExecutor(Executor):
                 self.attempts.pop(a.id, None)
                 if a.node.running.pop(a.id, None) is not None:
                     a.node.post({"t": "cancel", "id": a.id})
+            for p in task.packed.pins.values():  # unpinned while this task still used it
+                if p.closed and not any(p.key in t.packed.pins for t in self.tasks.values()):
+                    for n in self.nodes.values():
+                        if p.key in n.kept:
+                            n.kept.discard(p.key)
+                            n.post({"t": "unkeep", "key": p.key})
             self._cv.notify_all()
 
     def _add_node(self, node: Node) -> None:
@@ -611,6 +684,7 @@ class PocketExecutor(Executor):
                 # attempts survived, so those tasks are running, not lost.
                 o.known.update(node.known)
                 node.known = o.known
+                node.kept = o.kept
                 node.held = o.held
                 node.running = {k: a for k, a in o.running.items() if k in self.attempts}
                 for a in node.running.values():
@@ -639,9 +713,10 @@ class PocketExecutor(Executor):
                 top = f"{top}; {where}" if where else top
                 self._note(("crash", node.id), f"pocketnode: the app on {node.name} crashed last time ({top}); "
                            "details in ex.nodes[...].hello['last_crash']")
-            for packed, on in self._pins.values():  # data pinned earlier lives on this node again
-                if _matches(node, on):
-                    self._pin_on(node, packed)
+            for p in list(self._kept.values()):  # objects pinned earlier are kept on this node again
+                if _matches(node, p.on) and p.key not in node.kept and not _lacks(node, "pinned-objects"):
+                    for header, bufs in self._keep_frames(node, p):
+                        node.post(header, bufs)
 
     def _on_disconnect(self, node: Node) -> None:
         node.outbox.put(None)
@@ -710,12 +785,21 @@ class PocketExecutor(Executor):
             return False, self.mac_only[task.fn_key][0]
         if task.eligible.get(node.id):
             return True, ""
+        if task.packed.pins and _lacks(node, "pinned-objects"):
+            why = OLDER_APP.format(node.name)
+            if p not in ("auto", None) or self.strict:
+                self._fail(task, PlacementError(f"{task.fn_label} uses a pinned object, and {why}"))
+            else:
+                task.excluded[node.kind] = why
+            return False, why
         if node.kind != "mac":
             # The phone holds each input once in its cache and once more as the
             # task's own writable copy; sending something it can't hold would
-            # get the app killed instead of answered.
+            # get the app killed instead of answered. A pinned object it doesn't
+            # hold yet counts once (its copy is shared).
             need = sum(b.nbytes * (1 if task.ro is not None and b.nbytes >= task.ro else 2)
                        for b in task.packed.buffers)
+            need += sum(p_.nbytes for k, p_ in task.packed.pins.items() if k not in node.kept)
             avail = node.state.get("avail_mem")
             if avail and need > 0.8 * avail:
                 why = (f"its inputs need about {need / 2**30:.1f} GB on {node.name}, "
@@ -930,11 +1014,11 @@ class PocketExecutor(Executor):
                 node.held[str(msg.get("code"))] = "denied"
                 self._qgen += 1
                 self._cv.notify_all()
-        elif t == "pinned" and msg.get("missing") and not msg.get("req"):
-            self._repin(node, set(msg["missing"]))
+        elif t == "pinned" and msg.get("missing") and msg.get("key"):
+            self._rekeep(node, str(msg["key"]), list(msg["missing"]))
         elif t == "bye":
             node.bye = str(msg.get("why") or "closing")
-        elif t in ("stacks", "installed", "code_log", "pinned"):
+        elif t in ("stacks", "installed", "code_log", "pinned", "inventory"):
             ev = self._replies.get(msg.get("req"))
             if ev and not ev[0].is_set():
                 ev[1].append(msg)
@@ -995,11 +1079,16 @@ class PocketExecutor(Executor):
             return
         if msg.get("unavailable"):
             u = msg["unavailable"]
-            if u.get("kind") == "cache" and task.cache_retries < 2:
-                # Its inputs were evicted between arriving and running: send them again.
+            if u.get("kind") in ("cache", "pin") and task.cache_retries < 2:
+                # Its inputs were evicted between arriving and running, or a pinned object it
+                # uses isn't on the node (any more): send them again.
                 task.cache_retries += 1
                 with self._cv:
                     node.known.difference_update(task.packed.hashes)
+                    if u.get("kind") == "pin":
+                        node.kept.difference_update(task.packed.pins)
+                        for p_ in task.packed.pins.values():
+                            node.known.difference_update(p_.packed.hashes)
                     if not task.done and not any(a.id in self.attempts for a in task.attempts.values()):
                         task.queued = True
                         self.queue.appendleft(task)
@@ -1020,7 +1109,7 @@ class PocketExecutor(Executor):
                 return self._fail(task, PlacementError(f"{task.fn_label}: {reason}"
                                                        + (f". {suggestion}" if suggestion else "")))
             # Memory and cache depend on the inputs, not the function; "stopped" was the phone's owner.
-            if u.get("kind") not in ("memory", "cache", "stopped"):
+            if u.get("kind") not in ("memory", "cache", "stopped", "pin"):
                 self.mac_only[task.fn_key] = (reason, suggestion)
                 if u.get("module"):  # undone when the module is added to the node
                     self._mac_only_mod[task.fn_key] = u["module"]
@@ -1397,6 +1486,44 @@ class PlacedExecutor:
 
 def _matches(node: Node, placement: str) -> bool:
     return placement in (node.kind, node.name, node.id)
+
+
+OLDER_APP = "the app on {} is older than this pocketnode; run `pocketnode app install`"
+
+
+def _lacks(node: Node, feature: str) -> bool:
+    """Does this node's worker predate `feature` (its hello doesn't list it)?"""
+    return feature not in (node.hello.get("features") or ())
+
+
+class _Pin:
+    """An object ex.pin() keeps on nodes: its pickle, buffers and the key tasks refer to it by."""
+
+    def __init__(self, obj, packed: serialize.Packed, on: str):
+        self.obj = obj  # kept alive while pinned: tasks find it by identity
+        self.key = uuid.uuid4().hex
+        self.packed = packed
+        self.modules = set(packed.modules)
+        self.nbytes = sum(b.nbytes for b in packed.buffers)
+        self.on = on
+        self.sig = _versions(obj)
+        self.label = type(obj).__qualname__
+        self.closed = False
+        self.retries: dict[str, int] = {}  # node id -> times its buffers were sent again
+
+
+def _versions(obj):
+    """PyTorch's in-place version counters for a tensor or module (None for anything else):
+    a cheap way to tell that a pinned object changed since it was pinned."""
+    import sys
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    if isinstance(obj, torch.Tensor):
+        return ((id(obj), obj._version),)
+    if isinstance(obj, torch.nn.Module):
+        return tuple((id(t), t._version) for t in itertools.chain(obj.parameters(), obj.buffers()))
+    return None
 
 
 def _unavailable_reason(u: dict, node: Node) -> str:
