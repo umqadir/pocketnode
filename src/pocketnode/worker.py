@@ -119,7 +119,7 @@ def _env_key(manifest) -> str | None:
 class Worker:
     uses_site = True  # packages added at run time are imported from self.site
     # What this worker understands beyond plain tasks; a Mac checks before using one.
-    features = ("disk-cache", "pinned-objects", "objects")
+    features = ("disk-cache", "pinned-objects", "objects", "stream")
 
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
@@ -159,6 +159,8 @@ class Worker:
         # Objects a Mac built here (ex.create), by the id it chose. They live in the main
         # interpreter; their method calls run on the task threads, one at a time per object.
         self.objects: dict[str, dict] = {}
+        self._acks: dict[str, list[int]] = {}  # streaming task id -> [items the Mac has taken]
+        self._ack_cv = threading.Condition()
         self._lock = threading.RLock()
         self._tl = threading.local()
         self._pending_imports: dict[str, tuple[threading.Event, list]] = {}
@@ -465,6 +467,12 @@ class Worker:
         elif t == "drop":
             with self._lock:
                 self.objects.pop(str(msg.get("obj")), None)
+        elif t == "ack":
+            with self._ack_cv:
+                a = self._acks.get(str(msg.get("id")))
+                if a is not None:
+                    a[0] = max(a[0], int(msg.get("n", 0)))
+                    self._ack_cv.notify_all()
         elif t == "put":
             self._on_put(msg["hashes"], bufs)
         elif t == "module":
@@ -915,8 +923,12 @@ class Worker:
         """(fn, args, kwargs) for a message: a task's own, or building / calling a kept object."""
         kept = self._kept_object if msg.get("pins") else None
         t = msg.get("t", "task")
+        stream = bool(msg.get("stream"))
         if t == "task":
-            return serialize.loads(payload, views, kept=kept)
+            fn, args, kwargs = serialize.loads(payload, views, kept=kept)
+            if stream:
+                return (lambda *a, **k: self._stream(msg, fn(*a, **k))), args, kwargs
+            return fn, args, kwargs
         oid, label = str(msg.get("obj")), str(msg.get("label") or "object")
         if t == "create":
             factory, args, kwargs = serialize.loads(payload, views, kept=kept)
@@ -941,11 +953,50 @@ class Worker:
             while not lock.acquire(timeout=0.05):  # (a timeout, so a cancel can land while it waits)
                 pass
             try:
-                return getattr(o["value"], name)(*a, **k)
+                r = getattr(o["value"], name)(*a, **k)
+                return self._stream(msg, r) if stream else r
             finally:
                 lock.release()
 
         return call, args, kwargs
+
+    def _stream(self, msg: dict, it) -> int:
+        """Send what a streaming task yields, item by item, staying at most `window` items
+        ahead of what the Mac has taken. Returns how many were sent."""
+        if not hasattr(it, "__next__"):
+            raise TypeError(f"{msg.get('label') or 'the function'} returned {type(it).__name__}, not an iterator: "
+                            ".stream() needs a generator (a function that yields) or another iterator")
+        tid, sid = str(msg["id"]), msg.get("_sid")
+        window = max(1, int(msg.get("window") or 32))
+        taken = [0]
+        with self._ack_cv:
+            self._acks[tid] = taken
+        n = 0
+        try:
+            for item in it:
+                p = serialize.dumps_plain(item)
+                # Copies of its buffers: the generator may reuse an array for its next item.
+                if not self._send({"t": "item", "id": tid, "n": n}, [p.data, *(bytes(b) for b in p.buffers)],
+                                  sid=sid):
+                    raise TaskCancelled  # the Mac that asked is gone; nobody will read the rest
+                n += 1
+                with self._ack_cv:
+                    while n - taken[0] >= window:
+                        if not self._live(sid):
+                            raise TaskCancelled
+                        self._ack_cv.wait(0.1)
+        finally:
+            with self._ack_cv:
+                self._acks.pop(tid, None)
+            close = getattr(it, "close", None)
+            if close is not None:
+                close()  # a generator stopped early runs its finally blocks now
+        return n
+
+    def _live(self, sid) -> bool:
+        with self._lock:
+            s = self.sessions.get(sid)
+            return s is not None and s.live
 
     def _prefetch(self, mods) -> None:
         """Fetch pure-Python modules a task names, so subinterpreters (which have

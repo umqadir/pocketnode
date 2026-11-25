@@ -137,7 +137,7 @@ class RemoteObject:
         t.reason = f"{self._label} is kept there"
         return t
 
-    def _call(self, name: str, args, kwargs) -> PocketFuture:
+    def _call(self, name: str, args, kwargs, stream: bool = False):
         with self._lock:
             if self._closed:
                 raise RuntimeError(f"{self!r} is closed")
@@ -149,11 +149,12 @@ class RemoteObject:
         t = Task(uuid.uuid4().hex, f"{self._key}.{name}", f"{self._label}.{name}", packed, PocketFuture(),
                  "auto", fn=fn or self._factory, kind="call", obj=self, method=name, sticky=True)
         t.reason = f"where {self._label} is kept"
+        it = _streaming(ex, t) if stream else None
         with self._lock:
             t.gen = self._gen
             self._fifo.append(t)
         self._pump()
-        return t.future
+        return it if stream else t.future
 
     def _launch(self, t: Task) -> None:
         if getattr(t, "_admitted", False):
@@ -278,8 +279,118 @@ class _Method:
     def __call__(self, *args, **kwargs) -> PocketFuture:
         return self._obj._call(self._name, args, kwargs)
 
+    def stream(self, *args, **kwargs) -> "RemoteStream":
+        """Call a method that yields, and iterate over its items as they are produced."""
+        return self._obj._call(self._name, args, kwargs, stream=True)
+
     def __repr__(self):
         return f"<method {self._name} of {self._obj!r}>"
 
 
-__all__ = ["RemoteObject", "PlacementError"]
+class _StreamState:
+    """What has arrived of a streaming task (task.stream). The iterator the user holds is
+    separate, so dropping that iterator can stop the task while the executor still holds this."""
+
+    def __init__(self):
+        self.items: deque = deque()
+        self.cv = threading.Condition()
+        self.started = False  # an item has arrived
+        self.closed = False
+        self.max_buffered = 0  # most items ever waiting on the Mac at once
+
+    def _put(self, node, att: str, bufs) -> None:
+        with self.cv:
+            if self.closed:
+                return
+            self.started = True
+            self.items.append((node, att, bufs))
+            self.max_buffered = max(self.max_buffered, len(self.items))
+            self.cv.notify_all()
+
+    def wake(self, _f=None) -> None:
+        with self.cv:
+            self.cv.notify_all()
+
+
+class RemoteStream:
+    """The items a generator on a node yields, in order, as they arrive (ex.stream, method.stream).
+
+    Iterating takes the next item (waiting for it if need be); the iterator ends when the
+    generator does and raises what it raised. close(), or dropping the iterator, stops the
+    generator on the node. `placement` says where it ran once it has finished.
+    """
+
+    def __init__(self, ex: PocketExecutor, task: Task):
+        from .executor import STREAM_ACK
+        self._ex, self._task = ex, task
+        self._s = task.stream
+        self._taken = self._acked = 0
+        self._ack_every = STREAM_ACK
+        self._done = False
+        task.future.add_done_callback(self._s.wake)
+
+    @property
+    def placement(self):
+        return self._task.future.placement
+
+    @property
+    def max_buffered(self) -> int:
+        """The most items that were ever waiting here for you at once."""
+        return self._s.max_buffered
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        s, f = self._s, self._task.future
+        with s.cv:
+            while not s.items and not f.done():
+                s.cv.wait(0.5)
+            item = s.items.popleft() if s.items else None
+        if item is None:  # finished, and everything it sent has been taken
+            if self._done or f.cancelled():
+                raise StopIteration
+            self._done = True
+            exc = f.exception()
+            if exc is not None:
+                raise exc
+            raise StopIteration
+        node, att, bufs = item
+        self._taken += 1
+        if self._taken - self._acked >= self._ack_every and not f.done():
+            self._acked = self._taken
+            node.post({"t": "ack", "id": att, "n": self._taken})
+        return serialize.loads(bufs[0], bufs[1:])
+
+    def close(self) -> None:
+        """Stop the generator on its node (if it is still running) and end the iteration."""
+        s = self._s
+        with s.cv:
+            if s.closed:
+                return
+            s.closed = True
+            s.items.clear()
+        self._done = True
+        if not self._task.future.done():
+            from concurrent.futures import CancelledError
+            self._ex._fail(self._task, CancelledError("the stream was closed"))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - at interpreter exit
+            pass
+
+
+def _streaming(ex: PocketExecutor, task: Task) -> RemoteStream:
+    task.stream = _StreamState()
+    return RemoteStream(ex, task)
+
+
+__all__ = ["RemoteObject", "RemoteStream", "PlacementError"]

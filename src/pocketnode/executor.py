@@ -45,6 +45,10 @@ APPROVAL_WAIT = 120.0
 # so a phone that is only reconnecting isn't failed.
 BLOCKED_GRACE = 5.0
 SRC_LIMIT = 32 << 10  # bytes of source (or disassembly) sent to a store phone per function
+# A streaming task sends at most this many items before the Mac has taken them; the Mac says
+# what it has taken every STREAM_ACK items.
+STREAM_WINDOW = 32
+STREAM_ACK = 8
 
 
 # ------------------------------------------------------------------ records
@@ -104,6 +108,7 @@ class Task:
     kind: str = "task"
     obj: Any = None  # the RemoteObject handle
     method: str | None = None
+    stream: Any = None  # a RemoteStream: the callable yields, and each item is sent as it comes
     # Runs only where it was placed: if that node goes away it fails with NodeLost instead of
     # running again elsewhere (it may have changed state there, or already sent part of its output).
     sticky: bool = False
@@ -248,6 +253,8 @@ class Node:
             header["obj"] = t.obj._id
         if t.method:
             header["method"] = t.method
+        if t.stream is not None:
+            header["stream"], header["window"] = 1, STREAM_WINDOW
         if self.hello.get("edition") == "store":
             # The App Store edition shows the person what runs; the text travels once per code.
             ci = self.ex._code_of(t)
@@ -501,6 +508,33 @@ class PocketExecutor(Executor):
         obj = RemoteObject(self, factory, args, kwargs, placement or self.default_placement, recreate)
         obj._start()
         return obj
+
+    def stream(self, fn: Callable, /, *args, **kwargs) -> "RemoteStream":
+        """Run a generator function on one node and iterate over what it yields, as it yields.
+
+        Each item is sent to the Mac when it is produced (the node stays at most a few dozen
+        items ahead of you). The iterator ends when the generator does and raises what it
+        raises. Leaving the loop early (break, close(), or dropping the iterator) stops the
+        generator there. Placement is decided once, when you call this; the work is not checked
+        against the Mac or moved, and if the node goes away the iterator raises NodeLost.
+        """
+        return self._stream(fn, args, kwargs, None)
+
+    def _stream(self, fn, args, kwargs, placement) -> "RemoteStream":
+        if self._shutdown:
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        from .remote import _streaming
+        serialize.register_user_modules()
+        where = (placement or getattr(fn, "__pocketnode_placement__", None)
+                 or _placement_ctx.get() or self.default_placement)
+        packed = serialize.dumps((fn, args, kwargs), pins=self._pin_of if self._kept else None)
+        key, label = _fn_identity(fn, args)
+        task = Task(uuid.uuid4().hex, key, label, packed, PocketFuture(), where, fn=fn, sticky=True)
+        st = _streaming(self, task)
+        if where in ("auto", None):
+            self._place_once(task)
+        self._admit(task)
+        return st
 
     def _place_once(self, task: Task) -> None:
         """Automatic placement decided at submission, for work that stays where it starts:
@@ -819,7 +853,8 @@ class PocketExecutor(Executor):
             for a in list(node.running.values()):
                 t = a.task
                 if t.sticky and not t.done:
-                    if t.fallback and t.kind == "create":  # placed there automatically: build it elsewhere
+                    if t.fallback and (t.kind == "create" or (t.stream is not None and not t.stream.started)):
+                        # Placed there automatically and nothing came of it yet: start it elsewhere.
                         node.running.pop(a.id, None)
                         self.attempts.pop(a.id, None)
                         t.attempts.pop(a.id, None)
@@ -1086,6 +1121,11 @@ class PocketExecutor(Executor):
         t = msg["t"]
         if t == "result":
             self._on_result(node, msg, bufs)
+        elif t == "item":  # the next item of a streaming task
+            with self._cv:
+                att = self.attempts.get(msg.get("id"))
+            if att is not None and att.task.stream is not None:
+                att.task.stream._put(node, att.id, bufs)
         elif t == "need":
             with self._cv:
                 items = [(h, self._buf_by_hash.get(h)) for h in msg["hashes"]]
@@ -1178,7 +1218,8 @@ class PocketExecutor(Executor):
             if u.get("kind") == "object" and task.obj is not None:  # the node doesn't have it (any more)
                 task.obj._missing(task, node)
                 return
-            if task.fallback and u.get("kind") not in ("cache", "pin"):
+            if task.fallback and u.get("kind") not in ("cache", "pin") and not (
+                    task.stream is not None and task.stream.started):
                 if u.get("kind") in ("approval", "denied"):
                     code = str(u.get("code") or self._code_of(task)["code"])
                     with self._cv:
@@ -1608,6 +1649,10 @@ class PlacedExecutor:
         """Like ex.create, on this placement; PlacementError if no node there can hold it."""
         return self._ex._create(factory, args, kwargs, self._p, recreate)
 
+    def stream(self, fn, /, *args, **kwargs):
+        """Like ex.stream, on this placement."""
+        return self._ex._stream(fn, args, kwargs, self._p)
+
 
 def _matches(node: Node, placement: str) -> bool:
     return placement in (node.kind, node.name, node.id)
@@ -1624,6 +1669,8 @@ def _lost_error(t: Task, node: Node) -> NodeLost:
 
 def _feature_for(task: Task) -> str | None:
     """What a worker must understand to run this task (beyond plain tasks)."""
+    if task.stream is not None:
+        return "stream"
     if task.kind != "task":
         return "objects"
     if task.packed.pins:

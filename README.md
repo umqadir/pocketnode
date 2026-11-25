@@ -127,6 +127,15 @@ y = server.predict(x).result()
 server.close()
 ```
 
+**Streaming.** `.stream(...)` runs a generator on the phone and yields its items on the Mac as they are produced: tokens as a model generates them, or metrics after each epoch. Breaking out of the loop stops the generator on the phone.
+
+```python
+for token in server.generate.stream(prompt):     # a method that yields
+    print(token, end="")
+for metrics in ex.on("phone").stream(train, config):
+    log(metrics)
+```
+
 **Training on the phone's GPU.** Code that checks for `"mps"` picks up the phone's GPU too.
 
 ```python
