@@ -607,6 +607,29 @@ def test_input_bigger_than_the_phone_cache(tmp_path):
         proc.kill()
 
 
+def test_input_sent_again_to_a_phone_cache_too_small_for_it(tmp_path):
+    from pocketnode import serialize
+    from pocketnode.sources import Address
+    proc, port = _standalone_phone(tmp_path, "--store-budget", str(1 << 20))
+    e = pn.PocketExecutor(notes=False)
+    src = Address(f"127.0.0.1:{port}", token="t0ken", retry=0.5)
+    e.add_source(src)
+    try:
+        assert e.wait_for("phone", 20)
+        x = np.arange(1_000_000, dtype="float64")  # 8 MB against a 1 MB cache
+        assert e.on("phone").submit(lambda a: float(a[0]), x).result(timeout=30) == 0.0
+        # The phone dropped the array when that task ended. A task already on its way
+        # doesn't carry it, so the phone asks for it again and must hold on to it.
+        node = next(n for n in e.nodes.values() if n.kind == "phone")
+        with e._cv:
+            node.known.update(serialize.dumps(x).hashes)
+        assert e.on("phone").submit(lambda a: float(a[1]), x).result(timeout=30) == 1.0
+    finally:
+        src.stop()
+        e.shutdown(wait=False)
+        proc.kill()
+
+
 def _uses_yaml(pause=0.0):
     import time
     import yaml

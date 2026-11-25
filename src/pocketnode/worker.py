@@ -702,19 +702,24 @@ class Worker:
                         missing.discard(h)
                         missing.add(key)
                         good[key] = b
-        self.store.reserve((), good)
+        # Held until the waiting tasks have taken theirs: a buffer bigger than the
+        # cache would otherwise be evicted as it arrives, and its tasks would wait forever.
+        self.store.reserve(list(good), good)
         ready = []
-        with self._lock:
-            for tid, (msg, payload, missing) in list(self._waiting_bufs.items()):
-                got = [h for h in missing if h in good]
-                if not got:
-                    continue
-                still = set(self.store.reserve(got))
-                self._reserved.setdefault(tid, []).extend(h for h in got if h not in still)
-                missing.difference_update(set(got) - still)
-                if not missing:
-                    del self._waiting_bufs[tid]
-                    ready.append((msg, payload))
+        try:
+            with self._lock:
+                for tid, (msg, payload, missing) in list(self._waiting_bufs.items()):
+                    got = [h for h in missing if h in good]
+                    if not got:
+                        continue
+                    still = set(self.store.reserve(got))
+                    self._reserved.setdefault(tid, []).extend(h for h in got if h not in still)
+                    missing.difference_update(set(got) - still)
+                    if not missing:
+                        del self._waiting_bufs[tid]
+                        ready.append((msg, payload))
+        finally:
+            self.store.release(list(good))
         for msg, payload in ready:
             self.pool.submit(self._run_safe, msg, payload)
 
