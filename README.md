@@ -130,7 +130,7 @@ server.close()
 **Streaming.** `.stream(...)` runs a generator on the phone and yields its items on the Mac as they are produced: tokens as a model generates them, or metrics after each epoch. Breaking out of the loop stops the generator on the phone.
 
 ```python
-for token in server.generate.stream(prompt):     # a method that yields
+for token in chat.generate.stream(prompt):       # a method of a kept object that yields
     print(token, end="")
 for metrics in ex.on("phone").stream(train, config):
     log(metrics)
