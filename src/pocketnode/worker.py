@@ -117,6 +117,8 @@ def _env_key(manifest) -> str | None:
 
 class Worker:
     uses_site = True  # packages added at run time are imported from self.site
+    # What this worker understands beyond plain tasks; a Mac checks before using one.
+    features = ("disk-cache",)
 
     def __init__(self, token: str, *, slots: int | None = None, cache_dir: str | None = None,
                  phone: bool | None = None, name: str | None = None, store_budget: int | None = None,
@@ -138,7 +140,10 @@ class Worker:
         if self.uses_site and str(self.site) not in sys.path:
             sys.path.insert(0, str(self.site))
         self._installs: dict[str, set[str] | None] = {}  # req -> modules loaded before it (None: failed)
-        self.store = BufferStore(store_budget or self._default_budget())
+        # A phone keeps large inputs on disk too, so they outlive an app restart. (A worker on
+        # the Mac gets them over a local socket faster than it could read them back.)
+        self.store = BufferStore(store_budget or self._default_budget(),
+                                 disk_dir=self.cache_dir / "buffers" if self.kind != "mac" else None)
         self.pool = ThreadPoolExecutor(self.slots, thread_name_prefix="pn-task")
         self.sessions: dict[str, _Session] = {}
         self.env: str | None = None  # the Mac environment the import hook currently mirrors
@@ -216,6 +221,7 @@ class Worker:
     def hello(self) -> dict:
         return {
             "protocol": PROTOCOL,
+            "features": list(self.features),
             "id": self.id,
             "name": self.name,
             "kind": self.kind,
@@ -342,7 +348,12 @@ class Worker:
         return None
 
     def _handshake(self, conn: Connection) -> dict:
-        return server_handshake(conn, self.token, self.hello(), admit=self._admit)
+        return server_handshake(conn, self.token, self.hello(), admit=self._admit, after_auth=self._after_auth)
+
+    def _after_auth(self) -> dict:
+        """Told only to a Mac that proved its pairing: the inputs already on this node's disk,
+        so they aren't sent again after an app restart."""
+        return {"cached": self.store.cached()}
 
     def _session_started(self, sess: _Session, conn: Connection, info: dict) -> None:
         """Hook: a Mac session has authenticated on `conn` (its peer is conn.sock)."""
@@ -445,7 +456,8 @@ class Worker:
             self._cancel(msg["id"])
         elif t == "pin":
             ok = [h for h in msg["hashes"] if self.store.pin(h)]
-            self._send({"t": "pinned", "req": msg.get("req"), "hashes": ok}, sid=sid)
+            self._send({"t": "pinned", "req": msg.get("req"), "hashes": ok,
+                        "missing": [h for h in msg["hashes"] if h not in ok]}, sid=sid)
         elif t == "unpin":
             for h in msg["hashes"]:
                 self.store.unpin(h)

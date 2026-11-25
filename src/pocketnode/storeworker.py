@@ -96,7 +96,7 @@ class StoreWorker(Worker):
     def _handshake(self, conn: Connection) -> dict:
         local = self._peer_is_local(conn.sock)
         return server_handshake(
-            conn, "", self.hello(), admit=self._admit,
+            conn, "", self.hello(), admit=self._admit, after_auth=self._after_auth,
             token_for=lambda msg: self.pairs.token(msg.get("pair_id")),
             on_pair=lambda c, msg, nonce: self.window.handle(c, msg, nonce, self.pairs, local, phone_name=self.name))
 

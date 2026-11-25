@@ -148,7 +148,9 @@ class Node:
         self.slots = int(hello["slots"])
         self.same_env = source.same_env
         self.state = hello.get("state", {})
-        self.known: set[str] = set()
+        # Buffers the node holds. Seeded with what is on its disk (sent after the handshake),
+        # so inputs that survived an app restart aren't sent again; a "need" covers any miss.
+        self.known: set[str] = set(hello.get("cached") or ())
         self.running: dict[str, Attempt] = {}
         self.connected = True
         self.mac_only_modules: dict[str, str] = {}
@@ -458,6 +460,17 @@ class PocketExecutor(Executor):
             n.known.update(h for h, _ in new)
         n.post({"t": "pin", "hashes": packed.hashes})
 
+    def _repin(self, n: Node, missing: set) -> None:
+        """A node couldn't pin what it was thought to hold (its file was gone): send it again."""
+        with self._cv:
+            n.known.difference_update(missing)
+            items = {h: b for packed, _ in self._pins.values()
+                     for h, b in zip(packed.hashes, packed.buffers) if h in missing}
+        if items:
+            n.post({"t": "put", "hashes": list(items)}, list(items.values()))
+            n.known.update(items)
+            n.post({"t": "pin", "hashes": list(items)})
+
     def unpin(self, obj) -> None:
         packed = serialize.dumps(obj, scan=False)
         self._pins.pop(tuple(packed.hashes), None)
@@ -596,6 +609,7 @@ class PocketExecutor(Executor):
             for o in old + ([gone] if gone else []):
                 # The same worker process reconnecting: its cache and in-flight
                 # attempts survived, so those tasks are running, not lost.
+                o.known.update(node.known)
                 node.known = o.known
                 node.held = o.held
                 node.running = {k: a for k, a in o.running.items() if k in self.attempts}
@@ -916,9 +930,11 @@ class PocketExecutor(Executor):
                 node.held[str(msg.get("code"))] = "denied"
                 self._qgen += 1
                 self._cv.notify_all()
+        elif t == "pinned" and msg.get("missing") and not msg.get("req"):
+            self._repin(node, set(msg["missing"]))
         elif t == "bye":
             node.bye = str(msg.get("why") or "closing")
-        elif t in ("stacks", "installed", "code_log"):
+        elif t in ("stacks", "installed", "code_log", "pinned"):
             ev = self._replies.get(msg.get("req"))
             if ev and not ev[0].is_set():
                 ev[1].append(msg)

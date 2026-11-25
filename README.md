@@ -143,6 +143,8 @@ Manual placement: `ex.on("phone").submit(...)`, `@pn.runs_on("mac")`, or `with p
 
 **Data caching.** Arrays and DataFrames ship as raw buffers and cache on the phone by content, so an `X` used across 200 fits crosses the cable once. `ex.pin(X)` keeps it there.
 
+**Disk caching.** Inputs of 8 MB or more, and anything pinned, are also kept on the phone's disk by content, so model weights and large tables survive an app restart and aren't sent again. The disk cache uses up to a fifth of the phone's free space (at most 50 GB) and drops the least recently used first. A file iOS cleared or that no longer matches its content is sent again.
+
 **Scheduling.** pocketnode measures each function on each device, and the link's speed, then sends tasks where they'll finish soonest. Memory-bound operations like filtering or merging one large table stay on the Mac. Compute-heavy work spreads out.
 
 **Subinterpreters and threads.** iOS blocks child processes, so pure-Python tasks run in one subinterpreter per core, each with its own GIL. NumPy, scikit-learn and PyTorch release the GIL and run on threads.
